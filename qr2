@@ -1,5 +1,227 @@
 
 
+
+
+
+
+
+
+
+WITH bounds AS (
+    SELECT
+        $__timeFrom()::date AS start_date,
+        $__timeTo()::date AS end_date,
+        ($__timeTo()::date - $__timeFrom()::date + 1)::int AS day_count
+),
+
+-- ---------------------------------------------------------
+-- Latest overall health state as of selected range end
+-- ---------------------------------------------------------
+latest_summary AS (
+    SELECT
+        overall_status
+    FROM public.ewoc_ticket_prediction_health
+    WHERE record_type = 'RUN_SUMMARY'
+      AND run_ts <= $__timeTo()
+    ORDER BY run_ts DESC, id DESC
+    LIMIT 1
+),
+
+-- ---------------------------------------------------------
+-- Daily confidence: deduplicate repeated health-check runs
+-- ---------------------------------------------------------
+confidence_ranked AS (
+    SELECT
+        h.metric_date,
+        h.sample_count,
+        h.mean_confidence,
+        ROW_NUMBER() OVER (
+            PARTITION BY h.metric_date
+            ORDER BY
+                CASE WHEN h.window_name = 'current' THEN 1 ELSE 2 END,
+                h.run_ts DESC
+        ) AS rn
+    FROM public.ewoc_ticket_prediction_health h
+    CROSS JOIN bounds b
+    WHERE h.record_type = 'DAILY_CONFIDENCE'
+      AND h.metric_date BETWEEN b.start_date AND b.end_date
+),
+
+confidence_summary AS (
+    SELECT
+        SUM(sample_count) AS predictions_made,
+
+        SUM(mean_confidence * sample_count)
+        / NULLIF(SUM(sample_count), 0)
+            AS avg_confidence
+    FROM confidence_ranked
+    WHERE rn = 1
+),
+
+-- ---------------------------------------------------------
+-- Prefer trusted confusion rows over provisional
+-- for every selected date
+-- ---------------------------------------------------------
+chosen_source AS (
+    SELECT
+        h.metric_date,
+        CASE
+            WHEN BOOL_OR(
+                h.record_type = 'DAILY_CONFUSION_MATRIX'
+            )
+            THEN 'DAILY_CONFUSION_MATRIX'
+            ELSE 'DAILY_CONFUSION_MATRIX_PROVISIONAL'
+        END AS chosen_record_type
+    FROM public.ewoc_ticket_prediction_health h
+    CROSS JOIN bounds b
+    WHERE h.record_type IN (
+        'DAILY_CONFUSION_MATRIX',
+        'DAILY_CONFUSION_MATRIX_PROVISIONAL'
+    )
+      AND h.metric_date BETWEEN b.start_date AND b.end_date
+    GROUP BY h.metric_date
+),
+
+cm AS (
+    SELECT
+        h.actual_label,
+        h.predicted_label,
+        SUM(h.sample_count)::double precision AS n
+    FROM public.ewoc_ticket_prediction_health h
+    JOIN chosen_source s
+      ON h.metric_date = s.metric_date
+     AND h.record_type = s.chosen_record_type
+    GROUP BY
+        h.actual_label,
+        h.predicted_label
+),
+
+labels AS (
+    SELECT actual_label AS class_label FROM cm
+    UNION
+    SELECT predicted_label AS class_label FROM cm
+),
+
+per_class AS (
+    SELECT
+        l.class_label,
+
+        SUM(
+            CASE
+                WHEN c.actual_label = l.class_label
+                 AND c.predicted_label = l.class_label
+                THEN c.n ELSE 0
+            END
+        ) AS tp,
+
+        SUM(
+            CASE
+                WHEN c.actual_label <> l.class_label
+                 AND c.predicted_label = l.class_label
+                THEN c.n ELSE 0
+            END
+        ) AS fp,
+
+        SUM(
+            CASE
+                WHEN c.actual_label = l.class_label
+                 AND c.predicted_label <> l.class_label
+                THEN c.n ELSE 0
+            END
+        ) AS fn,
+
+        SUM(
+            CASE
+                WHEN c.actual_label = l.class_label
+                THEN c.n ELSE 0
+            END
+        ) AS support
+
+    FROM labels l
+    CROSS JOIN cm c
+    GROUP BY l.class_label
+),
+
+class_f1 AS (
+    SELECT
+        support,
+        CASE
+            WHEN (2 * tp + fp + fn) > 0
+            THEN (2 * tp) / (2 * tp + fp + fn)
+            ELSE 0
+        END AS f1
+    FROM per_class
+),
+
+evaluation_summary AS (
+    SELECT
+        SUM(n) AS trusted_labels,
+
+        SUM(
+            CASE
+                WHEN actual_label = predicted_label
+                THEN n ELSE 0
+            END
+        ) / NULLIF(SUM(n), 0)
+            AS accuracy
+    FROM cm
+),
+
+weighted_summary AS (
+    SELECT
+        SUM(f1 * support)
+        / NULLIF(SUM(support), 0)
+            AS weighted_f1
+    FROM class_f1
+)
+
+SELECT
+    COALESCE(ls.overall_status, 'UNKNOWN')
+        AS "Status",
+
+    b.day_count || ' days'
+        AS "Selected window",
+
+    COALESCE(cs.predictions_made, 0)
+        AS "Predictions made",
+
+    CASE
+        WHEN cs.avg_confidence IS NULL THEN 'N/A'
+        ELSE TO_CHAR(cs.avg_confidence, 'FM0.0000')
+    END AS "Avg confidence",
+
+    COALESCE(es.trusted_labels, 0)
+        AS "Evaluated labels",
+
+    CASE
+        WHEN es.accuracy IS NULL THEN 'N/A'
+        ELSE TO_CHAR(es.accuracy, 'FM0.0000')
+    END AS "Accuracy",
+
+    CASE
+        WHEN ws.weighted_f1 IS NULL THEN 'N/A'
+        ELSE TO_CHAR(ws.weighted_f1, 'FM0.0000')
+    END AS "Weighted F1"
+
+FROM bounds b
+CROSS JOIN latest_summary ls
+CROSS JOIN confidence_summary cs
+CROSS JOIN evaluation_summary es
+CROSS JOIN weighted_summary ws;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Yes. For the four bar-chart panels in your dashboard—Dev Performance on New Data, Top Predicted Classes, Prediction Drift, and Per-Class Detection Rate—use the queries below. Those are the panels visible in your current dashboard. 
 
 One important rule: because metric_date is a DATE, I recommend using:
