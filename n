@@ -1,0 +1,778 @@
+# =====================================================================
+# BOOTSTRAP CELL FOR FINAL >25 KM MISROUTE DOUBLE-CHECK
+#
+# Run this ONCE immediately before:
+#   "FINAL >25 KM MISROUTE DOUBLE-CHECK / RECOMPUTATION"
+#
+# Purpose:
+#   Rebuild all PSAP geometry objects/functions required by the QA cell,
+#   even if the notebook kernel was restarted.
+# =====================================================================
+
+from pathlib import Path
+from collections import defaultdict
+import re
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+from pyproj import Geod
+from shapely.geometry import Point, Polygon
+from shapely.ops import nearest_points, unary_union
+from shapely.strtree import STRtree
+
+
+# ---------------------------------------------------------------------
+# 1. PATH
+# ---------------------------------------------------------------------
+
+DATA_DIR = globals().get(
+    "DATA_DIR",
+    Path(r"C:\temp\gmlc_v2")
+)
+
+PSAP_BOUNDARY_TAB_QA = (
+    DATA_DIR
+    / "psap"
+    / "Final_Join.tab"
+)
+
+if not PSAP_BOUNDARY_TAB_QA.exists():
+    raise FileNotFoundError(
+        f"PSAP boundary file not found: {PSAP_BOUNDARY_TAB_QA}"
+    )
+
+print("Boundary source:", PSAP_BOUNDARY_TAB_QA)
+
+
+# ---------------------------------------------------------------------
+# 2. ID NORMALIZATION
+# ---------------------------------------------------------------------
+
+def norm_id_value(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = (
+        str(value)
+        .strip()
+        .strip('"')
+        .upper()
+    )
+
+    return re.sub(
+        r"\.0$",
+        "",
+        text
+    )
+
+
+# ---------------------------------------------------------------------
+# 3. GEOMETRY REPAIR
+# ---------------------------------------------------------------------
+
+def repair_geometry_qa(geom):
+
+    if geom is None or geom.is_empty:
+        return None
+
+    try:
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+
+        if geom.is_empty or not geom.is_valid:
+            return None
+
+        return geom
+
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------
+# 4. RELOAD PSAP BOUNDARIES INDEPENDENTLY
+# ---------------------------------------------------------------------
+
+try:
+    qa_geo = gpd.read_file(
+        PSAP_BOUNDARY_TAB_QA,
+        engine="pyogrio"
+    )
+except Exception:
+    qa_geo = gpd.read_file(
+        PSAP_BOUNDARY_TAB_QA
+    )
+
+if qa_geo.empty:
+    raise RuntimeError(
+        "No PSAP boundaries were read from Final_Join.tab."
+    )
+
+
+# Convert to WGS84 latitude/longitude if necessary.
+if qa_geo.crs is not None:
+    try:
+        if qa_geo.crs.to_epsg() != 4326:
+            qa_geo = qa_geo.to_crs(
+                epsg=4326
+            )
+    except Exception:
+        qa_geo = qa_geo.to_crs(
+            epsg=4326
+        )
+
+
+# Find FCC identifier column.
+upper_cols = {
+    str(c).strip().upper(): c
+    for c in qa_geo.columns
+}
+
+fcc_col = next(
+    (
+        upper_cols[c]
+        for c in [
+            "FCC_ID",
+            "FCC_PSAP_ID"
+        ]
+        if c in upper_cols
+    ),
+    None
+)
+
+if fcc_col is None:
+    raise RuntimeError(
+        "Final_Join.tab does not contain FCC_ID or FCC_PSAP_ID."
+    )
+
+
+# ---------------------------------------------------------------------
+# 5. MERGE MULTIPLE POLYGONS FOR SAME PSAP
+# ---------------------------------------------------------------------
+
+pieces_by_fcc = defaultdict(list)
+
+for _, row in qa_geo.iterrows():
+
+    fcc = norm_id_value(
+        row[fcc_col]
+    )
+
+    geom = repair_geometry_qa(
+        row.geometry
+    )
+
+    if fcc and geom is not None:
+        pieces_by_fcc[fcc].append(
+            geom
+        )
+
+
+boundary_rows = []
+
+for fcc, geoms in pieces_by_fcc.items():
+
+    merged = repair_geometry_qa(
+        unary_union(geoms)
+    )
+
+    if merged is not None:
+        boundary_rows.append(
+            {
+                "FCC_PSAP_ID": fcc,
+                "GEOMETRY": merged
+            }
+        )
+
+
+boundaries = pd.DataFrame(
+    boundary_rows
+)
+
+if boundaries.empty:
+    raise RuntimeError(
+        "No usable FCC PSAP polygons were reconstructed."
+    )
+
+
+# ---------------------------------------------------------------------
+# 6. BUILD SPATIAL INDEX
+# ---------------------------------------------------------------------
+
+boundary_geometries = (
+    boundaries["GEOMETRY"]
+    .tolist()
+)
+
+boundary_fcc = (
+    boundaries["FCC_PSAP_ID"]
+    .tolist()
+)
+
+boundary_by_fcc = dict(
+    zip(
+        boundary_fcc,
+        boundary_geometries
+    )
+)
+
+boundary_index = STRtree(
+    boundary_geometries
+)
+
+geometry_position = {
+    id(geom): i
+    for i, geom in enumerate(
+        boundary_geometries
+    )
+}
+
+geod = Geod(
+    ellps="WGS84"
+)
+
+print(
+    f"Usable PSAP boundaries: "
+    f"{len(boundary_by_fcc):,}"
+)
+
+
+# ---------------------------------------------------------------------
+# 7. SPATIAL CANDIDATES
+# ---------------------------------------------------------------------
+
+def candidate_positions(geometry):
+
+    hits = boundary_index.query(
+        geometry
+    )
+
+    positions = []
+
+    for hit in hits:
+
+        # Shapely 2 normally returns indexes.
+        if isinstance(
+            hit,
+            (int, np.integer)
+        ):
+            positions.append(
+                int(hit)
+            )
+
+        else:
+            # Compatibility with versions returning geometries.
+            pos = geometry_position.get(
+                id(hit)
+            )
+
+            if pos is not None:
+                positions.append(
+                    pos
+                )
+
+    return positions
+
+
+# ---------------------------------------------------------------------
+# 8. GEODESIC UNCERTAINTY CIRCLE
+# ---------------------------------------------------------------------
+
+def geodesic_uncertainty_polygon(
+    lon,
+    lat,
+    meters,
+    vertices=24
+):
+
+    if (
+        not np.isfinite(meters)
+        or meters <= 0
+    ):
+        return None
+
+    azimuths = np.linspace(
+        0.0,
+        360.0,
+        vertices,
+        endpoint=False
+    )
+
+    lons, lats, _ = geod.fwd(
+        np.full(vertices, lon),
+        np.full(vertices, lat),
+        azimuths,
+        np.full(vertices, meters)
+    )
+
+    polygon = Polygon(
+        zip(lons, lats)
+    )
+
+    return repair_geometry_qa(
+        polygon
+    )
+
+
+# ---------------------------------------------------------------------
+# 9. DISTANCE FROM CALL POINT TO PSAP BOUNDARY
+# ---------------------------------------------------------------------
+
+def distance_to_boundary_m(
+    lon,
+    lat,
+    geometry
+):
+
+    if geometry is None:
+        return None
+
+    try:
+        point = Point(
+            lon,
+            lat
+        )
+
+        _, nearest = nearest_points(
+            point,
+            geometry.boundary
+        )
+
+        _, _, distance = geod.inv(
+            lon,
+            lat,
+            nearest.x,
+            nearest.y
+        )
+
+        return float(
+            abs(distance)
+        )
+
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------
+# 10. INDEPENDENT REIMPLEMENTATION OF V5 GEOGRAPHIC LABEL
+# ---------------------------------------------------------------------
+
+def label_one_call(
+    lat_value,
+    lon_value,
+    uncert_value,
+    routed_value
+):
+
+    lat = pd.to_numeric(
+        lat_value,
+        errors="coerce"
+    )
+
+    lon = pd.to_numeric(
+        lon_value,
+        errors="coerce"
+    )
+
+    uncert = pd.to_numeric(
+        uncert_value,
+        errors="coerce"
+    )
+
+    routed = norm_id_value(
+        routed_value
+    )
+
+
+    # ------------------------------------------------
+    # Validate location
+    # ------------------------------------------------
+
+    if pd.isna(lat) or pd.isna(lon):
+
+        return (
+            "MISSING_LOCATION",
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+
+
+    lat = float(lat)
+    lon = float(lon)
+
+
+    if not (
+        -90 <= lat <= 90
+        and
+        -180 <= lon <= 180
+    ):
+
+        return (
+            "INVALID_LOCATION",
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+
+
+    if (
+        pd.isna(uncert)
+        or float(uncert) <= 0
+    ):
+
+        return (
+            "INVALID_UNCERTAINTY",
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+
+
+    routed_geom = (
+        boundary_by_fcc.get(
+            routed
+        )
+    )
+
+
+    if routed_geom is None:
+
+        return (
+            "MISSING_ROUTED_BOUNDARY",
+            None,
+            False,
+            None,
+            None,
+            None
+        )
+
+
+    # ------------------------------------------------
+    # Build complete uncertainty area
+    # ------------------------------------------------
+
+    uncertainty = (
+        geodesic_uncertainty_polygon(
+            lon,
+            lat,
+            float(uncert)
+        )
+    )
+
+
+    if uncertainty is None:
+
+        return (
+            "INVALID_UNCERTAINTY",
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+
+
+    routed_intersects = bool(
+        routed_geom.intersects(
+            uncertainty
+        )
+    )
+
+    routed_contains = bool(
+        routed_geom.covers(
+            uncertainty
+        )
+    )
+
+
+    # ------------------------------------------------
+    # Find all PSAPs intersecting/containing uncertainty
+    # ------------------------------------------------
+
+    contains = []
+    overlaps = []
+
+
+    for position in candidate_positions(
+        uncertainty
+    ):
+
+        geom = boundary_geometries[
+            position
+        ]
+
+        fcc = boundary_fcc[
+            position
+        ]
+
+
+        if geom.covers(
+            uncertainty
+        ):
+            contains.append(
+                fcc
+            )
+
+
+        if geom.intersects(
+            uncertainty
+        ):
+            overlaps.append(
+                fcc
+            )
+
+
+    contains = sorted(
+        set(contains)
+    )
+
+    overlaps = sorted(
+        set(overlaps)
+    )
+
+
+    alternate_contains = [
+        fcc
+        for fcc in contains
+        if fcc != routed
+    ]
+
+    alternate_overlaps = [
+        fcc
+        for fcc in overlaps
+        if fcc != routed
+    ]
+
+
+    overlap_set = set(
+        overlaps
+    )
+
+    contain_set = set(
+        contains
+    )
+
+
+    # ------------------------------------------------
+    # Conservative strong labels
+    # ------------------------------------------------
+
+    if (
+        routed_contains
+        and
+        overlap_set == {routed}
+    ):
+
+        status = (
+            "DEFINITE_CORRECT"
+        )
+
+        expected = routed
+
+
+    elif (
+        not routed_intersects
+        and
+        len(alternate_contains) == 1
+        and
+        overlap_set == {
+            alternate_contains[0]
+        }
+        and
+        contain_set == {
+            alternate_contains[0]
+        }
+    ):
+
+        status = (
+            "DEFINITE_MISROUTE"
+        )
+
+        expected = (
+            alternate_contains[0]
+        )
+
+
+    elif (
+        len(overlaps) > 1
+        or
+        (
+            routed_intersects
+            and
+            alternate_overlaps
+        )
+    ):
+
+        status = (
+            "BOUNDARY_AMBIGUOUS"
+        )
+
+        expected = (
+            alternate_contains[0]
+            if len(alternate_contains) == 1
+            else None
+        )
+
+
+    else:
+
+        # Lower-confidence point fallback.
+        point = Point(
+            lon,
+            lat
+        )
+
+
+        point_alternates = sorted(
+            set(
+                boundary_fcc[pos]
+
+                for pos in candidate_positions(
+                    point
+                )
+
+                if (
+                    boundary_fcc[pos] != routed
+                    and
+                    boundary_geometries[pos].covers(
+                        point
+                    )
+                )
+            )
+        )
+
+
+        if len(point_alternates) == 1:
+
+            status = (
+                "POINT_MISMATCH_LOW_CONFIDENCE"
+            )
+
+            expected = (
+                point_alternates[0]
+            )
+
+
+        elif not overlaps:
+
+            status = (
+                "NO_CONTAINING_PSAP"
+            )
+
+            expected = None
+
+
+        else:
+
+            status = (
+                "BOUNDARY_AMBIGUOUS"
+            )
+
+            expected = (
+                alternate_contains[0]
+                if len(alternate_contains) == 1
+                else None
+            )
+
+
+    # ------------------------------------------------
+    # Fresh routed/expected boundary distances
+    # ------------------------------------------------
+
+    distance_to_routed = (
+        distance_to_boundary_m(
+            lon,
+            lat,
+            routed_geom
+        )
+    )
+
+
+    expected_geom = (
+        boundary_by_fcc.get(
+            expected
+        )
+        if expected
+        else None
+    )
+
+
+    distance_to_expected = (
+        distance_to_boundary_m(
+            lon,
+            lat,
+            expected_geom
+        )
+        if expected_geom is not None
+        else None
+    )
+
+
+    label = (
+        1
+        if status == "DEFINITE_MISROUTE"
+        else
+        (
+            0
+            if status == "DEFINITE_CORRECT"
+            else None
+        )
+    )
+
+
+    return (
+        status,
+        expected,
+        routed_intersects,
+        distance_to_routed,
+        distance_to_expected,
+        label
+    )
+
+
+# ---------------------------------------------------------------------
+# 11. FINAL SELF-CHECK
+# ---------------------------------------------------------------------
+
+required_objects = [
+    "label_one_call",
+    "candidate_positions",
+    "distance_to_boundary_m",
+    "boundary_by_fcc",
+    "boundary_geometries",
+    "boundary_fcc",
+    "norm_id_value"
+]
+
+missing_objects = [
+    x
+    for x in required_objects
+    if x not in globals()
+]
+
+
+if missing_objects:
+
+    raise RuntimeError(
+        "Bootstrap failed. Missing: "
+        + ", ".join(
+            missing_objects
+        )
+    )
+
+
+print()
+print("QA geometry bootstrap READY.")
+print(
+    "Now run the previous "
+    "'FINAL >25 KM MISROUTE DOUBLE-CHECK / RECOMPUTATION' cell."
+)
