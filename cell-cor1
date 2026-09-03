@@ -1,0 +1,1499 @@
+
+
+# === Strong PSAP misroute precursor / leakage-controlled feature discovery ===
+# Add as ONE cell at the end of psap_gmlc_routing_v5.ipynb.
+# Positive = rows in psap_routing_definite_misroutes_filtered_by_routed_distance.csv
+# Negative = matched DEFINITE_CORRECT calls from the v5 SQLite database.
+
+from pathlib import Path
+import sqlite3, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from IPython.display import display, Markdown
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score,
+    precision_score, recall_score, f1_score
+)
+
+# ---------------- change only these when needed ----------------
+POSITIVE_FILE = "psap_routing_definite_misroutes_filtered_by_routed_distance.csv"
+
+MAX_POSITIVES = 100_000       # None = use every filtered misroute
+CONTROL_RATIO = 1.0           # 1 correct control per misroute
+MAX_ASSOC_ROWS = 50_000
+MAX_PERM_ROWS = 25_000
+TOP_N = 25
+RANDOM_STATE = 42
+
+# Put features here after reviewing the first result, then rerun this cell.
+USER_EXCLUDE_FEATURES = [
+    # "MARKET",
+    # "COUNTY",
+    # "MME_NAME",
+    # "IMS__RAN_MARKET",
+]
+# ---------------------------------------------------------------
+
+DATA_DIR = globals().get("DATA_DIR", Path(r"C:\temp\gmlc_v2"))
+OUTPUT_DIR = globals().get("OUTPUT_DIR", DATA_DIR / "outputs_psap_rca_v5")
+DB_PATH = globals().get("DB_PATH", OUTPUT_DIR / "psap_rca_stage_v5.sqlite")
+
+pos_path = next(
+    (p for p in [OUTPUT_DIR / POSITIVE_FILE, DATA_DIR / POSITIVE_FILE] if p.exists()),
+    None
+)
+
+if pos_path is None:
+    raise FileNotFoundError(POSITIVE_FILE)
+
+if not Path(DB_PATH).exists():
+    raise FileNotFoundError(DB_PATH)
+
+cx = sqlite3.connect(DB_PATH)
+
+qi = lambda x: '"' + str(x).replace('"', '""') + '"'
+
+def cols(table):
+    return [
+        r[1]
+        for r in cx.execute(
+            f"PRAGMA table_info({qi(table)})"
+        ).fetchall()
+    ]
+
+view_cols = set(cols("enriched_calls_v5_view"))
+handoff_cols = set(cols("psap_routing_call_handoff_v5"))
+
+if not view_cols or not handoff_cols:
+    raise RuntimeError(
+        "Run v5 through the handoff section first."
+    )
+
+
+# ================================================================
+# 1. READ THE FILTERED DEFINITE MISROUTES
+# ================================================================
+
+pos = pd.read_csv(
+    pos_path,
+    dtype="string",
+    low_memory=False
+)
+
+pos.columns = [
+    str(c).strip().upper()
+    for c in pos.columns
+]
+
+# CALL_KEY is preferred because it is unique in v5.
+key = next(
+    (c for c in ["CALL_KEY", "GMLC_ROW_ID"] if c in pos.columns),
+    None
+)
+
+if key is None:
+    raise RuntimeError(
+        "Filtered CSV must retain CALL_KEY or GMLC_ROW_ID. "
+        "Do not fuzzy-join the failure labels."
+    )
+
+keys = (
+    pos[[key]]
+    .dropna()
+    .drop_duplicates()
+    .copy()
+)
+
+if key == "GMLC_ROW_ID":
+    keys[key] = pd.to_numeric(
+        keys[key],
+        errors="coerce"
+    ).astype("Int64")
+else:
+    keys[key] = (
+        keys[key]
+        .astype("string")
+        .str.strip()
+    )
+
+keys = keys.dropna()
+
+keys.to_sql(
+    "tmp_ml_positive_keys",
+    cx,
+    if_exists="replace",
+    index=False
+)
+
+
+# Resolve them to the v5 call grain.
+
+case = pd.read_sql_query(
+    f"""
+    SELECT DISTINCT
+        h.CALL_KEY,
+        h.GMLC_ROW_ID,
+        h.MARKET,
+        h.CALL_POPULATION_TAG,
+        h.CALL_BEGIN_TIME_UTC,
+        h.SETUP_ECGI_HEX,
+        h.CALL_DURATION_SEC
+    FROM psap_routing_call_handoff_v5 h
+    JOIN tmp_ml_positive_keys p
+      ON h.{qi(key)} = p.{qi(key)}
+    WHERE h.MISROUTE_LABEL = 1
+    """,
+    cx
+)
+
+coverage = len(case) / max(len(keys), 1)
+
+print(
+    f"Filtered positives: {len(keys):,} | "
+    f"exact matched: {len(case):,} "
+    f"({coverage:.1%})"
+)
+
+if coverage < 0.95:
+    print(
+        "WARNING: <95% exact positive-key coverage. "
+        "Inspect before trusting the ranking."
+    )
+
+if case.empty:
+    raise RuntimeError(
+        "No positive calls matched."
+    )
+
+# Large cohorts do not require every row for feature ranking.
+if MAX_POSITIVES and len(case) > MAX_POSITIVES:
+    case = case.sample(
+        MAX_POSITIVES,
+        random_state=RANDOM_STATE
+    ).copy()
+
+    print(
+        f"Model uses reproducible sample of "
+        f"{len(case):,} positives."
+    )
+
+
+# ================================================================
+# 2. BUILD MATCHED DEFINITE-CORRECT CONTROLS
+#
+# Matching on MARKET + population prevents the model from simply
+# learning that one market has more filtered failures.
+# ================================================================
+
+def norm(s):
+    return (
+        s.astype("string")
+        .fillna("<MISSING>")
+        .str.strip()
+        .replace("", "<MISSING>")
+    )
+
+case["STRATUM"] = (
+    norm(case["MARKET"])
+    + "||"
+    + norm(case["CALL_POPULATION_TAG"])
+)
+
+need = (
+    case["STRATUM"]
+    .value_counts()
+    .rename_axis("STRATUM")
+    .reset_index(name="N")
+)
+
+need["N"] = np.ceil(
+    need["N"] * CONTROL_RATIO
+).astype(int)
+
+need.to_sql(
+    "tmp_ml_control_need",
+    cx,
+    if_exists="replace",
+    index=False
+)
+
+case[["CALL_KEY"]].to_sql(
+    "tmp_ml_case_calls",
+    cx,
+    if_exists="replace",
+    index=False
+)
+
+stratum = """
+COALESCE(NULLIF(TRIM(h.MARKET),''),'<MISSING>')
+|| '||' ||
+COALESCE(NULLIF(TRIM(h.CALL_POPULATION_TAG),''),'<MISSING>')
+"""
+
+# Deterministic pseudo-random order.
+# Much cheaper than ORDER BY RANDOM() on millions of rows.
+order_expr = """
+ABS(
+    (
+        COALESCE(h.GMLC_ROW_ID,h.rowid)
+        * 1103515245
+        + 12345
+    ) % 2147483647
+)
+"""
+
+ctrl = pd.read_sql_query(
+    f"""
+    WITH ranked AS (
+
+        SELECT
+            h.CALL_KEY,
+            {stratum} AS STRATUM,
+
+            ROW_NUMBER() OVER(
+                PARTITION BY {stratum}
+                ORDER BY {order_expr}
+            ) AS RN
+
+        FROM psap_routing_call_handoff_v5 h
+
+        JOIN tmp_ml_control_need n
+          ON n.STRATUM = {stratum}
+
+        LEFT JOIN tmp_ml_case_calls p
+          ON p.CALL_KEY = h.CALL_KEY
+
+        WHERE h.MISROUTE_LABEL = 0
+          AND p.CALL_KEY IS NULL
+    )
+
+    SELECT
+        r.CALL_KEY
+
+    FROM ranked r
+
+    JOIN tmp_ml_control_need n
+      USING(STRATUM)
+
+    WHERE r.RN <= n.N
+    """,
+    cx
+)
+
+print(
+    f"Matched DEFINITE_CORRECT controls: "
+    f"{len(ctrl):,}"
+)
+
+
+# ================================================================
+# 3. DEFINE PRECURSOR FEATURES
+#
+# Start from features already available in v5, but explicitly
+# eliminate:
+#
+#   - target construction fields
+#   - expected/routed PSAP
+#   - route outcome
+#   - fallback
+#   - ESInet selection
+#   - SIP/delivery outcome
+#   - post-call duration
+#
+# This is the main anti-leakage protection.
+# ================================================================
+
+base_cat = list(
+    globals().get(
+        "CAT_FEATURES",
+        []
+    )
+)
+
+base_num = list(
+    globals().get(
+        "NUM_FEATURES",
+        []
+    )
+)
+
+
+# Extra useful precursor/context fields that may exist in the joined
+# IMS / RAW CCDR tables but are not in the original v5 ranking list.
+
+extra_cat = [
+
+    # IMS ingress/core context
+    "IMS__ORIG_E_CSCF_1",
+    "IMS__ORIG_E_CSCF_2",
+
+    "IMS__ORIG_PCSCF_1",
+    "IMS__ORIG_PCSCF_2",
+
+    "IMS__ORIG_SCC_AS_1",
+    "IMS__ORIG_SCC_AS_2",
+
+    "IMS__UE_MAKE",
+    "IMS__UE_MODEL",
+
+    # RAW CCDR pre/during-call context
+    "RAW__START_CELLSITE",
+    "RAW__START_CELLSITE_TZ",
+    "RAW__NODE_ADDRESS",
+]
+
+
+extra_num = [
+
+    # Important location-quality / location-acquisition candidates
+    "DISTCELL2XY_M",
+
+    "ESPOSREQ_COUNT",
+    "HDV_CNT",
+
+    "VERTICAL_UNCERT",
+
+    "LOCATION_FIRST_CONFIDENCE",
+    "LOCATION_FIRST_HORIZONTAL_UNCERT",
+
+    "LOCATION_LAST_CONFIDENCE",
+    "LOCATION_LAST_HORIZONTAL_UNCERT",
+
+    "ESPOSREQ_LOC_CONFIDENCE",
+    "ESPOSREQ_LOC_HORIZONTAL_UNCERT",
+
+    # IMS device context
+    "IMS__TAC_DEC__MEAN",
+    "IMS__UE_HANDSET_TAC__MEAN",
+]
+
+
+# ------------------------------------------------
+# HARD LEAKAGE / CONSEQUENCE EXCLUSION
+# ------------------------------------------------
+
+FORBIDDEN_EXACT = {
+
+    # TARGET ITSELF
+    "MISROUTE_LABEL",
+    "ROUTE_INTEGRITY_STATUS",
+
+    # GEOGRAPHIC LABEL CONSTRUCTION
+    "EXPECTED_FCC_PSAP_ID",
+    "FCC_PSAP_ID",
+
+    "PSAP_ID",
+    "PSAP_NAME",
+    "PSAP_NAME_ESRK",
+    "ROUTE_PSAP_NAME",
+
+    "LATITUDE",
+    "LONGITUDE",
+
+    "CELL_LATITUDE",
+    "CELL_LONGITUDE",
+
+    "UNCERT_METERS",
+
+    "DISTANCE_TO_ROUTED_BOUNDARY_M",
+    "DISTANCE_TO_EXPECTED_BOUNDARY_M",
+
+    # ROUTING RESULT / CONSEQUENCE
+    "ROUTE_ESZ",
+    "ROUTE_ESINET",
+    "ROUTE_FALLBACK",
+    "DEFAULT_ROUTED_CALL",
+
+    "ROUTE_STATUS_GMLC",
+    "ROUTE_OUT_TYPE",
+
+    "ESRK",
+
+    "LBR_ATTEMPTED",
+    "LBR_SUCCESS",
+    "LBR_PSAP_DIFF",
+
+    "LRRINVITE_STATUS",
+
+    # DOWNSTREAM FAILURE / RESPONSE
+    "SIP_STATUS",
+
+    "FAILURE_SHORT_DR",
+    "EXCEPTION_FLAG",
+    "EXCEPTION_TYPE",
+
+    "COMPLETE_CALL",
+
+    # ESINET / DELIVERY RESULT
+    "IMS__ESINET_PROVIDER",
+
+    "RAW__ECSCF_STATUS",
+    "RAW__DEFAULT_ROUTED_CALL",
+    "RAW__END_CELLSITE",
+
+    # POST-CALL / CONSEQUENCE
+    "CALL_DURATION_SEC",
+    "IMS__DURATION__MEAN",
+
+    "INVITE_TO_END_SEC",
+    "LOCATE_TO_CALL_END_SEC",
+
+    "IMS__TERM_E911_SBC_1",
+    "IMS__TERM_E911_SBC_2",
+}
+
+
+FORBIDDEN_TOKENS = (
+
+    "DISTANCE_TO_ROUTED",
+    "DISTANCE_TO_EXPECTED",
+
+    "TERM_E911",
+
+    "SOFTDROPCALL",
+
+    "__DURATION",
+
+    "END_CELLSITE",
+
+    "ROUTE_OUT_DIGITS",
+
+    "Z_RELAYED2PSAP",
+)
+
+
+# Your manual exclusions.
+user_ex = {
+    str(x).strip().upper()
+    for x in USER_EXCLUDE_FEATURES
+}
+
+
+def allowed(c):
+
+    u = c.upper()
+
+    return (
+        c in view_cols
+        and u not in FORBIDDEN_EXACT
+        and u not in user_ex
+        and not any(
+            token in u
+            for token in FORBIDDEN_TOKENS
+        )
+    )
+
+
+cat = [
+    c
+    for c in dict.fromkeys(
+        base_cat + extra_cat
+    )
+    if allowed(c)
+]
+
+num = [
+    c
+    for c in dict.fromkeys(
+        base_num + extra_num
+    )
+    if allowed(c)
+]
+
+
+# ================================================================
+# 4. LOAD ONLY THE SELECTED COHORT FROM SQLITE
+# ================================================================
+
+cohort = pd.concat(
+    [
+        case[["CALL_KEY"]].assign(
+            TARGET=1
+        ),
+
+        ctrl.assign(
+            TARGET=0
+        )
+    ],
+    ignore_index=True
+)
+
+cohort = cohort.drop_duplicates(
+    "CALL_KEY"
+)
+
+cohort.to_sql(
+    "tmp_ml_cohort",
+    cx,
+    if_exists="replace",
+    index=False
+)
+
+
+# Metadata is retained but NOT necessarily a model feature.
+meta = [
+    c
+    for c in [
+        "CALL_KEY",
+        "CALL_BEGIN_TIME_UTC",
+        "SETUP_ECGI_HEX",
+        "CALL_DURATION_SEC"
+    ]
+    if c in view_cols
+]
+
+selected = list(
+    dict.fromkeys(
+        meta + cat + num
+    )
+)
+
+select_sql = ",".join(
+    "e." + qi(c)
+    for c in selected
+)
+
+df = pd.read_sql_query(
+    f"""
+    SELECT
+        k.TARGET,
+        {select_sql}
+
+    FROM tmp_ml_cohort k
+
+    JOIN enriched_calls_v5_view e
+      ON e.CALL_KEY = k.CALL_KEY
+    """,
+    cx
+)
+
+
+# Timestamp is used ONLY for future holdout.
+# It is not given to the model.
+
+call_time = pd.to_datetime(
+    df.get("CALL_BEGIN_TIME_UTC"),
+    errors="coerce",
+    utc=True
+)
+
+
+for c in num:
+
+    df[c] = pd.to_numeric(
+        df[c],
+        errors="coerce"
+    )
+
+
+for c in cat:
+
+    df[c] = norm(
+        df[c]
+    )
+
+
+# ================================================================
+# 5. FEATURE QUALITY FILTER
+#
+# Automatically drop:
+#   - >95% missing
+#   - constant columns
+#   - huge categorical IDs likely to memorize calls/cells
+# ================================================================
+
+qc = []
+
+keep_cat = []
+keep_num = []
+
+for c in dict.fromkeys(
+    cat + num
+):
+
+    if c in num:
+
+        missing = (
+            df[c]
+            .isna()
+            .mean()
+        )
+
+    else:
+
+        missing = (
+            df[c]
+            .eq("<MISSING>")
+            .mean()
+        )
+
+    nunique = df[c].nunique(
+        dropna=True
+    )
+
+    decision = "KEEP"
+
+    if missing > 0.95:
+
+        decision = "DROP_>95%_MISSING"
+
+    elif nunique <= 1:
+
+        decision = "DROP_CONSTANT"
+
+    elif (
+        c in cat
+        and nunique > 200
+    ):
+
+        decision = "DROP_HIGH_CARDINALITY"
+
+
+    qc.append(
+        [
+            c,
+            missing,
+            nunique,
+            decision
+        ]
+    )
+
+
+    if decision == "KEEP":
+
+        if c in cat:
+
+            keep_cat.append(c)
+
+        else:
+
+            keep_num.append(c)
+
+
+cat = keep_cat
+num = keep_num
+
+features = (
+    num
+    + cat
+)
+
+
+if len(features) < 2:
+
+    raise RuntimeError(
+        f"Too few leakage-safe features: "
+        f"{features}"
+    )
+
+
+feature_qc = pd.DataFrame(
+    qc,
+    columns=[
+        "FEATURE",
+        "MISSING_FRAC",
+        "N_UNIQUE",
+        "DECISION"
+    ]
+)
+
+feature_qc.to_csv(
+    OUTPUT_DIR
+    / "misroute_precursor_feature_qc_v1.csv",
+    index=False
+)
+
+
+X = df[features].copy()
+y = df["TARGET"].astype(int)
+
+
+# ================================================================
+# 6. MODEL-FREE ASSOCIATION
+#
+# Mutual Information can detect nonlinear relationships.
+#
+# This gives:
+# ASSOCIATION_PCT
+#
+# It does NOT mean causal impact.
+# ================================================================
+
+assoc_idx = np.arange(
+    len(X)
+)
+
+
+if len(assoc_idx) > MAX_ASSOC_ROWS:
+
+    assoc_idx = train_test_split(
+        assoc_idx,
+        train_size=MAX_ASSOC_ROWS,
+        stratify=y,
+        random_state=RANDOM_STATE
+    )[0]
+
+
+assoc_pre = ColumnTransformer(
+    [
+
+        (
+            "num",
+            SimpleImputer(
+                strategy="median"
+            ),
+            num
+        ),
+
+        (
+            "cat",
+
+            OrdinalEncoder(
+                handle_unknown="use_encoded_value",
+                unknown_value=-1,
+                min_frequency=10,
+                max_categories=64
+            ),
+
+            cat
+        )
+    ]
+)
+
+
+Xa = assoc_pre.fit_transform(
+    X.iloc[assoc_idx]
+)
+
+ya = y.iloc[
+    assoc_idx
+]
+
+
+discrete = np.array(
+    [False] * len(num)
+    + [True] * len(cat)
+)
+
+
+mi = mutual_info_classif(
+    Xa,
+    ya,
+    discrete_features=discrete,
+    random_state=RANDOM_STATE
+)
+
+
+assoc = pd.DataFrame(
+    {
+        "FEATURE": features,
+        "ASSOCIATION_MI": mi
+    }
+)
+
+
+if assoc["ASSOCIATION_MI"].sum() > 0:
+
+    assoc["ASSOCIATION_PCT"] = (
+        100
+        * assoc["ASSOCIATION_MI"]
+        / assoc["ASSOCIATION_MI"].sum()
+    )
+
+else:
+
+    assoc["ASSOCIATION_PCT"] = 0
+
+
+# ================================================================
+# 7. TRAIN / TEST SPLIT
+#
+# Priority:
+#
+# 1. Future time holdout
+# 2. Hold out complete ECGIs
+# 3. Stratified random split
+#
+# This is stronger than random-only testing.
+# ================================================================
+
+idx = np.arange(
+    len(X)
+)
+
+train_idx = None
+test_idx = None
+split_name = None
+
+
+# ---------- future holdout ----------
+
+if (
+    call_time.notna().mean() >= 0.80
+    and call_time.nunique() >= 20
+):
+
+    cutoff = call_time.quantile(
+        0.80
+    )
+
+    tr = np.flatnonzero(
+        (
+            call_time
+            < cutoff
+        ).to_numpy()
+    )
+
+    te = np.flatnonzero(
+        (
+            call_time
+            >= cutoff
+        ).to_numpy()
+    )
+
+
+    if (
+        len(tr) > 100
+        and len(te) > 100
+        and y.iloc[tr].nunique() == 2
+        and y.iloc[te].nunique() == 2
+    ):
+
+        train_idx = tr
+        test_idx = te
+        split_name = "TIME_HOLDOUT"
+
+
+# ---------- ECGI group holdout ----------
+
+if (
+    train_idx is None
+    and "SETUP_ECGI_HEX" in df
+):
+
+    groups = norm(
+        df["SETUP_ECGI_HEX"]
+    )
+
+
+    if groups.nunique() >= 10:
+
+        splitter = GroupShuffleSplit(
+            n_splits=1,
+            test_size=0.20,
+            random_state=RANDOM_STATE
+        )
+
+        tr, te = next(
+            splitter.split(
+                X,
+                y,
+                groups
+            )
+        )
+
+
+        if (
+            y.iloc[tr].nunique() == 2
+            and y.iloc[te].nunique() == 2
+        ):
+
+            train_idx = tr
+            test_idx = te
+            split_name = "ECGI_GROUP_HOLDOUT"
+
+
+# ---------- final fallback ----------
+
+if train_idx is None:
+
+    train_idx, test_idx = train_test_split(
+        idx,
+        test_size=0.20,
+        stratify=y,
+        random_state=RANDOM_STATE
+    )
+
+    split_name = "STRATIFIED_RANDOM"
+
+
+# ================================================================
+# 8. NONLINEAR TABULAR MODEL
+#
+# HistGradientBoosting is a better second baseline than repeating
+# another Random Forest.
+#
+# Permutation importance is measured on held-out calls.
+# ================================================================
+
+preprocessor = ColumnTransformer(
+    [
+
+        (
+            "num",
+
+            Pipeline(
+                [
+                    (
+                        "impute",
+                        SimpleImputer(
+                            strategy="median"
+                        )
+                    )
+                ]
+            ),
+
+            num
+        ),
+
+
+        (
+            "cat",
+
+            Pipeline(
+                [
+                    (
+                        "encode",
+
+                        OrdinalEncoder(
+                            handle_unknown="use_encoded_value",
+                            unknown_value=-1,
+                            min_frequency=10,
+                            max_categories=64
+                        )
+                    )
+                ]
+            ),
+
+            cat
+        )
+    ]
+)
+
+
+categorical_mask = np.array(
+    [False] * len(num)
+    + [True] * len(cat)
+)
+
+
+model = HistGradientBoostingClassifier(
+
+    learning_rate=0.07,
+
+    max_iter=220,
+
+    max_leaf_nodes=31,
+
+    min_samples_leaf=30,
+
+    l2_regularization=1.0,
+
+    categorical_features=categorical_mask,
+
+    class_weight="balanced",
+
+    random_state=RANDOM_STATE
+)
+
+
+pipeline = Pipeline(
+    [
+        (
+            "prep",
+            preprocessor
+        ),
+
+        (
+            "model",
+            model
+        )
+    ]
+)
+
+
+pipeline.fit(
+    X.iloc[train_idx],
+    y.iloc[train_idx]
+)
+
+
+probability = pipeline.predict_proba(
+    X.iloc[test_idx]
+)[:, 1]
+
+
+prediction = (
+    probability >= 0.50
+).astype(int)
+
+
+metrics = pd.DataFrame(
+    [
+        {
+
+            "SPLIT":
+                split_name,
+
+            "TRAIN_ROWS":
+                len(train_idx),
+
+            "TEST_ROWS":
+                len(test_idx),
+
+            "ROC_AUC":
+                roc_auc_score(
+                    y.iloc[test_idx],
+                    probability
+                ),
+
+            "AVERAGE_PRECISION":
+                average_precision_score(
+                    y.iloc[test_idx],
+                    probability
+                ),
+
+            "PRECISION":
+                precision_score(
+                    y.iloc[test_idx],
+                    prediction,
+                    zero_division=0
+                ),
+
+            "RECALL":
+                recall_score(
+                    y.iloc[test_idx],
+                    prediction,
+                    zero_division=0
+                ),
+
+            "F1":
+                f1_score(
+                    y.iloc[test_idx],
+                    prediction,
+                    zero_division=0
+                )
+        }
+    ]
+)
+
+
+# ================================================================
+# 9. HELD-OUT PERMUTATION IMPORTANCE
+#
+# This asks:
+#
+# "When this feature is destroyed, how much does the model lose
+#  its ability to identify the strong misroutes?"
+#
+# Much better than RF Gini importance for this use.
+# ================================================================
+
+perm_idx = test_idx
+
+
+if len(test_idx) > MAX_PERM_ROWS:
+
+    perm_idx = train_test_split(
+        test_idx,
+        train_size=MAX_PERM_ROWS,
+        stratify=y.iloc[test_idx],
+        random_state=RANDOM_STATE
+    )[0]
+
+
+perm = permutation_importance(
+
+    pipeline,
+
+    X.iloc[perm_idx],
+
+    y.iloc[perm_idx],
+
+    scoring="average_precision",
+
+    n_repeats=3,
+
+    random_state=RANDOM_STATE,
+
+    n_jobs=-1
+)
+
+
+importance = pd.DataFrame(
+    {
+
+        "FEATURE":
+            features,
+
+        "PERM_IMPORTANCE_AP":
+            perm.importances_mean,
+
+        "IMPORTANCE_STD":
+            perm.importances_std
+    }
+)
+
+
+positive_importance = (
+    importance["PERM_IMPORTANCE_AP"]
+    .clip(lower=0)
+)
+
+
+if positive_importance.sum() > 0:
+
+    importance["MODEL_IMPORTANCE_PCT"] = (
+        100
+        * positive_importance
+        / positive_importance.sum()
+    )
+
+else:
+
+    importance["MODEL_IMPORTANCE_PCT"] = 0
+
+
+# ================================================================
+# 10. FINAL RANKING
+# ================================================================
+
+ranking = assoc.merge(
+    importance,
+    on="FEATURE"
+)
+
+
+ranking["SOURCE"] = np.select(
+
+    [
+        ranking["FEATURE"]
+        .str.startswith("IMS__"),
+
+        ranking["FEATURE"]
+        .str.startswith("RAW__")
+    ],
+
+    [
+        "IMS",
+        "RAW_CCDR"
+    ],
+
+    default="GMLC"
+)
+
+
+# Consensus uses both:
+#
+# - model-free association
+# - held-out model importance
+
+ranking["CONSENSUS_PCT"] = (
+
+    ranking["ASSOCIATION_PCT"]
+    + ranking["MODEL_IMPORTANCE_PCT"]
+
+) / 2
+
+
+ranking = (
+    ranking
+    .sort_values(
+        [
+            "CONSENSUS_PCT",
+            "MODEL_IMPORTANCE_PCT"
+        ],
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+
+ranking.insert(
+    0,
+    "RANK",
+    np.arange(
+        1,
+        len(ranking) + 1
+    )
+)
+
+
+ranking.to_csv(
+    OUTPUT_DIR
+    / "misroute_precursor_feature_ranking_v1.csv",
+    index=False
+)
+
+
+metrics.to_csv(
+    OUTPUT_DIR
+    / "misroute_precursor_model_metrics_v1.csv",
+    index=False
+)
+
+
+# ================================================================
+# 11. DURATION = REVIEW / PRIORITIZATION ONLY
+#
+# Do not allow it to influence model prediction.
+# ================================================================
+
+if "CALL_DURATION_SEC" in df:
+
+    duration = pd.to_numeric(
+        df["CALL_DURATION_SEC"],
+        errors="coerce"
+    )
+
+
+    duration_review = pd.DataFrame(
+        {
+
+            "TARGET":
+                y,
+
+            "CALL_DURATION_SEC":
+                duration
+        }
+    )
+
+
+    duration_summary = (
+
+        duration_review
+
+        .groupby(
+            "TARGET"
+        )
+
+        ["CALL_DURATION_SEC"]
+
+        .agg(
+            [
+                "count",
+                "median",
+                "mean",
+                "max"
+            ]
+        )
+    )
+
+
+    duration_summary.to_csv(
+        OUTPUT_DIR
+        / "misroute_duration_review_only_v1.csv"
+    )
+
+
+# ================================================================
+# 12. DISPLAY RESULTS
+# ================================================================
+
+display(
+    Markdown(
+        "### Leakage-controlled strong-misroute precursor model"
+    )
+)
+
+
+display(
+    metrics.round(4)
+)
+
+
+display(
+    Markdown(
+        "### Top precursor features"
+    )
+)
+
+
+display(
+    ranking
+    .head(30)
+    .round(3)
+)
+
+
+# ================================================================
+# 13. ASSOCIATION / IMPORTANCE MAP
+# ================================================================
+
+plot_df = ranking.head(
+    TOP_N
+).copy()
+
+
+plot_df["LABEL"] = (
+
+    "["
+    + plot_df["SOURCE"]
+    + "] "
+    + plot_df["FEATURE"]
+)
+
+
+heat = (
+
+    plot_df
+
+    .set_index(
+        "LABEL"
+    )
+
+    [
+        [
+            "ASSOCIATION_PCT",
+            "MODEL_IMPORTANCE_PCT"
+        ]
+    ]
+)
+
+
+fig, ax = plt.subplots(
+
+    figsize=(
+        10,
+        max(
+            7,
+            0.34 * len(heat) + 2
+        )
+    )
+)
+
+
+image = ax.imshow(
+
+    heat.values,
+
+    aspect="auto"
+)
+
+
+ax.set_yticks(
+    np.arange(
+        len(heat)
+    )
+)
+
+
+ax.set_yticklabels(
+    heat.index
+)
+
+
+ax.set_xticks(
+    [
+        0,
+        1
+    ]
+)
+
+
+ax.set_xticklabels(
+    [
+        "Association %",
+        "Held-out model importance %"
+    ]
+)
+
+
+ax.set_title(
+    "Strong PSAP Misroute Precursors "
+    "(post-route leakage excluded)"
+)
+
+
+for i in range(
+    len(heat)
+):
+
+    for j in range(
+        2
+    ):
+
+        ax.text(
+
+            j,
+
+            i,
+
+            f"{heat.iloc[i, j]:.1f}%",
+
+            ha="center",
+
+            va="center"
+        )
+
+
+fig.colorbar(
+
+    image,
+
+    ax=ax,
+
+    label="Normalized share (%)"
+)
+
+
+fig.tight_layout()
+
+
+fig.savefig(
+
+    OUTPUT_DIR
+    / "misroute_precursor_feature_association_map_v1.png",
+
+    dpi=180,
+
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+print("\nOutputs:")
+
+for f in [
+
+    "misroute_precursor_feature_ranking_v1.csv",
+
+    "misroute_precursor_model_metrics_v1.csv",
+
+    "misroute_precursor_feature_qc_v1.csv",
+
+    "misroute_duration_review_only_v1.csv",
+
+    "misroute_precursor_feature_association_map_v1.png"
+
+]:
+
+    print(
+        " -",
+        OUTPUT_DIR / f
+    )
+
+
+print(
+    "\nAdd unwanted columns to "
+    "USER_EXCLUDE_FEATURES and rerun this cell."
+)
+
+print(
+    "CALL_DURATION_SEC is REVIEW ONLY, "
+    "not a predictor."
+)
+
+print(
+    "Percentages are predictive association/"
+    "importance shares, NOT causal impact percentages."
+)
