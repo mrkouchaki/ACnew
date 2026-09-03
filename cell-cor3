@@ -1,0 +1,2345 @@
+
+
+
+# =====================================================================
+# FINAL >25 KM MISROUTE DOUBLE-CHECK / RECOMPUTATION
+#
+# Reads:
+#   psap_routing_definite_misroutes_filtered_by_routed_distance.csv
+#
+# For every UNIQ911_CID:
+#   1. Exact lookup in v5 SQLite
+#   2. Re-read canonical GMLC location / routed PSAP
+#   3. Freshly rerun PSAP boundary geometry
+#   4. Re-find expected PSAP
+#   5. Recalculate distance to routed PSAP boundary
+#   6. Recalculate distance to expected PSAP boundary
+#   7. Independently check which PSAP contains the call POINT
+#   8. Recalculate call duration from begin/end timestamps
+#   9. Compare FILE vs DATABASE vs FRESH RECALCULATION
+#
+# This does NOT relabel the main v5 tables.
+# It is an independent QA/export cell.
+# =====================================================================
+
+from pathlib import Path
+import re
+import sqlite3
+import numpy as np
+import pandas as pd
+
+from shapely.geometry import Point
+from IPython.display import display, Markdown
+
+
+# ---------------------------------------------------------------------
+# 0. CONFIG
+# ---------------------------------------------------------------------
+
+VERIFY_FILE = (
+    "psap_routing_definite_misroutes_filtered_by_routed_distance.csv"
+)
+
+MIN_DISTANCE_M = 25_000.0
+
+# Fresh calculation should normally be nearly identical.
+# Small tolerance protects against serialization/rounding differences.
+DISTANCE_TOLERANCE_M = 5.0
+
+DURATION_TOLERANCE_SEC = 2.0
+
+LONG_CALL_MIN_SEC = 60.0
+
+
+DATA_DIR = globals().get(
+    "DATA_DIR",
+    Path(r"C:\temp\gmlc_v2")
+)
+
+OUTPUT_DIR = globals().get(
+    "OUTPUT_DIR",
+    DATA_DIR / "outputs_psap_rca_v5"
+)
+
+DB_PATH = globals().get(
+    "DB_PATH",
+    OUTPUT_DIR / "psap_rca_stage_v5.sqlite"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ---------------------------------------------------------------------
+# 1. REQUIRED V5 GEOMETRY OBJECTS
+# ---------------------------------------------------------------------
+
+required_objects = [
+
+    "label_one_call",
+    "candidate_positions",
+    "distance_to_boundary_m",
+    "boundary_by_fcc",
+    "boundary_geometries",
+    "boundary_fcc",
+    "norm_id_value",
+]
+
+missing_objects = [
+
+    x
+    for x in required_objects
+    if x not in globals()
+]
+
+if missing_objects:
+
+    raise RuntimeError(
+
+        "Run the v5 boundary/label sections first. "
+        "Missing objects: "
+        + ", ".join(missing_objects)
+    )
+
+
+# ---------------------------------------------------------------------
+# 2. FIND INPUT FILE
+# ---------------------------------------------------------------------
+
+candidate_paths = [
+
+    OUTPUT_DIR / VERIFY_FILE,
+    DATA_DIR / VERIFY_FILE,
+]
+
+verify_path = next(
+
+    (
+        p
+        for p in candidate_paths
+        if p.exists()
+    ),
+
+    None
+)
+
+
+# If it was saved somewhere underneath gmlc_v2, find it.
+if verify_path is None:
+
+    found = list(
+        DATA_DIR.rglob(
+            VERIFY_FILE
+        )
+    )
+
+    if found:
+
+        verify_path = found[0]
+
+
+if verify_path is None:
+
+    raise FileNotFoundError(
+
+        f"Could not find {VERIFY_FILE} "
+        f"under {DATA_DIR}"
+    )
+
+
+print(
+    "Verification source:",
+    verify_path
+)
+
+
+# ---------------------------------------------------------------------
+# 3. READ FILTERED >25 KM MISROUTE FILE
+# ---------------------------------------------------------------------
+
+src = pd.read_csv(
+
+    verify_path,
+
+    dtype="string",
+
+    low_memory=False
+)
+
+
+src.columns = [
+
+    str(c)
+    .strip()
+    .upper()
+
+    for c in src.columns
+]
+
+
+if "UNIQ911_CID" not in src.columns:
+
+    raise RuntimeError(
+
+        "The verification CSV must contain UNIQ911_CID."
+    )
+
+
+src.insert(
+
+    0,
+
+    "INPUT_ROW",
+
+    np.arange(
+        1,
+        len(src) + 1
+    )
+)
+
+
+src["CID_NORM"] = (
+
+    src["UNIQ911_CID"]
+
+    .map(
+        norm_id_value
+    )
+)
+
+
+missing_cid = (
+
+    src["CID_NORM"]
+    .eq("")
+    .sum()
+)
+
+
+duplicate_input_cids = (
+
+    src.loc[
+        src["CID_NORM"].ne(""),
+        "CID_NORM"
+    ]
+
+    .duplicated(
+        keep=False
+    )
+
+    .sum()
+)
+
+
+print(
+    f"Input rows              : {len(src):,}"
+)
+
+print(
+    f"Unique valid UNIQ911_CID: "
+    f"{src.loc[src.CID_NORM.ne(''), 'CID_NORM'].nunique():,}"
+)
+
+print(
+    f"Missing UNIQ911_CID     : {missing_cid:,}"
+)
+
+print(
+    f"Rows with duplicate CID : {duplicate_input_cids:,}"
+)
+
+
+# ---------------------------------------------------------------------
+# 4. PRESERVE ORIGINAL FILE VALUES
+#
+# These become FILE_* so they can be compared with the database and
+# with a fresh geometry calculation.
+# ---------------------------------------------------------------------
+
+file_compare_columns = [
+
+    "LATITUDE",
+    "LONGITUDE",
+    "UNCERT_METERS",
+
+    "FCC_PSAP_ID",
+    "PSAP_ID",
+    "PSAP_NAME",
+    "ROUTE_PSAP_NAME",
+
+    "ROUTE_INTEGRITY_STATUS",
+    "EXPECTED_FCC_PSAP_ID",
+
+    "DISTANCE_TO_ROUTED_BOUNDARY_M",
+    "DISTANCE_TO_EXPECTED_BOUNDARY_M",
+
+    "MISROUTE_LABEL",
+
+    "CALL_BEGIN_TIME_UTC",
+    "CALL_END_TIME_UTC",
+    "CALL_DURATION_SEC",
+]
+
+
+existing_file_compare = [
+
+    c
+    for c in file_compare_columns
+    if c in src.columns
+]
+
+
+input_keep = [
+
+    "INPUT_ROW",
+    "UNIQ911_CID",
+    "CID_NORM",
+
+] + existing_file_compare
+
+
+verify = src[
+    input_keep
+].copy()
+
+
+verify = verify.rename(
+
+    columns={
+
+        c: f"FILE_{c}"
+
+        for c in existing_file_compare
+    }
+)
+
+
+# Keep original CID readable.
+verify = verify.rename(
+
+    columns={
+        "UNIQ911_CID":
+            "INPUT_UNIQ911_CID"
+    }
+)
+
+
+# ---------------------------------------------------------------------
+# 5. EXACT LOOKUP IN THE V5 SQLITE DATABASE
+# ---------------------------------------------------------------------
+
+if not Path(DB_PATH).exists():
+
+    raise FileNotFoundError(
+        DB_PATH
+    )
+
+
+check_con = sqlite3.connect(
+    DB_PATH
+)
+
+
+def table_cols(
+    connection,
+    table
+):
+
+    return {
+
+        row[1]
+
+        for row in connection.execute(
+            f'PRAGMA table_info("{table}")'
+        ).fetchall()
+    }
+
+
+handoff_cols = table_cols(
+
+    check_con,
+
+    "psap_routing_call_handoff_v5"
+)
+
+
+if not handoff_cols:
+
+    raise RuntimeError(
+
+        "psap_routing_call_handoff_v5 "
+        "does not exist. Run v5 handoff first."
+    )
+
+
+if "GMLC_JOIN_KEY" not in handoff_cols:
+
+    raise RuntimeError(
+
+        "v5 handoff does not contain GMLC_JOIN_KEY."
+    )
+
+
+# Unique normalized CIDs only for database lookup.
+cid_lookup = (
+
+    verify[
+        ["CID_NORM"]
+    ]
+
+    .query(
+        "CID_NORM != ''"
+    )
+
+    .drop_duplicates()
+)
+
+
+cid_lookup.to_sql(
+
+    "tmp_verify_25km_cids_v5",
+
+    check_con,
+
+    if_exists="replace",
+
+    index=False
+)
+
+
+# ---------------------------------------------------------------------
+# Dynamically select database columns.
+# ---------------------------------------------------------------------
+
+wanted_db = [
+
+    ("CALL_KEY", "DB_CALL_KEY"),
+
+    ("GMLC_ROW_ID", "DB_GMLC_ROW_ID"),
+
+    ("GMLC_JOIN_KEY", "DB_GMLC_JOIN_KEY"),
+
+    ("UNIQ911_CID", "DB_UNIQ911_CID"),
+
+    ("SOURCE_ROW_COUNT", "DB_GMLC_SOURCE_ROW_COUNT"),
+
+    ("CALL_CONFLICT", "DB_CALL_CONFLICT"),
+
+    ("CONFLICT_REASON", "DB_CONFLICT_REASON"),
+
+    ("CALL_BEGIN_TIME_UTC", "DB_CALL_BEGIN_TIME_UTC"),
+
+    ("CALL_END_TIME_UTC", "DB_CALL_END_TIME_UTC"),
+
+    ("LATITUDE", "DB_LATITUDE"),
+
+    ("LONGITUDE", "DB_LONGITUDE"),
+
+    ("UNCERT_METERS", "DB_UNCERT_METERS"),
+
+    ("FCC_PSAP_ID", "DB_ROUTED_FCC_PSAP_ID"),
+
+    ("PSAP_ID", "DB_PSAP_ID"),
+
+    ("PSAP_NAME", "DB_ROUTED_PSAP_NAME"),
+
+    ("ROUTE_PSAP_NAME", "DB_ROUTE_PSAP_NAME"),
+
+    ("ROUTE_INTEGRITY_STATUS", "DB_ROUTE_INTEGRITY_STATUS"),
+
+    ("EXPECTED_FCC_PSAP_ID", "DB_EXPECTED_FCC_PSAP_ID"),
+
+    (
+        "ROUTED_INTERSECTS_UNCERT_AREA",
+        "DB_ROUTED_INTERSECTS_UNCERT_AREA"
+    ),
+
+    (
+        "DISTANCE_TO_ROUTED_BOUNDARY_M",
+        "DB_DISTANCE_TO_ROUTED_BOUNDARY_M"
+    ),
+
+    (
+        "DISTANCE_TO_EXPECTED_BOUNDARY_M",
+        "DB_DISTANCE_TO_EXPECTED_BOUNDARY_M"
+    ),
+
+    ("MISROUTE_LABEL", "DB_MISROUTE_LABEL"),
+
+    ("CALL_DURATION_SEC", "DB_CALL_DURATION_SEC"),
+
+    ("IMS__ROW_COUNT", "DB_IMS_ROW_COUNT"),
+
+    ("RAW__ROW_COUNT", "DB_RAW_CCDR_ROW_COUNT"),
+]
+
+
+select_parts = []
+
+
+for source_col, output_col in wanted_db:
+
+    if source_col in handoff_cols:
+
+        select_parts.append(
+
+            f'h."{source_col}" '
+            f'AS "{output_col}"'
+        )
+
+    else:
+
+        select_parts.append(
+
+            f'NULL AS "{output_col}"'
+        )
+
+
+db_calls = pd.read_sql_query(
+
+    f"""
+
+    SELECT
+
+        k.CID_NORM,
+
+        {", ".join(select_parts)}
+
+    FROM tmp_verify_25km_cids_v5 k
+
+    LEFT JOIN psap_routing_call_handoff_v5 h
+
+      ON h.GMLC_JOIN_KEY =
+         k.CID_NORM
+
+    """,
+
+    check_con
+)
+
+
+# There should be one canonical CALL_KEY per valid UNIQ911_CID.
+cid_match_counts = (
+
+    db_calls
+
+    .groupby(
+        "CID_NORM",
+        dropna=False
+    )
+
+    ["DB_CALL_KEY"]
+
+    .count()
+
+    .rename(
+        "CID_DATABASE_MATCH_COUNT"
+    )
+
+    .reset_index()
+)
+
+
+db_calls = db_calls.merge(
+
+    cid_match_counts,
+
+    on="CID_NORM",
+
+    how="left"
+)
+
+
+# Merge original filtered CSV with canonical DB information.
+verify = verify.merge(
+
+    db_calls,
+
+    on="CID_NORM",
+
+    how="left",
+
+    validate="many_to_many"
+)
+
+
+verify[
+    "CID_EXACT_MATCH"
+] = (
+
+    verify[
+        "DB_CALL_KEY"
+    ]
+
+    .notna()
+)
+
+
+verify[
+    "CID_UNIQUE_DATABASE_MATCH"
+] = (
+
+    verify[
+        "CID_DATABASE_MATCH_COUNT"
+    ]
+
+    .fillna(0)
+
+    .eq(1)
+)
+
+
+# ---------------------------------------------------------------------
+# 6. PSAP NAME LOOKUP
+#
+# This is only for readable output.
+# The boundary calculation itself uses FCC PSAP IDs.
+# ---------------------------------------------------------------------
+
+psap_name_lookup = pd.read_sql_query(
+
+    """
+
+    WITH counts AS (
+
+        SELECT
+
+            FCC_PSAP_ID,
+
+            PSAP_NAME,
+
+            COUNT(*) AS N
+
+        FROM psap_routing_call_handoff_v5
+
+        WHERE
+
+            FCC_PSAP_ID IS NOT NULL
+
+            AND TRIM(
+                CAST(FCC_PSAP_ID AS TEXT)
+            ) <> ''
+
+            AND PSAP_NAME IS NOT NULL
+
+            AND TRIM(PSAP_NAME) <> ''
+
+        GROUP BY
+
+            FCC_PSAP_ID,
+
+            PSAP_NAME
+    ),
+
+    ranked AS (
+
+        SELECT
+
+            *,
+
+            ROW_NUMBER() OVER (
+
+                PARTITION BY FCC_PSAP_ID
+
+                ORDER BY
+                    N DESC,
+                    PSAP_NAME
+
+            ) AS RN
+
+        FROM counts
+    )
+
+    SELECT
+        FCC_PSAP_ID,
+        PSAP_NAME
+
+    FROM ranked
+
+    WHERE RN = 1
+
+    """,
+
+    check_con
+)
+
+
+psap_name_map = {
+
+    norm_id_value(fcc):
+        name
+
+    for fcc, name in zip(
+
+        psap_name_lookup[
+            "FCC_PSAP_ID"
+        ],
+
+        psap_name_lookup[
+            "PSAP_NAME"
+        ]
+    )
+}
+
+
+# ---------------------------------------------------------------------
+# 7. INDEPENDENT POINT-ONLY PSAP SANITY CHECK
+#
+# This is separate from the uncertainty-area label.
+#
+# It asks:
+#   "Which PSAP polygon contains the reported LAT/LON point?"
+#
+# For a strong definite misroute, the unique point PSAP should normally
+# be the same PSAP found by the full uncertainty-area calculation.
+# ---------------------------------------------------------------------
+
+def point_psap_check(
+    lat_value,
+    lon_value
+):
+
+    lat = pd.to_numeric(
+        lat_value,
+        errors="coerce"
+    )
+
+    lon = pd.to_numeric(
+        lon_value,
+        errors="coerce"
+    )
+
+
+    if (
+        pd.isna(lat)
+        or pd.isna(lon)
+    ):
+
+        return (
+            "MISSING_LOCATION",
+            None,
+            None,
+            0
+        )
+
+
+    lat = float(lat)
+
+    lon = float(lon)
+
+
+    if not (
+        -90 <= lat <= 90
+        and
+        -180 <= lon <= 180
+    ):
+
+        return (
+            "INVALID_LOCATION",
+            None,
+            None,
+            0
+        )
+
+
+    point = Point(
+        lon,
+        lat
+    )
+
+
+    inside = sorted(
+        set(
+
+            boundary_fcc[pos]
+
+            for pos in candidate_positions(
+                point
+            )
+
+            if boundary_geometries[
+                pos
+            ].covers(
+                point
+            )
+        )
+    )
+
+
+    if len(inside) == 1:
+
+        return (
+
+            "UNIQUE_POINT_PSAP",
+
+            inside[0],
+
+            psap_name_map.get(
+                inside[0]
+            ),
+
+            1
+        )
+
+
+    if len(inside) == 0:
+
+        return (
+
+            "NO_POINT_PSAP",
+
+            None,
+
+            None,
+
+            0
+        )
+
+
+    return (
+
+        "MULTIPLE_POINT_PSAP",
+
+        "|".join(
+            inside
+        ),
+
+        None,
+
+        len(inside)
+    )
+
+
+# ---------------------------------------------------------------------
+# 8. FRESH GEOGRAPHIC RECALCULATION
+#
+# IMPORTANT:
+# This does NOT trust the stored expected PSAP or distances.
+#
+# It reruns:
+#    location + uncertainty + routed FCC PSAP
+#        -> boundary geometry
+#        -> expected FCC PSAP
+#        -> routed distance
+#        -> expected distance
+# ---------------------------------------------------------------------
+
+fresh_rows = []
+
+
+for row in verify.itertuples(
+    index=False
+):
+
+    if not bool(
+        row.CID_EXACT_MATCH
+    ):
+
+        fresh_rows.append(
+            {
+
+                "RECALC_ROUTE_INTEGRITY_STATUS":
+                    "CID_NOT_FOUND",
+
+                "RECALC_EXPECTED_FCC_PSAP_ID":
+                    None,
+
+                "RECALC_ROUTED_INTERSECTS_UNCERT_AREA":
+                    None,
+
+                "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M":
+                    np.nan,
+
+                "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_M":
+                    np.nan,
+
+                "RECALC_MISROUTE_LABEL":
+                    np.nan,
+
+                "POINT_PSAP_STATUS":
+                    "CID_NOT_FOUND",
+
+                "POINT_EXPECTED_FCC_PSAP_ID":
+                    None,
+
+                "POINT_EXPECTED_PSAP_NAME":
+                    None,
+
+                "POINT_PSAP_COUNT":
+                    0,
+            }
+        )
+
+        continue
+
+
+    # Fresh v5 uncertainty-area calculation
+    result = label_one_call(
+
+        row.DB_LATITUDE,
+
+        row.DB_LONGITUDE,
+
+        row.DB_UNCERT_METERS,
+
+        row.DB_ROUTED_FCC_PSAP_ID
+    )
+
+
+    (
+        fresh_status,
+        fresh_expected,
+        fresh_routed_intersects,
+        fresh_dist_routed,
+        fresh_dist_expected,
+        fresh_label,
+
+    ) = result
+
+
+    # Independent point-only containment sanity check
+    (
+        point_status,
+        point_expected,
+        point_name,
+        point_count,
+
+    ) = point_psap_check(
+
+        row.DB_LATITUDE,
+
+        row.DB_LONGITUDE
+    )
+
+
+    fresh_rows.append(
+        {
+
+            "RECALC_ROUTE_INTEGRITY_STATUS":
+                fresh_status,
+
+            "RECALC_EXPECTED_FCC_PSAP_ID":
+                fresh_expected,
+
+            "RECALC_ROUTED_INTERSECTS_UNCERT_AREA":
+                fresh_routed_intersects,
+
+            "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M":
+                fresh_dist_routed,
+
+            "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_M":
+                fresh_dist_expected,
+
+            "RECALC_MISROUTE_LABEL":
+                fresh_label,
+
+            "POINT_PSAP_STATUS":
+                point_status,
+
+            "POINT_EXPECTED_FCC_PSAP_ID":
+                point_expected,
+
+            "POINT_EXPECTED_PSAP_NAME":
+                point_name,
+
+            "POINT_PSAP_COUNT":
+                point_count,
+        }
+    )
+
+
+fresh = pd.DataFrame(
+    fresh_rows
+)
+
+
+verify = pd.concat(
+
+    [
+
+        verify.reset_index(
+            drop=True
+        ),
+
+        fresh.reset_index(
+            drop=True
+        ),
+    ],
+
+    axis=1
+)
+
+
+# ---------------------------------------------------------------------
+# 9. ADD HUMAN-READABLE ROUTED / EXPECTED PSAP NAMES
+# ---------------------------------------------------------------------
+
+verify[
+    "RECALC_ROUTED_FCC_PSAP_ID"
+] = (
+
+    verify[
+        "DB_ROUTED_FCC_PSAP_ID"
+    ]
+
+    .map(
+        norm_id_value
+    )
+)
+
+
+verify[
+    "RECALC_EXPECTED_FCC_PSAP_ID"
+] = (
+
+    verify[
+        "RECALC_EXPECTED_FCC_PSAP_ID"
+    ]
+
+    .map(
+        norm_id_value
+    )
+)
+
+
+verify[
+    "RECALC_ROUTED_PSAP_NAME"
+] = (
+
+    verify[
+        "RECALC_ROUTED_FCC_PSAP_ID"
+    ]
+
+    .map(
+        psap_name_map
+    )
+
+    .fillna(
+        verify[
+            "DB_ROUTED_PSAP_NAME"
+        ]
+    )
+)
+
+
+verify[
+    "RECALC_EXPECTED_PSAP_NAME"
+] = (
+
+    verify[
+        "RECALC_EXPECTED_FCC_PSAP_ID"
+    ]
+
+    .map(
+        psap_name_map
+    )
+)
+
+
+# ---------------------------------------------------------------------
+# 10. DISTANCES IN METERS + KM
+# ---------------------------------------------------------------------
+
+for c in [
+
+    "DB_DISTANCE_TO_ROUTED_BOUNDARY_M",
+    "DB_DISTANCE_TO_EXPECTED_BOUNDARY_M",
+
+    "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M",
+    "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_M",
+
+]:
+
+    verify[c] = pd.to_numeric(
+
+        verify[c],
+
+        errors="coerce"
+    )
+
+
+verify[
+    "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_KM"
+] = (
+
+    verify[
+        "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M"
+    ]
+
+    / 1000.0
+)
+
+
+verify[
+    "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_KM"
+] = (
+
+    verify[
+        "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_M"
+    ]
+
+    / 1000.0
+)
+
+
+verify[
+    "RECALC_OVER_25KM"
+] = (
+
+    verify[
+        "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M"
+    ]
+
+    >= MIN_DISTANCE_M
+)
+
+
+# ---------------------------------------------------------------------
+# 11. STORED DB vs FRESH RECALCULATION
+# ---------------------------------------------------------------------
+
+def normalized_id_series(
+    series
+):
+
+    return series.map(
+        norm_id_value
+    )
+
+
+db_expected_norm = normalized_id_series(
+
+    verify[
+        "DB_EXPECTED_FCC_PSAP_ID"
+    ]
+)
+
+
+fresh_expected_norm = normalized_id_series(
+
+    verify[
+        "RECALC_EXPECTED_FCC_PSAP_ID"
+    ]
+)
+
+
+point_expected_norm = normalized_id_series(
+
+    verify[
+        "POINT_EXPECTED_FCC_PSAP_ID"
+    ]
+)
+
+
+verify[
+    "EXPECTED_PSAP_DB_VS_RECALC_MATCH"
+] = (
+
+    db_expected_norm.ne("")
+
+    &
+
+    fresh_expected_norm.ne("")
+
+    &
+
+    db_expected_norm.eq(
+        fresh_expected_norm
+    )
+)
+
+
+verify[
+    "POINT_PSAP_VS_RECALC_EXPECTED_MATCH"
+] = (
+
+    point_expected_norm.ne("")
+
+    &
+
+    fresh_expected_norm.ne("")
+
+    &
+
+    point_expected_norm.eq(
+        fresh_expected_norm
+    )
+)
+
+
+verify[
+    "ROUTE_STATUS_DB_VS_RECALC_MATCH"
+] = (
+
+    verify[
+        "DB_ROUTE_INTEGRITY_STATUS"
+    ]
+
+    .astype("string")
+    .fillna("")
+    .str.strip()
+
+    ==
+
+    verify[
+        "RECALC_ROUTE_INTEGRITY_STATUS"
+    ]
+
+    .astype("string")
+    .fillna("")
+    .str.strip()
+)
+
+
+verify[
+    "ROUTED_DISTANCE_ABS_DIFF_M"
+] = (
+
+    verify[
+        "DB_DISTANCE_TO_ROUTED_BOUNDARY_M"
+    ]
+
+    -
+
+    verify[
+        "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M"
+    ]
+
+).abs()
+
+
+verify[
+    "EXPECTED_DISTANCE_ABS_DIFF_M"
+] = (
+
+    verify[
+        "DB_DISTANCE_TO_EXPECTED_BOUNDARY_M"
+    ]
+
+    -
+
+    verify[
+        "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_M"
+    ]
+
+).abs()
+
+
+verify[
+    "ROUTED_DISTANCE_DB_VS_RECALC_MATCH"
+] = (
+
+    verify[
+        "ROUTED_DISTANCE_ABS_DIFF_M"
+    ]
+
+    <= DISTANCE_TOLERANCE_M
+)
+
+
+verify[
+    "EXPECTED_DISTANCE_DB_VS_RECALC_MATCH"
+] = (
+
+    verify[
+        "EXPECTED_DISTANCE_ABS_DIFF_M"
+    ]
+
+    <= DISTANCE_TOLERANCE_M
+)
+
+
+verify[
+    "RECALC_CONFIRMS_DEFINITE_MISROUTE"
+] = (
+
+    verify[
+        "RECALC_ROUTE_INTEGRITY_STATUS"
+    ]
+
+    .eq(
+        "DEFINITE_MISROUTE"
+    )
+
+    &
+
+    pd.to_numeric(
+
+        verify[
+            "RECALC_MISROUTE_LABEL"
+        ],
+
+        errors="coerce"
+
+    ).eq(1)
+)
+
+
+# ---------------------------------------------------------------------
+# 12. ORIGINAL FILTERED FILE vs DB / RECALC
+# ---------------------------------------------------------------------
+
+if (
+    "FILE_EXPECTED_FCC_PSAP_ID"
+    in verify.columns
+):
+
+    file_expected_norm = (
+
+        normalized_id_series(
+
+            verify[
+                "FILE_EXPECTED_FCC_PSAP_ID"
+            ]
+        )
+    )
+
+
+    verify[
+        "FILE_EXPECTED_VS_RECALC_MATCH"
+    ] = (
+
+        file_expected_norm.ne("")
+
+        &
+
+        fresh_expected_norm.ne("")
+
+        &
+
+        file_expected_norm.eq(
+            fresh_expected_norm
+        )
+    )
+
+
+if (
+    "FILE_FCC_PSAP_ID"
+    in verify.columns
+):
+
+    file_routed_norm = (
+
+        normalized_id_series(
+
+            verify[
+                "FILE_FCC_PSAP_ID"
+            ]
+        )
+    )
+
+
+    db_routed_norm = (
+
+        normalized_id_series(
+
+            verify[
+                "DB_ROUTED_FCC_PSAP_ID"
+            ]
+        )
+    )
+
+
+    verify[
+        "FILE_ROUTED_PSAP_VS_DB_MATCH"
+    ] = (
+
+        file_routed_norm.ne("")
+
+        &
+
+        db_routed_norm.ne("")
+
+        &
+
+        file_routed_norm.eq(
+            db_routed_norm
+        )
+    )
+
+
+if (
+    "FILE_DISTANCE_TO_ROUTED_BOUNDARY_M"
+    in verify.columns
+):
+
+    file_d = pd.to_numeric(
+
+        verify[
+            "FILE_DISTANCE_TO_ROUTED_BOUNDARY_M"
+        ],
+
+        errors="coerce"
+    )
+
+
+    verify[
+        "FILE_ROUTED_DISTANCE_VS_RECALC_DIFF_M"
+    ] = (
+
+        file_d
+
+        -
+
+        verify[
+            "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M"
+        ]
+
+    ).abs()
+
+
+if (
+    "FILE_DISTANCE_TO_EXPECTED_BOUNDARY_M"
+    in verify.columns
+):
+
+    file_d = pd.to_numeric(
+
+        verify[
+            "FILE_DISTANCE_TO_EXPECTED_BOUNDARY_M"
+        ],
+
+        errors="coerce"
+    )
+
+
+    verify[
+        "FILE_EXPECTED_DISTANCE_VS_RECALC_DIFF_M"
+    ] = (
+
+        file_d
+
+        -
+
+        verify[
+            "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_M"
+        ]
+
+    ).abs()
+
+
+# ---------------------------------------------------------------------
+# 13. CALL DURATION DOUBLE-CHECK
+#
+# DB_CALL_DURATION_SEC is the source value.
+# TIMESTAMP_DURATION_SEC is independently calculated:
+#
+#       CALL_END_TIME_UTC - CALL_BEGIN_TIME_UTC
+# ---------------------------------------------------------------------
+
+def parse_call_timestamp(
+    series
+):
+
+    s = (
+
+        series
+        .astype("string")
+        .fillna("")
+        .str.strip()
+    )
+
+
+    # Oracle exports may appear like:
+    # 31-AUG-23 11.58.06.388762000 PM UTC
+    #
+    # Convert hh.mm.ss -> hh:mm:ss while leaving fractional seconds.
+
+    s = s.str.replace(
+
+        r"(\s\d{1,2})\.(\d{2})\.(\d{2})(\.\d+)?",
+
+        lambda m:
+            f"{m.group(1)}:"
+            f"{m.group(2)}:"
+            f"{m.group(3)}"
+            f"{m.group(4) or ''}",
+
+        regex=True
+    )
+
+
+    return pd.to_datetime(
+
+        s,
+
+        errors="coerce",
+
+        utc=True
+    )
+
+
+begin_ts = parse_call_timestamp(
+
+    verify[
+        "DB_CALL_BEGIN_TIME_UTC"
+    ]
+)
+
+
+end_ts = parse_call_timestamp(
+
+    verify[
+        "DB_CALL_END_TIME_UTC"
+    ]
+)
+
+
+verify[
+    "TIMESTAMP_DURATION_SEC"
+] = (
+
+    end_ts
+    -
+    begin_ts
+
+).dt.total_seconds()
+
+
+# Negative calculated durations are invalid.
+verify.loc[
+
+    verify[
+        "TIMESTAMP_DURATION_SEC"
+    ] < 0,
+
+    "TIMESTAMP_DURATION_SEC"
+
+] = np.nan
+
+
+verify[
+    "DB_CALL_DURATION_SEC"
+] = pd.to_numeric(
+
+    verify[
+        "DB_CALL_DURATION_SEC"
+    ],
+
+    errors="coerce"
+)
+
+
+verify[
+    "CALL_DURATION_ABS_DIFF_SEC"
+] = (
+
+    verify[
+        "DB_CALL_DURATION_SEC"
+    ]
+
+    -
+
+    verify[
+        "TIMESTAMP_DURATION_SEC"
+    ]
+
+).abs()
+
+
+both_duration = (
+
+    verify[
+        "DB_CALL_DURATION_SEC"
+    ].notna()
+
+    &
+
+    verify[
+        "TIMESTAMP_DURATION_SEC"
+    ].notna()
+)
+
+
+verify[
+    "CALL_DURATION_CHECK"
+] = np.select(
+
+    [
+
+        both_duration
+
+        &
+
+        (
+            verify[
+                "CALL_DURATION_ABS_DIFF_SEC"
+            ]
+
+            <= DURATION_TOLERANCE_SEC
+        ),
+
+        both_duration
+
+        &
+
+        (
+            verify[
+                "CALL_DURATION_ABS_DIFF_SEC"
+            ]
+
+            > DURATION_TOLERANCE_SEC
+        ),
+
+        verify[
+            "DB_CALL_DURATION_SEC"
+        ].notna(),
+
+        verify[
+            "TIMESTAMP_DURATION_SEC"
+        ].notna(),
+    ],
+
+    [
+
+        "MATCH",
+
+        "DIFFERENT",
+
+        "ONLY_DATABASE_DURATION",
+
+        "ONLY_TIMESTAMP_DURATION",
+    ],
+
+    default=
+        "NO_DURATION_AVAILABLE"
+)
+
+
+# Effective review duration:
+# Prefer explicit GMLC call duration, fall back to timestamps.
+
+verify[
+    "CALL_DURATION_EFFECTIVE_SEC"
+] = (
+
+    verify[
+        "DB_CALL_DURATION_SEC"
+    ]
+
+    .where(
+
+        verify[
+            "DB_CALL_DURATION_SEC"
+        ]
+
+        .ge(0),
+
+        verify[
+            "TIMESTAMP_DURATION_SEC"
+        ]
+    )
+)
+
+
+verify[
+    "IS_ZERO_DURATION"
+] = (
+
+    verify[
+        "CALL_DURATION_EFFECTIVE_SEC"
+    ]
+
+    .eq(0)
+)
+
+
+verify[
+    "IS_LONG_DURATION"
+] = (
+
+    verify[
+        "CALL_DURATION_EFFECTIVE_SEC"
+    ]
+
+    >= LONG_CALL_MIN_SEC
+)
+
+
+# ---------------------------------------------------------------------
+# 14. CONFIRM IMS / RAW CCDR ATTACHMENT
+#
+# These are informational only.
+# Geography is intentionally recalculated from GMLC + PSAP boundaries.
+# ---------------------------------------------------------------------
+
+verify[
+    "IMS_ATTACHED"
+] = (
+
+    pd.to_numeric(
+
+        verify[
+            "DB_IMS_ROW_COUNT"
+        ],
+
+        errors="coerce"
+
+    )
+
+    .fillna(0)
+
+    .gt(0)
+)
+
+
+verify[
+    "RAW_CCDR_ATTACHED"
+] = (
+
+    pd.to_numeric(
+
+        verify[
+            "DB_RAW_CCDR_ROW_COUNT"
+        ],
+
+        errors="coerce"
+
+    )
+
+    .fillna(0)
+
+    .gt(0)
+)
+
+
+# ---------------------------------------------------------------------
+# 15. OVERALL GEOGRAPHIC VERIFICATION
+# ---------------------------------------------------------------------
+
+verify[
+    "GEOMETRY_DOUBLECHECK_PASS"
+] = (
+
+    verify[
+        "CID_EXACT_MATCH"
+    ]
+
+    &
+
+    verify[
+        "CID_UNIQUE_DATABASE_MATCH"
+    ]
+
+    &
+
+    verify[
+        "RECALC_CONFIRMS_DEFINITE_MISROUTE"
+    ]
+
+    &
+
+    verify[
+        "RECALC_OVER_25KM"
+    ]
+
+    &
+
+    verify[
+        "EXPECTED_PSAP_DB_VS_RECALC_MATCH"
+    ]
+
+    &
+
+    verify[
+        "POINT_PSAP_VS_RECALC_EXPECTED_MATCH"
+    ]
+
+    &
+
+    verify[
+        "ROUTE_STATUS_DB_VS_RECALC_MATCH"
+    ]
+
+    &
+
+    verify[
+        "ROUTED_DISTANCE_DB_VS_RECALC_MATCH"
+    ]
+
+    &
+
+    verify[
+        "EXPECTED_DISTANCE_DB_VS_RECALC_MATCH"
+    ]
+)
+
+
+# ---------------------------------------------------------------------
+# Explain exactly why a row failed verification.
+# ---------------------------------------------------------------------
+
+def verification_reason(
+    row
+):
+
+    reasons = []
+
+
+    if not row.CID_EXACT_MATCH:
+
+        reasons.append(
+            "CID_NOT_FOUND"
+        )
+
+
+    if (
+        row.CID_EXACT_MATCH
+
+        and
+
+        not row.CID_UNIQUE_DATABASE_MATCH
+    ):
+
+        reasons.append(
+            "CID_NOT_UNIQUE"
+        )
+
+
+    if (
+
+        row.RECALC_ROUTE_INTEGRITY_STATUS
+
+        != "DEFINITE_MISROUTE"
+    ):
+
+        reasons.append(
+
+            "FRESH_GEOMETRY_NOT_DEFINITE_MISROUTE"
+        )
+
+
+    if not bool(
+        row.RECALC_OVER_25KM
+    ):
+
+        reasons.append(
+            "FRESH_DISTANCE_NOT_OVER_25KM"
+        )
+
+
+    if not bool(
+        row.EXPECTED_PSAP_DB_VS_RECALC_MATCH
+    ):
+
+        reasons.append(
+            "EXPECTED_PSAP_CHANGED"
+        )
+
+
+    if not bool(
+        row.POINT_PSAP_VS_RECALC_EXPECTED_MATCH
+    ):
+
+        reasons.append(
+            "POINT_PSAP_DISAGREES"
+        )
+
+
+    if not bool(
+        row.ROUTED_DISTANCE_DB_VS_RECALC_MATCH
+    ):
+
+        reasons.append(
+            "ROUTED_DISTANCE_CHANGED"
+        )
+
+
+    if not bool(
+        row.EXPECTED_DISTANCE_DB_VS_RECALC_MATCH
+    ):
+
+        reasons.append(
+            "EXPECTED_DISTANCE_CHANGED"
+        )
+
+
+    return (
+
+        "VERIFIED"
+
+        if not reasons
+
+        else "|".join(
+            reasons
+        )
+    )
+
+
+verify[
+    "VERIFICATION_REASON"
+] = verify.apply(
+
+    verification_reason,
+
+    axis=1
+)
+
+
+verify[
+    "VERIFICATION_STATUS"
+] = np.where(
+
+    verify[
+        "GEOMETRY_DOUBLECHECK_PASS"
+    ],
+
+    "VERIFIED_25KM_DEFINITE_MISROUTE",
+
+    "REVIEW_REQUIRED"
+)
+
+
+# ---------------------------------------------------------------------
+# 16. ORDER OUTPUT FOR MANUAL REVIEW
+# ---------------------------------------------------------------------
+
+front_columns = [
+
+    "INPUT_ROW",
+
+    "INPUT_UNIQ911_CID",
+
+    "DB_CALL_KEY",
+
+    "CID_EXACT_MATCH",
+
+    "CID_UNIQUE_DATABASE_MATCH",
+
+    "DB_GMLC_SOURCE_ROW_COUNT",
+
+    "DB_CALL_CONFLICT",
+
+    "IMS_ATTACHED",
+
+    "RAW_CCDR_ATTACHED",
+
+
+    # Call location
+    "DB_LATITUDE",
+
+    "DB_LONGITUDE",
+
+    "DB_UNCERT_METERS",
+
+
+    # Routed PSAP
+    "RECALC_ROUTED_FCC_PSAP_ID",
+
+    "RECALC_ROUTED_PSAP_NAME",
+
+
+    # Expected PSAP
+    "RECALC_EXPECTED_FCC_PSAP_ID",
+
+    "RECALC_EXPECTED_PSAP_NAME",
+
+
+    # Independent point sanity check
+    "POINT_PSAP_STATUS",
+
+    "POINT_EXPECTED_FCC_PSAP_ID",
+
+    "POINT_EXPECTED_PSAP_NAME",
+
+
+    # Fresh distances
+    "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M",
+
+    "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_KM",
+
+    "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_M",
+
+    "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_KM",
+
+
+    # Fresh label
+    "RECALC_ROUTE_INTEGRITY_STATUS",
+
+    "RECALC_MISROUTE_LABEL",
+
+    "RECALC_OVER_25KM",
+
+
+    # Duration
+    "DB_CALL_DURATION_SEC",
+
+    "TIMESTAMP_DURATION_SEC",
+
+    "CALL_DURATION_ABS_DIFF_SEC",
+
+    "CALL_DURATION_CHECK",
+
+    "CALL_DURATION_EFFECTIVE_SEC",
+
+    "IS_ZERO_DURATION",
+
+    "IS_LONG_DURATION",
+
+
+    # QA
+    "EXPECTED_PSAP_DB_VS_RECALC_MATCH",
+
+    "POINT_PSAP_VS_RECALC_EXPECTED_MATCH",
+
+    "ROUTED_DISTANCE_ABS_DIFF_M",
+
+    "EXPECTED_DISTANCE_ABS_DIFF_M",
+
+    "ROUTED_DISTANCE_DB_VS_RECALC_MATCH",
+
+    "EXPECTED_DISTANCE_DB_VS_RECALC_MATCH",
+
+    "GEOMETRY_DOUBLECHECK_PASS",
+
+    "VERIFICATION_STATUS",
+
+    "VERIFICATION_REASON",
+]
+
+
+front_columns = [
+
+    c
+
+    for c in front_columns
+
+    if c in verify.columns
+]
+
+
+remaining_columns = [
+
+    c
+
+    for c in verify.columns
+
+    if c not in front_columns
+]
+
+
+verify = verify[
+
+    front_columns
+
+    +
+
+    remaining_columns
+]
+
+
+# Prioritize longest calls, then largest routed distance.
+verify = verify.sort_values(
+
+    [
+
+        "GEOMETRY_DOUBLECHECK_PASS",
+
+        "CALL_DURATION_EFFECTIVE_SEC",
+
+        "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_M",
+    ],
+
+    ascending=[
+
+        False,
+
+        False,
+
+        False,
+    ],
+
+    na_position="last"
+)
+
+
+# ---------------------------------------------------------------------
+# 17. SAVE OUTPUTS
+# ---------------------------------------------------------------------
+
+full_output = (
+
+    OUTPUT_DIR
+    / "psap_25km_misroute_doublecheck_v5.csv"
+)
+
+
+review_output = (
+
+    OUTPUT_DIR
+    / "psap_25km_misroute_doublecheck_review_required_v5.csv"
+)
+
+
+summary_output = (
+
+    OUTPUT_DIR
+    / "psap_25km_misroute_doublecheck_summary_v5.csv"
+)
+
+
+verify.to_csv(
+
+    full_output,
+
+    index=False
+)
+
+
+review = verify.loc[
+
+    ~verify[
+        "GEOMETRY_DOUBLECHECK_PASS"
+    ]
+
+].copy()
+
+
+review.to_csv(
+
+    review_output,
+
+    index=False
+)
+
+
+# ---------------------------------------------------------------------
+# 18. SUMMARY
+# ---------------------------------------------------------------------
+
+summary = pd.DataFrame(
+
+    [
+
+        {
+
+            "INPUT_ROWS":
+                len(verify),
+
+            "UNIQUE_INPUT_CIDS":
+                verify[
+                    "CID_NORM"
+                ].nunique(),
+
+            "EXACT_CID_MATCHES":
+                int(
+                    verify[
+                        "CID_EXACT_MATCH"
+                    ].sum()
+                ),
+
+            "FRESH_DEFINITE_MISROUTES":
+                int(
+                    verify[
+                        "RECALC_CONFIRMS_DEFINITE_MISROUTE"
+                    ].sum()
+                ),
+
+            "FRESH_OVER_25KM":
+                int(
+                    verify[
+                        "RECALC_OVER_25KM"
+                    ].sum()
+                ),
+
+            "EXPECTED_PSAP_MATCHES":
+                int(
+                    verify[
+                        "EXPECTED_PSAP_DB_VS_RECALC_MATCH"
+                    ].sum()
+                ),
+
+            "POINT_PSAP_MATCHES":
+                int(
+                    verify[
+                        "POINT_PSAP_VS_RECALC_EXPECTED_MATCH"
+                    ].sum()
+                ),
+
+            "ROUTED_DISTANCE_MATCHES":
+                int(
+                    verify[
+                        "ROUTED_DISTANCE_DB_VS_RECALC_MATCH"
+                    ].sum()
+                ),
+
+            "EXPECTED_DISTANCE_MATCHES":
+                int(
+                    verify[
+                        "EXPECTED_DISTANCE_DB_VS_RECALC_MATCH"
+                    ].sum()
+                ),
+
+            "FULLY_VERIFIED":
+                int(
+                    verify[
+                        "GEOMETRY_DOUBLECHECK_PASS"
+                    ].sum()
+                ),
+
+            "REVIEW_REQUIRED":
+                int(
+                    (
+                        ~verify[
+                            "GEOMETRY_DOUBLECHECK_PASS"
+                        ]
+                    ).sum()
+                ),
+
+            "ZERO_DURATION_CALLS":
+                int(
+                    verify[
+                        "IS_ZERO_DURATION"
+                    ].sum()
+                ),
+
+            "LONG_CALLS_GE_60_SEC":
+                int(
+                    verify[
+                        "IS_LONG_DURATION"
+                    ].sum()
+                ),
+
+            "DURATION_MATCHES":
+                int(
+                    verify[
+                        "CALL_DURATION_CHECK"
+                    ]
+                    .eq(
+                        "MATCH"
+                    )
+                    .sum()
+                ),
+        }
+    ]
+)
+
+
+summary.to_csv(
+
+    summary_output,
+
+    index=False
+)
+
+
+display(
+
+    Markdown(
+        "### >25 km definite-misroute independent double-check"
+    )
+)
+
+
+display(
+    summary
+)
+
+
+display(
+
+    Markdown(
+        "### Verification preview"
+    )
+)
+
+
+preview_cols = [
+
+    "INPUT_UNIQ911_CID",
+
+    "DB_LATITUDE",
+
+    "DB_LONGITUDE",
+
+    "DB_UNCERT_METERS",
+
+    "RECALC_ROUTED_FCC_PSAP_ID",
+
+    "RECALC_ROUTED_PSAP_NAME",
+
+    "RECALC_EXPECTED_FCC_PSAP_ID",
+
+    "RECALC_EXPECTED_PSAP_NAME",
+
+    "RECALC_DISTANCE_TO_ROUTED_BOUNDARY_KM",
+
+    "RECALC_DISTANCE_TO_EXPECTED_BOUNDARY_KM",
+
+    "CALL_DURATION_EFFECTIVE_SEC",
+
+    "CALL_DURATION_CHECK",
+
+    "VERIFICATION_STATUS",
+
+    "VERIFICATION_REASON",
+]
+
+
+display(
+
+    verify[
+        [
+            c
+            for c in preview_cols
+            if c in verify.columns
+        ]
+    ]
+
+    .head(
+        50
+    )
+)
+
+
+if not review.empty:
+
+    display(
+
+        Markdown(
+            "### Calls requiring review"
+        )
+    )
+
+
+    display(
+
+        review[
+            [
+                c
+                for c in preview_cols
+                if c in review.columns
+            ]
+        ]
+
+        .head(
+            100
+        )
+    )
+
+
+print(
+    "\nSaved:"
+)
+
+print(
+    " -",
+    full_output
+)
+
+print(
+    " -",
+    review_output
+)
+
+print(
+    " -",
+    summary_output
+)
+
+
+check_con.close()
+
+
