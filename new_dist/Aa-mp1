@@ -1,0 +1,3027 @@
+
+
+
+
+
+
+# =====================================================================
+# CROSSCHECK CSV -> INTERACTIVE PSAP / LOCATION MAP
+# =====================================================================
+#
+# READS:
+#   psap_three_location_coordinate_crosscheck_v5.csv
+#
+# AND:
+#   C:\temp\gmlc_v2\psap\Final_Join.tab
+#
+#
+# MAP SHOWS
+# ---------
+#   BLUE     = CALLER location
+#   GREEN    = CELL location
+#   ORANGE   = ESPOSREQ location (optional)
+#
+#   RED polygon   = ROUTED PSAP boundary
+#   GREEN polygon = EXPECTED PSAP boundary
+#
+#   RED line:
+#       CALLER -> nearest point on ROUTED PSAP boundary
+#
+#   GREEN line:
+#       selected location source -> nearest EXPECTED PSAP boundary
+#
+#   BLUE dashed line:
+#       CALLER -> CELL
+#
+#   BLUE circle:
+#       caller uncertainty radius, when available
+#
+#
+# POPUP INCLUDES
+# --------------
+#   Call ID
+#   Call duration
+#   Routed PSAP ID / name
+#   Expected PSAP ID / name
+#   SAME / CLOSE / DIFFERENT
+#   Caller -> routed boundary distance
+#   Caller -> expected boundary distance
+#   Cell -> routed boundary distance
+#   ESPOSREQ -> routed boundary distance
+#   Caller -> Cell distance
+#
+#
+# MIN / MEAN / MAX
+# ----------------
+# Recomputed independently for each ROUTED_PSAP_ID using the current
+# input CSV:
+#
+#   CALLER   -> ROUTED PSAP
+#   CELL     -> ROUTED PSAP
+#   ESPOSREQ -> ROUTED PSAP
+#
+# Three separate map layers are created:
+#
+#   Routed PSAP MIN distance stats
+#   Routed PSAP MEAN distance stats
+#   Routed PSAP MAX distance stats
+#
+# They are OFF by default and can be turned ON/OFF from Layer Control.
+#
+#
+# IMPORTANT
+# ---------
+# If you make a filtered CSV, simply change INPUT_CSV below.
+#
+# =====================================================================
+
+
+from pathlib import Path
+import re
+import html
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+import folium
+
+from folium.plugins import (
+    MarkerCluster,
+    Fullscreen,
+    MeasureControl,
+)
+
+from shapely.geometry import (
+    Point,
+    mapping,
+)
+
+from shapely.ops import (
+    nearest_points,
+)
+
+from pyproj import Geod
+
+
+# =====================================================================
+# 0. CONFIGURATION
+# =====================================================================
+
+DATA_DIR = Path(
+    r"C:\temp\gmlc_v2"
+)
+
+OUTPUT_DIR = (
+    DATA_DIR
+    / "outputs_psap_rca_v5"
+)
+
+BOUNDARY_PATH = (
+    DATA_DIR
+    / "psap"
+    / "Final_Join.tab"
+)
+
+
+# ---------------------------------------------------------------------
+# CURRENT CROSSCHECK CSV
+# ---------------------------------------------------------------------
+
+INPUT_CSV = (
+    OUTPUT_DIR
+    / "psap_three_location_coordinate_crosscheck_v5.csv"
+)
+
+
+# ---------------------------------------------------------------------
+# If you create a filtered copy, use it instead:
+#
+# INPUT_CSV = Path(
+#     r"C:\temp\gmlc_v2\outputs_psap_rca_v5\my_filtered_crosscheck.csv"
+# )
+# ---------------------------------------------------------------------
+
+
+OUTPUT_HTML = (
+    OUTPUT_DIR
+    / f"{INPUT_CSV.stem}_interactive_map.html"
+)
+
+
+# =====================================================================
+# MAP OPTIONS
+# =====================================================================
+
+# Which coordinate source defines the EXPECTED PSAP shown in green?
+#
+# Options:
+#   "CALLER"
+#   "CELL"
+#   "ESPOSREQ"
+
+EXPECTED_SOURCE = "CALLER"
+
+
+# Number of calls to draw.
+#
+# Large files with thousands of calls + lines can create a very large
+# HTML map.
+#
+# None = map every row in the CSV.
+#
+# If set to 300, the 300 calls with the largest CALLER -> ROUTED
+# boundary distance are mapped.
+
+MAX_CALLS = 300
+
+
+# ---------------------------------------------------------------------
+# Location layers
+# ---------------------------------------------------------------------
+
+SHOW_CALLER_POINT = True
+SHOW_CELL_POINT = True
+SHOW_ESPOSREQ_POINT = True
+
+SHOW_UNCERTAINTY_CIRCLE = True
+
+
+# ---------------------------------------------------------------------
+# Distance lines
+# ---------------------------------------------------------------------
+
+SHOW_CALLER_TO_ROUTED_LINE = True
+SHOW_EXPECTED_BOUNDARY_LINE = True
+SHOW_CALLER_TO_CELL_LINE = True
+
+
+# ---------------------------------------------------------------------
+# PSAP polygons
+# ---------------------------------------------------------------------
+
+SHOW_ROUTED_PSAP_BOUNDARIES = True
+SHOW_EXPECTED_PSAP_BOUNDARIES = True
+
+# Drawing all 4,000+ PSAP boundaries makes the HTML much heavier.
+# Normally keep False. Relevant routed/expected boundaries are still
+# always shown.
+SHOW_ALL_PSAP_BOUNDARIES = False
+
+
+# ---------------------------------------------------------------------
+# MIN / MEAN / MAX statistic layers
+#
+# If enabled, each becomes a layer in the map control.
+# They are hidden initially and can be turned on individually.
+# ---------------------------------------------------------------------
+
+ENABLE_MIN_DISTANCE_LAYER = True
+ENABLE_MEAN_DISTANCE_LAYER = True
+ENABLE_MAX_DISTANCE_LAYER = True
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+geod = Geod(
+    ellps="WGS84"
+)
+
+
+def norm_id(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    value = (
+        str(value)
+        .strip()
+        .strip('"')
+    )
+
+    if value.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    return re.sub(
+        r"\.0$",
+        "",
+        value
+    )
+
+
+def safe_text(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    return html.escape(
+        str(value).strip()
+    )
+
+
+def fmt_num(
+    value,
+    digits=2
+):
+
+    value = pd.to_numeric(
+        value,
+        errors="coerce"
+    )
+
+    if pd.isna(value):
+        return "N/A"
+
+    return f"{float(value):,.{digits}f}"
+
+
+def pick_col(
+    df,
+    candidates,
+    required=False
+):
+
+    for column in candidates:
+
+        if column in df.columns:
+            return column
+
+    if required:
+
+        raise RuntimeError(
+            "None of these columns exist:\n"
+            + "\n".join(candidates)
+        )
+
+    return None
+
+
+def numeric_series(
+    df,
+    column
+):
+
+    if column is None:
+
+        return pd.Series(
+            np.nan,
+            index=df.index,
+            dtype=float
+        )
+
+    return pd.to_numeric(
+        df[column],
+        errors="coerce"
+    )
+
+
+def distance_km(
+    df,
+    km_candidates,
+    m_candidates
+):
+
+    km_col = pick_col(
+        df,
+        km_candidates
+    )
+
+    if km_col is not None:
+
+        return pd.to_numeric(
+            df[km_col],
+            errors="coerce"
+        )
+
+
+    m_col = pick_col(
+        df,
+        m_candidates
+    )
+
+    if m_col is not None:
+
+        return (
+            pd.to_numeric(
+                df[m_col],
+                errors="coerce"
+            )
+            / 1000.0
+        )
+
+
+    return pd.Series(
+        np.nan,
+        index=df.index,
+        dtype=float
+    )
+
+
+def valid_point(
+    lat,
+    lon
+):
+
+    lat = pd.to_numeric(
+        lat,
+        errors="coerce"
+    )
+
+    lon = pd.to_numeric(
+        lon,
+        errors="coerce"
+    )
+
+    return (
+        pd.notna(lat)
+        and pd.notna(lon)
+        and -90 <= float(lat) <= 90
+        and -180 <= float(lon) <= 180
+    )
+
+
+def repair_geometry(
+    geometry
+):
+
+    if (
+        geometry is None
+        or geometry.is_empty
+    ):
+        return None
+
+    try:
+
+        if not geometry.is_valid:
+            geometry = geometry.buffer(0)
+
+        if (
+            geometry.is_empty
+            or not geometry.is_valid
+        ):
+            return None
+
+        return geometry
+
+    except Exception:
+
+        return None
+
+
+def nearest_boundary_location(
+    lat,
+    lon,
+    geometry
+):
+    """
+    Return:
+       boundary_lat,
+       boundary_lon,
+       geodesic_distance_km
+    """
+
+    if (
+        geometry is None
+        or
+        not valid_point(
+            lat,
+            lon
+        )
+    ):
+        return (
+            np.nan,
+            np.nan,
+            np.nan
+        )
+
+
+    lat = float(lat)
+    lon = float(lon)
+
+    point = Point(
+        lon,
+        lat
+    )
+
+
+    try:
+
+        _, near = nearest_points(
+            point,
+            geometry.boundary
+        )
+
+
+        _, _, distance_m = geod.inv(
+            lon,
+            lat,
+            near.x,
+            near.y
+        )
+
+
+        return (
+            float(near.y),
+            float(near.x),
+            abs(float(distance_m)) / 1000.0
+        )
+
+
+    except Exception:
+
+        return (
+            np.nan,
+            np.nan,
+            np.nan
+        )
+
+
+# =====================================================================
+# 2. READ CURRENT CROSSCHECK CSV
+# =====================================================================
+
+if not INPUT_CSV.exists():
+
+    raise FileNotFoundError(
+        INPUT_CSV
+    )
+
+
+df = pd.read_csv(
+    INPUT_CSV,
+    dtype="string",
+    low_memory=False
+)
+
+
+df.columns = [
+    str(c)
+    .strip()
+    .upper()
+    for c in df.columns
+]
+
+
+print(
+    "Input crosscheck:",
+    INPUT_CSV
+)
+
+print(
+    "Rows:",
+    f"{len(df):,}"
+)
+
+
+# =====================================================================
+# 3. AUTO-DETECT COLUMN NAMES
+#
+# Supports both your older crosscheck CSV and newer renamed versions.
+# =====================================================================
+
+CALL_ID_COL = pick_col(
+    df,
+    [
+        "INPUT_UNIQ911_CID",
+        "UNIQ911_CID",
+    ]
+)
+
+
+ROUTED_ID_COL = pick_col(
+    df,
+    [
+        "ROUTED_PSAP_ID",
+        "ROUTED_PSAP_FCC_ID",
+        "FCC_PSAP_ID",
+    ],
+    required=True
+)
+
+
+ROUTED_NAME_COL = pick_col(
+    df,
+    [
+        "ROUTED_PSAP_NAME",
+        "ROUTED_PSAP_NAME_RESOLVED",
+        "ROUTE_PSAP_NAME",
+        "PSAP_NAME",
+    ]
+)
+
+
+CALLER_LAT_COL = pick_col(
+    df,
+    [
+        "CALLER_LATITUDE",
+        "LATITUDE",
+    ],
+    required=True
+)
+
+
+CALLER_LON_COL = pick_col(
+    df,
+    [
+        "CALLER_LONGITUDE",
+        "LONGITUDE",
+    ],
+    required=True
+)
+
+
+CELL_LAT_COL = pick_col(
+    df,
+    [
+        "CELL_LATITUDE",
+    ]
+)
+
+
+CELL_LON_COL = pick_col(
+    df,
+    [
+        "CELL_LONGITUDE",
+    ]
+)
+
+
+ESPOSREQ_LAT_COL = pick_col(
+    df,
+    [
+        "ESPOSREQ_LATITUDE",
+        "ESPOSREQ_LOC_LATITUDE",
+    ]
+)
+
+
+ESPOSREQ_LON_COL = pick_col(
+    df,
+    [
+        "ESPOSREQ_LONGITUDE",
+        "ESPOSREQ_LOC_LONGITUDE",
+    ]
+)
+
+
+DURATION_COL = pick_col(
+    df,
+    [
+        "CALL_DURATION_SEC",
+    ]
+)
+
+
+UNCERTAINTY_COL = pick_col(
+    df,
+    [
+        "UNCERT_METERS",
+        "LOCATION_FIRST_HORIZONTAL_UNCERT",
+    ]
+)
+
+
+# =====================================================================
+# 4. EXPECTED PSAP COLUMN ALIASES
+# =====================================================================
+
+expected_aliases = {
+
+    "CALLER": {
+
+        "ID": [
+            "CALLER_EXPECTED_PSAP_ID",
+            "CALLER_EXPECTED_PSAP_FCC_ID",
+            "CALLER_POINT_PSAP_ID",
+        ],
+
+        "NAME": [
+            "CALLER_EXPECTED_PSAP_NAME",
+            "CALLER_POINT_PSAP_NAME",
+        ],
+
+        "STATUS": [
+            "CALLER_EXPECTED_VS_ROUTED_PSAP",
+            "CALLER_VS_ROUTED_PSAP",
+            "CALLER_ROUTED_VS_EXPECTED_STATUS",
+        ],
+    },
+
+
+    "CELL": {
+
+        "ID": [
+            "CELL_EXPECTED_PSAP_ID",
+            "CELL_EXPECTED_PSAP_FCC_ID",
+            "CELL_POINT_PSAP_ID",
+        ],
+
+        "NAME": [
+            "CELL_EXPECTED_PSAP_NAME",
+            "CELL_POINT_PSAP_NAME",
+        ],
+
+        "STATUS": [
+            "CELL_EXPECTED_VS_ROUTED_PSAP",
+            "CELL_VS_ROUTED_PSAP",
+            "CELL_ROUTED_VS_EXPECTED_STATUS",
+        ],
+    },
+
+
+    "ESPOSREQ": {
+
+        "ID": [
+            "ESPOSREQ_EXPECTED_PSAP_ID",
+            "ESPOSREQ_EXPECTED_PSAP_FCC_ID",
+            "ESPOSREQ_POINT_PSAP_ID",
+        ],
+
+        "NAME": [
+            "ESPOSREQ_EXPECTED_PSAP_NAME",
+            "ESPOSREQ_POINT_PSAP_NAME",
+        ],
+
+        "STATUS": [
+            "ESPOSREQ_EXPECTED_VS_ROUTED_PSAP",
+            "ESPOSREQ_VS_ROUTED_PSAP",
+            "ESPOSREQ_ROUTED_VS_EXPECTED_STATUS",
+        ],
+    },
+}
+
+
+EXPECTED_SOURCE = (
+    EXPECTED_SOURCE
+    .strip()
+    .upper()
+)
+
+
+if EXPECTED_SOURCE not in expected_aliases:
+
+    raise ValueError(
+        "EXPECTED_SOURCE must be "
+        "'CALLER', 'CELL', or 'ESPOSREQ'."
+    )
+
+
+EXPECTED_ID_COL = pick_col(
+    df,
+    expected_aliases[
+        EXPECTED_SOURCE
+    ]["ID"],
+    required=True
+)
+
+
+EXPECTED_NAME_COL = pick_col(
+    df,
+    expected_aliases[
+        EXPECTED_SOURCE
+    ]["NAME"]
+)
+
+
+EXPECTED_STATUS_COL = pick_col(
+    df,
+    expected_aliases[
+        EXPECTED_SOURCE
+    ]["STATUS"]
+)
+
+
+# =====================================================================
+# 5. NORMALIZE COORDINATES / IDS
+# =====================================================================
+
+df["_ROUTED_ID"] = (
+    df[
+        ROUTED_ID_COL
+    ]
+    .map(
+        norm_id
+    )
+)
+
+
+df["_EXPECTED_ID"] = (
+    df[
+        EXPECTED_ID_COL
+    ]
+    .map(
+        norm_id
+    )
+)
+
+
+df["_CALLER_LAT"] = numeric_series(
+    df,
+    CALLER_LAT_COL
+)
+
+df["_CALLER_LON"] = numeric_series(
+    df,
+    CALLER_LON_COL
+)
+
+
+df["_CELL_LAT"] = numeric_series(
+    df,
+    CELL_LAT_COL
+)
+
+df["_CELL_LON"] = numeric_series(
+    df,
+    CELL_LON_COL
+)
+
+
+df["_ESPOSREQ_LAT"] = numeric_series(
+    df,
+    ESPOSREQ_LAT_COL
+)
+
+df["_ESPOSREQ_LON"] = numeric_series(
+    df,
+    ESPOSREQ_LON_COL
+)
+
+
+# =====================================================================
+# 6. NORMALIZE DISTANCE COLUMNS
+#
+# Handles both old and new crosscheck column names.
+# =====================================================================
+
+df["_CALLER_ROUTED_KM"] = distance_km(
+
+    df,
+
+    [
+        "CALLER_DISTANCE_TO_ROUTED_PSAP_BOUNDARY_KM",
+        "CALLER_TO_ROUTED_PSAP_BOUNDARY_KM",
+        "CALLER_TO_ROUTED_BOUNDARY_KM",
+    ],
+
+    [
+        "CALLER_DISTANCE_TO_ROUTED_PSAP_BOUNDARY_M",
+        "CALLER_TO_ROUTED_PSAP_BOUNDARY_M",
+        "CALLER_TO_ROUTED_BOUNDARY_M",
+    ]
+)
+
+
+df["_CELL_ROUTED_KM"] = distance_km(
+
+    df,
+
+    [
+        "CELL_DISTANCE_TO_ROUTED_PSAP_BOUNDARY_KM",
+        "CELL_TO_ROUTED_PSAP_BOUNDARY_KM",
+        "CELL_TO_ROUTED_BOUNDARY_KM",
+    ],
+
+    [
+        "CELL_DISTANCE_TO_ROUTED_PSAP_BOUNDARY_M",
+        "CELL_TO_ROUTED_PSAP_BOUNDARY_M",
+        "CELL_TO_ROUTED_BOUNDARY_M",
+    ]
+)
+
+
+df["_ESPOSREQ_ROUTED_KM"] = distance_km(
+
+    df,
+
+    [
+        "ESPOSREQ_DISTANCE_TO_ROUTED_PSAP_BOUNDARY_KM",
+        "ESPOSREQ_TO_ROUTED_PSAP_BOUNDARY_KM",
+        "ESPOSREQ_TO_ROUTED_BOUNDARY_KM",
+    ],
+
+    [
+        "ESPOSREQ_DISTANCE_TO_ROUTED_PSAP_BOUNDARY_M",
+        "ESPOSREQ_TO_ROUTED_PSAP_BOUNDARY_M",
+        "ESPOSREQ_TO_ROUTED_BOUNDARY_M",
+    ]
+)
+
+
+df["_CALLER_EXPECTED_KM"] = distance_km(
+
+    df,
+
+    [
+        "CALLER_DISTANCE_TO_EXPECTED_PSAP_BOUNDARY_KM",
+        "CALLER_TO_EXPECTED_PSAP_BOUNDARY_KM",
+        "CALLER_TO_EXPECTED_BOUNDARY_KM",
+    ],
+
+    [
+        "CALLER_DISTANCE_TO_EXPECTED_PSAP_BOUNDARY_M",
+        "CALLER_TO_EXPECTED_PSAP_BOUNDARY_M",
+        "CALLER_TO_EXPECTED_BOUNDARY_M",
+    ]
+)
+
+
+df["_CELL_EXPECTED_KM"] = distance_km(
+
+    df,
+
+    [
+        "CELL_DISTANCE_TO_EXPECTED_PSAP_BOUNDARY_KM",
+        "CELL_TO_EXPECTED_PSAP_BOUNDARY_KM",
+        "CELL_TO_EXPECTED_BOUNDARY_KM",
+    ],
+
+    [
+        "CELL_DISTANCE_TO_EXPECTED_PSAP_BOUNDARY_M",
+        "CELL_TO_EXPECTED_PSAP_BOUNDARY_M",
+        "CELL_TO_EXPECTED_BOUNDARY_M",
+    ]
+)
+
+
+df["_ESPOSREQ_EXPECTED_KM"] = distance_km(
+
+    df,
+
+    [
+        "ESPOSREQ_DISTANCE_TO_EXPECTED_PSAP_BOUNDARY_KM",
+        "ESPOSREQ_TO_EXPECTED_PSAP_BOUNDARY_KM",
+        "ESPOSREQ_TO_EXPECTED_BOUNDARY_KM",
+    ],
+
+    [
+        "ESPOSREQ_DISTANCE_TO_EXPECTED_PSAP_BOUNDARY_M",
+        "ESPOSREQ_TO_EXPECTED_PSAP_BOUNDARY_M",
+        "ESPOSREQ_TO_EXPECTED_BOUNDARY_M",
+    ]
+)
+
+
+df["_CALLER_CELL_KM"] = distance_km(
+
+    df,
+
+    [
+        "CALLER_TO_CELL_DISTANCE_KM",
+        "CALLER_CELL_DISTANCE_KM",
+        "CALLER_TO_CELL_KM",
+    ],
+
+    [
+        "CALLER_TO_CELL_M",
+    ]
+)
+
+
+# =====================================================================
+# 7. EXPECTED-SOURCE DISTANCE / COORDINATE
+# =====================================================================
+
+if EXPECTED_SOURCE == "CALLER":
+
+    df["_EXPECTED_SOURCE_LAT"] = (
+        df["_CALLER_LAT"]
+    )
+
+    df["_EXPECTED_SOURCE_LON"] = (
+        df["_CALLER_LON"]
+    )
+
+    df["_EXPECTED_BOUNDARY_KM"] = (
+        df["_CALLER_EXPECTED_KM"]
+    )
+
+
+elif EXPECTED_SOURCE == "CELL":
+
+    df["_EXPECTED_SOURCE_LAT"] = (
+        df["_CELL_LAT"]
+    )
+
+    df["_EXPECTED_SOURCE_LON"] = (
+        df["_CELL_LON"]
+    )
+
+    df["_EXPECTED_BOUNDARY_KM"] = (
+        df["_CELL_EXPECTED_KM"]
+    )
+
+
+else:
+
+    df["_EXPECTED_SOURCE_LAT"] = (
+        df["_ESPOSREQ_LAT"]
+    )
+
+    df["_EXPECTED_SOURCE_LON"] = (
+        df["_ESPOSREQ_LON"]
+    )
+
+    df["_EXPECTED_BOUNDARY_KM"] = (
+        df["_ESPOSREQ_EXPECTED_KM"]
+    )
+
+
+# =====================================================================
+# 8. RECOMPUTE MIN / MEAN / MAX BY SAME ROUTED PSAP
+#
+# IMPORTANT:
+# This ignores any old MIN / MEAN / MAX already stored in the CSV.
+# =====================================================================
+
+valid_group = (
+    df["_ROUTED_ID"]
+    .ne("")
+)
+
+
+stats_source = (
+    df.loc[
+        valid_group
+    ]
+    .copy()
+)
+
+
+routed_stats = (
+    stats_source
+
+    .groupby(
+        "_ROUTED_ID",
+        dropna=False
+    )
+
+    .agg(
+
+        CALLS=(
+            "_ROUTED_ID",
+            "size"
+        ),
+
+
+        CALLER_MIN_KM=(
+            "_CALLER_ROUTED_KM",
+            "min"
+        ),
+
+        CALLER_MEAN_KM=(
+            "_CALLER_ROUTED_KM",
+            "mean"
+        ),
+
+        CALLER_MAX_KM=(
+            "_CALLER_ROUTED_KM",
+            "max"
+        ),
+
+
+        CELL_MIN_KM=(
+            "_CELL_ROUTED_KM",
+            "min"
+        ),
+
+        CELL_MEAN_KM=(
+            "_CELL_ROUTED_KM",
+            "mean"
+        ),
+
+        CELL_MAX_KM=(
+            "_CELL_ROUTED_KM",
+            "max"
+        ),
+
+
+        ESPOSREQ_MIN_KM=(
+            "_ESPOSREQ_ROUTED_KM",
+            "min"
+        ),
+
+        ESPOSREQ_MEAN_KM=(
+            "_ESPOSREQ_ROUTED_KM",
+            "mean"
+        ),
+
+        ESPOSREQ_MAX_KM=(
+            "_ESPOSREQ_ROUTED_KM",
+            "max"
+        ),
+    )
+
+    .reset_index()
+)
+
+
+stats_lookup = (
+    routed_stats
+    .set_index(
+        "_ROUTED_ID"
+    )
+    .to_dict(
+        orient="index"
+    )
+)
+
+
+print(
+    "Unique routed PSAPs:",
+    f"{len(routed_stats):,}"
+)
+
+
+# =====================================================================
+# 9. SELECT CALLS TO DRAW
+# =====================================================================
+
+map_df = (
+    df.copy()
+)
+
+
+if (
+    MAX_CALLS is not None
+    and
+    len(map_df) > MAX_CALLS
+):
+
+    map_df = (
+        map_df
+        .sort_values(
+            "_CALLER_ROUTED_KM",
+            ascending=False,
+            na_position="last"
+        )
+        .head(
+            int(MAX_CALLS)
+        )
+        .copy()
+    )
+
+
+print(
+    "Calls being mapped:",
+    f"{len(map_df):,}"
+)
+
+
+# =====================================================================
+# 10. LOAD PSAP BOUNDARIES
+# =====================================================================
+
+try:
+
+    psap_raw = gpd.read_file(
+        BOUNDARY_PATH,
+        engine="pyogrio"
+    )
+
+except Exception:
+
+    psap_raw = gpd.read_file(
+        BOUNDARY_PATH
+    )
+
+
+if psap_raw.empty:
+
+    raise RuntimeError(
+        "No PSAP boundaries loaded."
+    )
+
+
+if psap_raw.crs is not None:
+
+    try:
+
+        if (
+            psap_raw.crs.to_epsg()
+            != 4326
+        ):
+
+            psap_raw = (
+                psap_raw
+                .to_crs(
+                    epsg=4326
+                )
+            )
+
+    except Exception:
+
+        psap_raw = (
+            psap_raw
+            .to_crs(
+                epsg=4326
+            )
+        )
+
+
+boundary_columns = {
+    str(c)
+    .strip()
+    .upper():
+        c
+
+    for c
+    in psap_raw.columns
+}
+
+
+BOUNDARY_ID_COL = next(
+    (
+        boundary_columns[c]
+
+        for c in [
+            "FCC_ID",
+            "FCC_PSAP_ID"
+        ]
+
+        if c in boundary_columns
+    ),
+    None
+)
+
+
+if BOUNDARY_ID_COL is None:
+
+    raise RuntimeError(
+        "Final_Join.tab does not contain "
+        "FCC_ID or FCC_PSAP_ID."
+    )
+
+
+BOUNDARY_NAME_COL = next(
+    (
+        boundary_columns[c]
+
+        for c in [
+            "PSAP_NAME",
+            "NAME",
+            "AGENCY_NAME",
+            "AGENCY",
+            "PSAP"
+        ]
+
+        if c in boundary_columns
+    ),
+    None
+)
+
+
+psap_raw["_PSAP_ID"] = (
+    psap_raw[
+        BOUNDARY_ID_COL
+    ]
+    .map(
+        norm_id
+    )
+)
+
+
+if BOUNDARY_NAME_COL is not None:
+
+    psap_raw["_PSAP_NAME"] = (
+        psap_raw[
+            BOUNDARY_NAME_COL
+        ]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+else:
+
+    psap_raw["_PSAP_NAME"] = ""
+
+
+psap_raw[
+    "geometry"
+] = (
+    psap_raw[
+        "geometry"
+    ]
+    .apply(
+        repair_geometry
+    )
+)
+
+
+psap_raw = (
+    psap_raw.loc[
+        psap_raw["_PSAP_ID"].ne("")
+        &
+        psap_raw["geometry"].notna()
+    ]
+    .copy()
+)
+
+
+# ---------------------------------------------------------------------
+# Dissolve multiple pieces belonging to same FCC PSAP.
+# ---------------------------------------------------------------------
+
+psap = (
+    psap_raw[
+        [
+            "_PSAP_ID",
+            "_PSAP_NAME",
+            "geometry"
+        ]
+    ]
+
+    .dissolve(
+        by="_PSAP_ID",
+        as_index=False,
+        aggfunc={
+            "_PSAP_NAME":
+                "first"
+        }
+    )
+)
+
+
+psap_geometry = {
+
+    row["_PSAP_ID"]:
+        row.geometry
+
+    for _, row
+    in psap.iterrows()
+}
+
+
+psap_name = {
+
+    row["_PSAP_ID"]:
+        str(
+            row["_PSAP_NAME"]
+        )
+
+    for _, row
+    in psap.iterrows()
+}
+
+
+print(
+    "Usable PSAP polygons:",
+    f"{len(psap_geometry):,}"
+)
+
+
+# =====================================================================
+# 11. FALLBACK PSAP NAMES FROM CROSSCHECK CSV
+# =====================================================================
+
+if ROUTED_NAME_COL is not None:
+
+    for psap_id, name in zip(
+        df["_ROUTED_ID"],
+        df[ROUTED_NAME_COL]
+    ):
+
+        if (
+            psap_id
+            and
+            (
+                psap_id not in psap_name
+                or not psap_name[
+                    psap_id
+                ]
+            )
+        ):
+
+            psap_name[
+                psap_id
+            ] = str(
+                name
+            )
+
+
+if EXPECTED_NAME_COL is not None:
+
+    for psap_id, name in zip(
+        df["_EXPECTED_ID"],
+        df[EXPECTED_NAME_COL]
+    ):
+
+        if (
+            psap_id
+            and
+            (
+                psap_id not in psap_name
+                or not psap_name[
+                    psap_id
+                ]
+            )
+        ):
+
+            psap_name[
+                psap_id
+            ] = str(
+                name
+            )
+
+
+# =====================================================================
+# 12. CREATE MAP
+# =====================================================================
+
+coordinate_frames = []
+
+
+for lat_col, lon_col in [
+
+    ("_CALLER_LAT", "_CALLER_LON"),
+
+    ("_CELL_LAT", "_CELL_LON"),
+
+    ("_ESPOSREQ_LAT", "_ESPOSREQ_LON"),
+]:
+
+    temp = (
+        map_df[
+            [
+                lat_col,
+                lon_col
+            ]
+        ]
+        .copy()
+    )
+
+    temp.columns = [
+        "LAT",
+        "LON"
+    ]
+
+    temp = temp.loc[
+        temp["LAT"].between(
+            -90,
+            90
+        )
+        &
+        temp["LON"].between(
+            -180,
+            180
+        )
+    ]
+
+    coordinate_frames.append(
+        temp
+    )
+
+
+all_points = pd.concat(
+    coordinate_frames,
+    ignore_index=True
+)
+
+
+if all_points.empty:
+
+    raise RuntimeError(
+        "No valid coordinates available for map."
+    )
+
+
+center_lat = (
+    all_points[
+        "LAT"
+    ]
+    .median()
+)
+
+center_lon = (
+    all_points[
+        "LON"
+    ]
+    .median()
+)
+
+
+m = folium.Map(
+
+    location=[
+        center_lat,
+        center_lon
+    ],
+
+    zoom_start=4,
+
+    tiles="CartoDB positron",
+
+    control_scale=True,
+
+    prefer_canvas=True
+)
+
+
+folium.TileLayer(
+    "OpenStreetMap",
+    name="OpenStreetMap"
+).add_to(
+    m
+)
+
+
+Fullscreen(
+    position="topright"
+).add_to(
+    m
+)
+
+
+MeasureControl(
+    position="topright",
+    primary_length_unit="kilometers"
+).add_to(
+    m
+)
+
+
+# =====================================================================
+# 13. MAP LAYERS
+# =====================================================================
+
+routed_boundary_layer = (
+    folium.FeatureGroup(
+        name="ROUTED PSAP boundaries",
+        show=True
+    )
+)
+
+expected_boundary_layer = (
+    folium.FeatureGroup(
+        name=f"{EXPECTED_SOURCE} EXPECTED PSAP boundaries",
+        show=True
+    )
+)
+
+
+caller_layer = folium.FeatureGroup(
+    name="CALLER locations",
+    show=True
+)
+
+cell_layer = folium.FeatureGroup(
+    name="CELL locations",
+    show=True
+)
+
+esposreq_layer = folium.FeatureGroup(
+    name="ESPOSREQ locations",
+    show=False
+)
+
+
+caller_cluster = (
+    MarkerCluster()
+    .add_to(
+        caller_layer
+    )
+)
+
+cell_cluster = (
+    MarkerCluster()
+    .add_to(
+        cell_layer
+    )
+)
+
+esposreq_cluster = (
+    MarkerCluster()
+    .add_to(
+        esposreq_layer
+    )
+)
+
+
+uncertainty_layer = folium.FeatureGroup(
+    name="Caller uncertainty circles",
+    show=False
+)
+
+
+routed_line_layer = folium.FeatureGroup(
+    name="Caller → ROUTED PSAP boundary",
+    show=True
+)
+
+
+expected_line_layer = folium.FeatureGroup(
+    name=f"{EXPECTED_SOURCE} → EXPECTED PSAP boundary",
+    show=True
+)
+
+
+caller_cell_line_layer = folium.FeatureGroup(
+    name="Caller → Cell distance",
+    show=True
+)
+
+
+nearest_point_layer = folium.FeatureGroup(
+    name="Nearest PSAP boundary points",
+    show=False
+)
+
+
+if SHOW_ALL_PSAP_BOUNDARIES:
+
+    all_psap_layer = (
+        folium.FeatureGroup(
+            name="ALL PSAP boundaries",
+            show=False
+        )
+    )
+
+else:
+
+    all_psap_layer = None
+
+
+if ENABLE_MIN_DISTANCE_LAYER:
+
+    min_stats_layer = (
+        folium.FeatureGroup(
+            name="MIN distance by routed PSAP",
+            show=False
+        )
+    )
+
+else:
+
+    min_stats_layer = None
+
+
+if ENABLE_MEAN_DISTANCE_LAYER:
+
+    mean_stats_layer = (
+        folium.FeatureGroup(
+            name="MEAN distance by routed PSAP",
+            show=False
+        )
+    )
+
+else:
+
+    mean_stats_layer = None
+
+
+if ENABLE_MAX_DISTANCE_LAYER:
+
+    max_stats_layer = (
+        folium.FeatureGroup(
+            name="MAX distance by routed PSAP",
+            show=False
+        )
+    )
+
+else:
+
+    max_stats_layer = None
+
+
+# =====================================================================
+# 14. OPTIONAL ALL-PSAP BOUNDARY LAYER
+# =====================================================================
+
+if (
+    SHOW_ALL_PSAP_BOUNDARIES
+    and
+    all_psap_layer is not None
+):
+
+    for _, psap_row in psap.iterrows():
+
+        feature = {
+
+            "type":
+                "Feature",
+
+            "properties": {
+
+                "PSAP_ID":
+                    psap_row[
+                        "_PSAP_ID"
+                    ],
+
+                "PSAP_NAME":
+                    psap_row[
+                        "_PSAP_NAME"
+                    ],
+            },
+
+            "geometry":
+                mapping(
+                    psap_row.geometry
+                ),
+        }
+
+
+        folium.GeoJson(
+
+            feature,
+
+            style_function=lambda _:
+            {
+                "color":
+                    "#777777",
+
+                "weight":
+                    0.6,
+
+                "fillOpacity":
+                    0.0,
+            },
+
+            tooltip=folium.GeoJsonTooltip(
+
+                fields=[
+                    "PSAP_ID",
+                    "PSAP_NAME"
+                ],
+
+                aliases=[
+                    "PSAP ID:",
+                    "PSAP:"
+                ]
+            )
+
+        ).add_to(
+            all_psap_layer
+        )
+
+
+# =====================================================================
+# 15. DRAW RELEVANT ROUTED / EXPECTED PSAP BOUNDARIES
+# =====================================================================
+
+mapped_routed_ids = sorted(
+    set(
+        x
+        for x in map_df[
+            "_ROUTED_ID"
+        ]
+        if x
+    )
+)
+
+
+mapped_expected_ids = sorted(
+    set(
+        x
+        for x in map_df[
+            "_EXPECTED_ID"
+        ]
+        if x and "|" not in x
+    )
+)
+
+
+if SHOW_ROUTED_PSAP_BOUNDARIES:
+
+    for psap_id in mapped_routed_ids:
+
+        geometry = (
+            psap_geometry.get(
+                psap_id
+            )
+        )
+
+        if geometry is None:
+            continue
+
+
+        feature = {
+
+            "type":
+                "Feature",
+
+            "properties": {
+
+                "TYPE":
+                    "ROUTED",
+
+                "PSAP_ID":
+                    psap_id,
+
+                "PSAP_NAME":
+                    psap_name.get(
+                        psap_id,
+                        ""
+                    ),
+            },
+
+            "geometry":
+                mapping(
+                    geometry
+                ),
+        }
+
+
+        folium.GeoJson(
+
+            feature,
+
+            style_function=lambda _:
+            {
+                "color":
+                    "#d62728",
+
+                "weight":
+                    3,
+
+                "fillColor":
+                    "#d62728",
+
+                "fillOpacity":
+                    0.04,
+            },
+
+            tooltip=folium.GeoJsonTooltip(
+
+                fields=[
+                    "TYPE",
+                    "PSAP_ID",
+                    "PSAP_NAME"
+                ],
+
+                aliases=[
+                    "",
+                    "Routed PSAP ID:",
+                    "Routed PSAP:"
+                ]
+            )
+
+        ).add_to(
+            routed_boundary_layer
+        )
+
+
+if SHOW_EXPECTED_PSAP_BOUNDARIES:
+
+    for psap_id in mapped_expected_ids:
+
+        geometry = (
+            psap_geometry.get(
+                psap_id
+            )
+        )
+
+        if geometry is None:
+            continue
+
+
+        feature = {
+
+            "type":
+                "Feature",
+
+            "properties": {
+
+                "TYPE":
+                    f"{EXPECTED_SOURCE} EXPECTED",
+
+                "PSAP_ID":
+                    psap_id,
+
+                "PSAP_NAME":
+                    psap_name.get(
+                        psap_id,
+                        ""
+                    ),
+            },
+
+            "geometry":
+                mapping(
+                    geometry
+                ),
+        }
+
+
+        folium.GeoJson(
+
+            feature,
+
+            style_function=lambda _:
+            {
+                "color":
+                    "#2ca02c",
+
+                "weight":
+                    3,
+
+                "fillColor":
+                    "#2ca02c",
+
+                "fillOpacity":
+                    0.04,
+            },
+
+            tooltip=folium.GeoJsonTooltip(
+
+                fields=[
+                    "TYPE",
+                    "PSAP_ID",
+                    "PSAP_NAME"
+                ],
+
+                aliases=[
+                    "",
+                    "Expected PSAP ID:",
+                    "Expected PSAP:"
+                ]
+            )
+
+        ).add_to(
+            expected_boundary_layer
+        )
+
+
+# =====================================================================
+# 16. MIN / MEAN / MAX STATISTIC LAYERS
+#
+# One label per mapped ROUTED PSAP.
+#
+# C = Caller
+# L = Cell
+# E = ESPOSREQ
+# =====================================================================
+
+for psap_id in mapped_routed_ids:
+
+    geometry = (
+        psap_geometry.get(
+            psap_id
+        )
+    )
+
+    stat = (
+        stats_lookup.get(
+            psap_id
+        )
+    )
+
+
+    if (
+        geometry is None
+        or
+        stat is None
+    ):
+        continue
+
+
+    try:
+
+        representative = (
+            geometry
+            .representative_point()
+        )
+
+        label_location = [
+            representative.y,
+            representative.x
+        ]
+
+    except Exception:
+
+        continue
+
+
+    psap_label = safe_text(
+        psap_name.get(
+            psap_id,
+            ""
+        )
+    )
+
+
+    # -------------------------------------------------------------
+    # MIN
+    # -------------------------------------------------------------
+
+    if min_stats_layer is not None:
+
+        min_html = f"""
+        <div style="
+            font-size:10px;
+            white-space:nowrap;
+            background:white;
+            border:2px solid #2ca02c;
+            border-radius:4px;
+            padding:3px 5px;
+            font-weight:bold;
+        ">
+            MIN — {psap_label}<br>
+            Caller: {fmt_num(stat['CALLER_MIN_KM'])} km |
+            Cell: {fmt_num(stat['CELL_MIN_KM'])} km |
+            ESPOSREQ: {fmt_num(stat['ESPOSREQ_MIN_KM'])} km
+        </div>
+        """
+
+
+        folium.Marker(
+
+            label_location,
+
+            icon=folium.DivIcon(
+                html=min_html
+            )
+
+        ).add_to(
+            min_stats_layer
+        )
+
+
+    # -------------------------------------------------------------
+    # MEAN
+    # -------------------------------------------------------------
+
+    if mean_stats_layer is not None:
+
+        mean_html = f"""
+        <div style="
+            font-size:10px;
+            white-space:nowrap;
+            background:white;
+            border:2px solid #ffbf00;
+            border-radius:4px;
+            padding:3px 5px;
+            font-weight:bold;
+        ">
+            MEAN — {psap_label}<br>
+            Caller: {fmt_num(stat['CALLER_MEAN_KM'])} km |
+            Cell: {fmt_num(stat['CELL_MEAN_KM'])} km |
+            ESPOSREQ: {fmt_num(stat['ESPOSREQ_MEAN_KM'])} km
+        </div>
+        """
+
+
+        folium.Marker(
+
+            label_location,
+
+            icon=folium.DivIcon(
+                html=mean_html
+            )
+
+        ).add_to(
+            mean_stats_layer
+        )
+
+
+    # -------------------------------------------------------------
+    # MAX
+    # -------------------------------------------------------------
+
+    if max_stats_layer is not None:
+
+        max_html = f"""
+        <div style="
+            font-size:10px;
+            white-space:nowrap;
+            background:white;
+            border:2px solid #d62728;
+            border-radius:4px;
+            padding:3px 5px;
+            font-weight:bold;
+        ">
+            MAX — {psap_label}<br>
+            Caller: {fmt_num(stat['CALLER_MAX_KM'])} km |
+            Cell: {fmt_num(stat['CELL_MAX_KM'])} km |
+            ESPOSREQ: {fmt_num(stat['ESPOSREQ_MAX_KM'])} km
+        </div>
+        """
+
+
+        folium.Marker(
+
+            label_location,
+
+            icon=folium.DivIcon(
+                html=max_html
+            )
+
+        ).add_to(
+            max_stats_layer
+        )
+
+
+# =====================================================================
+# 17. DRAW EACH CALL
+# =====================================================================
+
+for _, row in map_df.iterrows():
+
+    call_id = (
+        safe_text(
+            row[
+                CALL_ID_COL
+            ]
+        )
+        if CALL_ID_COL
+        else ""
+    )
+
+
+    routed_id = (
+        row[
+            "_ROUTED_ID"
+        ]
+    )
+
+    expected_id = (
+        row[
+            "_EXPECTED_ID"
+        ]
+    )
+
+
+    routed_name = (
+
+        safe_text(
+            row[
+                ROUTED_NAME_COL
+            ]
+        )
+
+        if ROUTED_NAME_COL
+
+        else safe_text(
+            psap_name.get(
+                routed_id,
+                ""
+            )
+        )
+    )
+
+
+    expected_name = (
+
+        safe_text(
+            row[
+                EXPECTED_NAME_COL
+            ]
+        )
+
+        if EXPECTED_NAME_COL
+
+        else safe_text(
+            psap_name.get(
+                expected_id,
+                ""
+            )
+        )
+    )
+
+
+    expected_status = (
+
+        safe_text(
+            row[
+                EXPECTED_STATUS_COL
+            ]
+        )
+
+        if EXPECTED_STATUS_COL
+
+        else (
+            "SAME"
+            if (
+                expected_id
+                and
+                expected_id == routed_id
+            )
+            else "DIFFERENT"
+        )
+    )
+
+
+    duration = (
+
+        fmt_num(
+            row[
+                DURATION_COL
+            ],
+            1
+        )
+
+        if DURATION_COL
+
+        else "N/A"
+    )
+
+
+    caller_lat = (
+        row[
+            "_CALLER_LAT"
+        ]
+    )
+
+    caller_lon = (
+        row[
+            "_CALLER_LON"
+        ]
+    )
+
+
+    cell_lat = (
+        row[
+            "_CELL_LAT"
+        ]
+    )
+
+    cell_lon = (
+        row[
+            "_CELL_LON"
+        ]
+    )
+
+
+    esposreq_lat = (
+        row[
+            "_ESPOSREQ_LAT"
+        ]
+    )
+
+    esposreq_lon = (
+        row[
+            "_ESPOSREQ_LON"
+        ]
+    )
+
+
+    routed_stat = (
+        stats_lookup.get(
+            routed_id,
+            {}
+        )
+    )
+
+
+    # -------------------------------------------------------------
+    # Main call popup
+    # -------------------------------------------------------------
+
+    popup_html = f"""
+    <div style="font-size:12px; min-width:390px">
+
+    <b>CALL</b><br>
+    Call ID:
+        {call_id}<br>
+
+    Call duration:
+        <b>{duration} sec</b><br><br>
+
+
+    <b>ROUTED PSAP</b><br>
+
+    ID:
+        {safe_text(routed_id)}<br>
+
+    Name:
+        <b>{routed_name}</b><br><br>
+
+
+    <b>{EXPECTED_SOURCE} EXPECTED PSAP</b><br>
+
+    ID:
+        {safe_text(expected_id)}<br>
+
+    Name:
+        <b>{expected_name}</b><br>
+
+    Expected vs Routed:
+        <b>{expected_status}</b><br><br>
+
+
+    <b>THIS CALL — DISTANCES</b><br>
+
+    Caller → Routed boundary:
+        <b>{fmt_num(row['_CALLER_ROUTED_KM'])} km</b><br>
+
+    Caller → Expected boundary:
+        <b>{fmt_num(row['_CALLER_EXPECTED_KM'])} km</b><br>
+
+    Cell → Routed boundary:
+        <b>{fmt_num(row['_CELL_ROUTED_KM'])} km</b><br>
+
+    ESPOSREQ → Routed boundary:
+        <b>{fmt_num(row['_ESPOSREQ_ROUTED_KM'])} km</b><br>
+
+    Caller ↔ Cell:
+        <b>{fmt_num(row['_CALLER_CELL_KM'])} km</b><br><br>
+
+
+    <b>SAME ROUTED PSAP — GROUP STATISTICS</b><br>
+
+    Calls:
+        {fmt_num(routed_stat.get('CALLS'), 0)}<br>
+
+    Caller Min / Mean / Max:
+        {fmt_num(routed_stat.get('CALLER_MIN_KM'))} /
+        {fmt_num(routed_stat.get('CALLER_MEAN_KM'))} /
+        {fmt_num(routed_stat.get('CALLER_MAX_KM'))} km<br>
+
+    Cell Min / Mean / Max:
+        {fmt_num(routed_stat.get('CELL_MIN_KM'))} /
+        {fmt_num(routed_stat.get('CELL_MEAN_KM'))} /
+        {fmt_num(routed_stat.get('CELL_MAX_KM'))} km<br>
+
+    ESPOSREQ Min / Mean / Max:
+        {fmt_num(routed_stat.get('ESPOSREQ_MIN_KM'))} /
+        {fmt_num(routed_stat.get('ESPOSREQ_MEAN_KM'))} /
+        {fmt_num(routed_stat.get('ESPOSREQ_MAX_KM'))} km
+
+    </div>
+    """
+
+
+    # =============================================================
+    # CALLER POINT
+    # =============================================================
+
+    if (
+        SHOW_CALLER_POINT
+        and
+        valid_point(
+            caller_lat,
+            caller_lon
+        )
+    ):
+
+        folium.CircleMarker(
+
+            location=[
+                float(caller_lat),
+                float(caller_lon)
+            ],
+
+            radius=6,
+
+            color="#1f77b4",
+
+            fill=True,
+
+            fill_color="#1f77b4",
+
+            fill_opacity=0.9,
+
+            tooltip=(
+                f"CALLER | "
+                f"Call {call_id} | "
+                f"{fmt_num(row['_CALLER_ROUTED_KM'])} km "
+                f"to routed boundary"
+            ),
+
+            popup=folium.Popup(
+                popup_html,
+                max_width=500
+            )
+
+        ).add_to(
+            caller_cluster
+        )
+
+
+        # ---------------------------------------------------------
+        # Uncertainty circle
+        # ---------------------------------------------------------
+
+        if (
+            SHOW_UNCERTAINTY_CIRCLE
+            and
+            UNCERTAINTY_COL is not None
+        ):
+
+            uncertainty = pd.to_numeric(
+                row[
+                    UNCERTAINTY_COL
+                ],
+                errors="coerce"
+            )
+
+
+            if (
+                pd.notna(
+                    uncertainty
+                )
+                and
+                uncertainty > 0
+            ):
+
+                folium.Circle(
+
+                    location=[
+                        float(caller_lat),
+                        float(caller_lon)
+                    ],
+
+                    radius=float(
+                        uncertainty
+                    ),
+
+                    color="#1f77b4",
+
+                    weight=1,
+
+                    fill=True,
+
+                    fill_opacity=0.05,
+
+                    tooltip=(
+                        f"Uncertainty: "
+                        f"{fmt_num(uncertainty, 1)} m"
+                    )
+
+                ).add_to(
+                    uncertainty_layer
+                )
+
+
+    # =============================================================
+    # CELL POINT
+    # =============================================================
+
+    if (
+        SHOW_CELL_POINT
+        and
+        valid_point(
+            cell_lat,
+            cell_lon
+        )
+    ):
+
+        cell_popup = f"""
+        <div style="font-size:12px; min-width:300px">
+
+        <b>CELL LOCATION</b><br>
+
+        Call:
+            {call_id}<br>
+
+        Cell latitude:
+            {fmt_num(cell_lat, 6)}<br>
+
+        Cell longitude:
+            {fmt_num(cell_lon, 6)}<br><br>
+
+        Cell → Routed PSAP boundary:
+            <b>{fmt_num(row['_CELL_ROUTED_KM'])} km</b><br>
+
+        Caller ↔ Cell:
+            <b>{fmt_num(row['_CALLER_CELL_KM'])} km</b><br>
+
+        Call duration:
+            <b>{duration} sec</b>
+
+        </div>
+        """
+
+
+        folium.CircleMarker(
+
+            location=[
+                float(cell_lat),
+                float(cell_lon)
+            ],
+
+            radius=6,
+
+            color="#2ca02c",
+
+            fill=True,
+
+            fill_color="#2ca02c",
+
+            fill_opacity=0.9,
+
+            tooltip=(
+                f"CELL | "
+                f"Call {call_id}"
+            ),
+
+            popup=folium.Popup(
+                cell_popup,
+                max_width=400
+            )
+
+        ).add_to(
+            cell_cluster
+        )
+
+
+    # =============================================================
+    # ESPOSREQ POINT
+    # =============================================================
+
+    if (
+        SHOW_ESPOSREQ_POINT
+        and
+        valid_point(
+            esposreq_lat,
+            esposreq_lon
+        )
+    ):
+
+        esposreq_popup = f"""
+        <div style="font-size:12px; min-width:300px">
+
+        <b>ESPOSREQ LOCATION</b><br>
+
+        Call:
+            {call_id}<br>
+
+        Latitude:
+            {fmt_num(esposreq_lat, 6)}<br>
+
+        Longitude:
+            {fmt_num(esposreq_lon, 6)}<br><br>
+
+        ESPOSREQ → Routed PSAP boundary:
+            <b>{fmt_num(row['_ESPOSREQ_ROUTED_KM'])} km</b><br>
+
+        Call duration:
+            <b>{duration} sec</b>
+
+        </div>
+        """
+
+
+        folium.CircleMarker(
+
+            location=[
+                float(esposreq_lat),
+                float(esposreq_lon)
+            ],
+
+            radius=5,
+
+            color="#ff7f0e",
+
+            fill=True,
+
+            fill_color="#ff7f0e",
+
+            fill_opacity=0.9,
+
+            tooltip=(
+                f"ESPOSREQ | "
+                f"Call {call_id}"
+            ),
+
+            popup=folium.Popup(
+                esposreq_popup,
+                max_width=400
+            )
+
+        ).add_to(
+            esposreq_cluster
+        )
+
+
+    # =============================================================
+    # CALLER -> ROUTED PSAP BOUNDARY
+    # =============================================================
+
+    if (
+        SHOW_CALLER_TO_ROUTED_LINE
+        and
+        valid_point(
+            caller_lat,
+            caller_lon
+        )
+        and
+        routed_id
+    ):
+
+        routed_geometry = (
+            psap_geometry.get(
+                routed_id
+            )
+        )
+
+
+        if routed_geometry is not None:
+
+            (
+                boundary_lat,
+                boundary_lon,
+                map_distance_km
+            ) = nearest_boundary_location(
+
+                caller_lat,
+                caller_lon,
+                routed_geometry
+            )
+
+
+            if valid_point(
+                boundary_lat,
+                boundary_lon
+            ):
+
+                folium.PolyLine(
+
+                    locations=[
+                        [
+                            float(caller_lat),
+                            float(caller_lon)
+                        ],
+
+                        [
+                            float(boundary_lat),
+                            float(boundary_lon)
+                        ],
+                    ],
+
+                    color="#d62728",
+
+                    weight=2.5,
+
+                    opacity=0.85,
+
+                    tooltip=(
+                        "Caller → ROUTED PSAP boundary | "
+                        f"CSV: {fmt_num(row['_CALLER_ROUTED_KM'])} km | "
+                        f"Map recalc: {fmt_num(map_distance_km)} km"
+                    )
+
+                ).add_to(
+                    routed_line_layer
+                )
+
+
+                folium.CircleMarker(
+
+                    location=[
+                        boundary_lat,
+                        boundary_lon
+                    ],
+
+                    radius=3,
+
+                    color="#d62728",
+
+                    fill=True,
+
+                    fill_opacity=1,
+
+                    tooltip=(
+                        "Nearest point on ROUTED "
+                        "PSAP boundary"
+                    )
+
+                ).add_to(
+                    nearest_point_layer
+                )
+
+
+    # =============================================================
+    # EXPECTED-SOURCE -> EXPECTED PSAP BOUNDARY
+    # =============================================================
+
+    expected_lat = (
+        row[
+            "_EXPECTED_SOURCE_LAT"
+        ]
+    )
+
+    expected_lon = (
+        row[
+            "_EXPECTED_SOURCE_LON"
+        ]
+    )
+
+
+    if (
+        SHOW_EXPECTED_BOUNDARY_LINE
+        and
+        valid_point(
+            expected_lat,
+            expected_lon
+        )
+        and
+        expected_id
+        and
+        "|" not in expected_id
+    ):
+
+        expected_geometry = (
+            psap_geometry.get(
+                expected_id
+            )
+        )
+
+
+        if expected_geometry is not None:
+
+            (
+                boundary_lat,
+                boundary_lon,
+                map_distance_km
+            ) = nearest_boundary_location(
+
+                expected_lat,
+                expected_lon,
+                expected_geometry
+            )
+
+
+            if valid_point(
+                boundary_lat,
+                boundary_lon
+            ):
+
+                folium.PolyLine(
+
+                    locations=[
+                        [
+                            float(expected_lat),
+                            float(expected_lon)
+                        ],
+
+                        [
+                            float(boundary_lat),
+                            float(boundary_lon)
+                        ],
+                    ],
+
+                    color="#2ca02c",
+
+                    weight=2.5,
+
+                    opacity=0.85,
+
+                    tooltip=(
+                        f"{EXPECTED_SOURCE} → EXPECTED "
+                        "PSAP boundary | "
+                        f"CSV: "
+                        f"{fmt_num(row['_EXPECTED_BOUNDARY_KM'])} km | "
+                        f"Map recalc: "
+                        f"{fmt_num(map_distance_km)} km"
+                    )
+
+                ).add_to(
+                    expected_line_layer
+                )
+
+
+                folium.CircleMarker(
+
+                    location=[
+                        boundary_lat,
+                        boundary_lon
+                    ],
+
+                    radius=3,
+
+                    color="#2ca02c",
+
+                    fill=True,
+
+                    fill_opacity=1,
+
+                    tooltip=(
+                        "Nearest point on EXPECTED "
+                        "PSAP boundary"
+                    )
+
+                ).add_to(
+                    nearest_point_layer
+                )
+
+
+    # =============================================================
+    # CALLER -> CELL
+    # =============================================================
+
+    if (
+        SHOW_CALLER_TO_CELL_LINE
+        and
+        valid_point(
+            caller_lat,
+            caller_lon
+        )
+        and
+        valid_point(
+            cell_lat,
+            cell_lon
+        )
+    ):
+
+        folium.PolyLine(
+
+            locations=[
+                [
+                    float(caller_lat),
+                    float(caller_lon)
+                ],
+
+                [
+                    float(cell_lat),
+                    float(cell_lon)
+                ],
+            ],
+
+            color="#3366cc",
+
+            weight=2,
+
+            opacity=0.65,
+
+            dash_array="7,6",
+
+            tooltip=(
+                "Caller ↔ Cell: "
+                f"{fmt_num(row['_CALLER_CELL_KM'])} km"
+            )
+
+        ).add_to(
+            caller_cell_line_layer
+        )
+
+
+# =====================================================================
+# 18. ADD LAYERS TO MAP
+# =====================================================================
+
+if all_psap_layer is not None:
+
+    all_psap_layer.add_to(
+        m
+    )
+
+
+routed_boundary_layer.add_to(
+    m
+)
+
+expected_boundary_layer.add_to(
+    m
+)
+
+
+caller_layer.add_to(
+    m
+)
+
+cell_layer.add_to(
+    m
+)
+
+esposreq_layer.add_to(
+    m
+)
+
+
+uncertainty_layer.add_to(
+    m
+)
+
+routed_line_layer.add_to(
+    m
+)
+
+expected_line_layer.add_to(
+    m
+)
+
+caller_cell_line_layer.add_to(
+    m
+)
+
+nearest_point_layer.add_to(
+    m
+)
+
+
+if min_stats_layer is not None:
+
+    min_stats_layer.add_to(
+        m
+    )
+
+
+if mean_stats_layer is not None:
+
+    mean_stats_layer.add_to(
+        m
+    )
+
+
+if max_stats_layer is not None:
+
+    max_stats_layer.add_to(
+        m
+    )
+
+
+# =====================================================================
+# 19. LEGEND
+# =====================================================================
+
+legend_html = f"""
+<div style="
+    position: fixed;
+    bottom: 35px;
+    left: 35px;
+    width: 310px;
+    z-index: 9999;
+    background: white;
+    border: 2px solid #777;
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 12px;
+    box-shadow: 2px 2px 6px rgba(0,0,0,0.25);
+">
+
+<b>Three-location PSAP map</b><br><br>
+
+<span style="color:#1f77b4;">●</span>
+Caller location<br>
+
+<span style="color:#2ca02c;">●</span>
+Cell location<br>
+
+<span style="color:#ff7f0e;">●</span>
+ESPOSREQ location<br><br>
+
+<span style="color:#d62728;">━━</span>
+Routed PSAP boundary / distance<br>
+
+<span style="color:#2ca02c;">━━</span>
+{EXPECTED_SOURCE} expected PSAP boundary / distance<br>
+
+<span style="color:#3366cc;">- - -</span>
+Caller ↔ Cell distance<br><br>
+
+<b>Expected source:</b> {EXPECTED_SOURCE}<br>
+
+MIN / MEAN / MAX layers can be switched
+on/off from the layer control.
+
+</div>
+"""
+
+
+m.get_root().html.add_child(
+    folium.Element(
+        legend_html
+    )
+)
+
+
+# =====================================================================
+# 20. FIT MAP TO DISPLAYED POINTS
+# =====================================================================
+
+if len(all_points) > 1:
+
+    south = float(
+        all_points[
+            "LAT"
+        ].min()
+    )
+
+    north = float(
+        all_points[
+            "LAT"
+        ].max()
+    )
+
+    west = float(
+        all_points[
+            "LON"
+        ].min()
+    )
+
+    east = float(
+        all_points[
+            "LON"
+        ].max()
+    )
+
+
+    m.fit_bounds(
+        [
+            [
+                south,
+                west
+            ],
+
+            [
+                north,
+                east
+            ]
+        ],
+
+        padding=[
+            20,
+            20
+        ]
+    )
+
+
+# =====================================================================
+# 21. LAYER CONTROL + SAVE
+# =====================================================================
+
+folium.LayerControl(
+    collapsed=False
+).add_to(
+    m
+)
+
+
+m.save(
+    OUTPUT_HTML
+)
+
+
+print("\nInteractive map saved:")
+print(OUTPUT_HTML)
+
+print(
+    "\nExpected PSAP source:",
+    EXPECTED_SOURCE
+)
+
+print(
+    "Mapped calls:",
+    f"{len(map_df):,}"
+)
+
+print(
+    "\nMIN / MEAN / MAX are recomputed "
+    "by SAME ROUTED_PSAP_ID."
+)
+
+print(
+    "Use the map Layer Control to turn "
+    "MIN, MEAN, or MAX labels on/off."
+)
+
+
+display(
+    m
+)
+
+
+
+
+
+
+
+
+
