@@ -1,0 +1,61 @@
+
+
+
+for nena, psap_id, fcc_id in (
+    boundary_raw[
+        [
+            "_NENA",
+            "_PSAP",
+            "_FCC"
+        ]
+    ]
+    .itertuples(
+        index=False,
+        name=None
+    )
+):
+
+    if psap_id:
+
+        psap_to_nena[
+            psap_id
+        ].add(
+            nena
+        )
+
+    if fcc_id:
+
+        fcc_to_nena[
+            fcc_id
+        ].add(
+            nena
+        )
+
+
+
+
+
+
+
+
+
+boundary_by_nena = {
+
+    nena:
+        geometry
+
+    for nena, geometry
+    in boundary_geo[
+        [
+            "_NENA",
+            "geometry"
+        ]
+    ]
+    .itertuples(
+        index=False,
+        name=None
+    )
+}
+
+
+
