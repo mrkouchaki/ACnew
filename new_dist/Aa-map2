@@ -96,6 +96,59 @@ EXPECTED_SOURCE = "CALLER"
 MAX_CALLS = 300
 
 
+
+
+
+
+# ---------------------------------------------------------------------
+# Number of calls to map
+# ---------------------------------------------------------------------
+
+MAX_CALLS = 50
+
+
+# ---------------------------------------------------------------------
+# Caller -> ROUTED PSAP boundary distance range, in KM
+#
+# Examples:
+#
+# 25 to 100 km:
+#     MIN_CALLER_TO_ROUTED_KM = 25
+#     MAX_CALLER_TO_ROUTED_KM = 100
+#
+# 25 km and above:
+#     MIN_CALLER_TO_ROUTED_KM = 25
+#     MAX_CALLER_TO_ROUTED_KM = None
+#
+# Up to 100 km:
+#     MIN_CALLER_TO_ROUTED_KM = None
+#     MAX_CALLER_TO_ROUTED_KM = 100
+#
+# No distance filter:
+#     both = None
+# ---------------------------------------------------------------------
+
+MIN_CALLER_TO_ROUTED_KM = 25
+MAX_CALLER_TO_ROUTED_KM = 100
+
+
+# ---------------------------------------------------------------------
+# Optional call-duration filters
+# ---------------------------------------------------------------------
+
+MIN_CALL_DURATION_SEC = None
+MAX_CALL_DURATION_SEC = None
+
+
+
+
+
+
+
+
+
+
+
 # ---------------------------------------------------------------------
 # Optional filters
 # ---------------------------------------------------------------------
