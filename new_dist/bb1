@@ -1,0 +1,479 @@
+# =====================================================================
+# DIAGNOSE ROUTED PSAP KEY MAPPING
+# =====================================================================
+#
+# Goal:
+#   Determine why GMLC FCC_PSAP_ID does not appear to uniquely identify
+#   the routed PSAP and find the strongest exact key shared with
+#   Final_Join.tab.
+#
+# Uses objects already loaded by the independent GeoPandas cell:
+#   report
+#   boundaries
+#   BOUNDARY_PATH
+#
+# =====================================================================
+
+import pandas as pd
+import geopandas as gpd
+
+
+# =====================================================================
+# 1. SHOW GMLC ROUTED KEY -> NAME MULTIPLICITY
+# =====================================================================
+
+gmlc_key_profile = (
+    report[
+        [
+            "FCC_PSAP_ID",
+            "PSAP_ID",
+            "PSAP_NAME",
+            "ROUTE_PSAP_NAME",
+            "STATE",
+            "COUNTY",
+        ]
+    ]
+    .copy()
+)
+
+
+for c in [
+    "FCC_PSAP_ID",
+    "PSAP_ID",
+    "PSAP_NAME",
+    "ROUTE_PSAP_NAME",
+    "STATE",
+    "COUNTY",
+]:
+    if c not in gmlc_key_profile.columns:
+        gmlc_key_profile[c] = ""
+
+
+gmlc_key_profile["FCC_PSAP_ID_NORM"] = (
+    gmlc_key_profile["FCC_PSAP_ID"]
+    .astype("string")
+    .str.strip()
+    .str.replace(r"\.0$", "", regex=True)
+)
+
+
+gmlc_key_profile["PSAP_ID_NORM"] = (
+    gmlc_key_profile["PSAP_ID"]
+    .astype("string")
+    .str.strip()
+    .str.replace(r"\.0$", "", regex=True)
+)
+
+
+gmlc_key_profile["ROUTED_NAME"] = (
+    gmlc_key_profile["ROUTE_PSAP_NAME"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+missing_route_name = (
+    gmlc_key_profile["ROUTED_NAME"].eq("")
+)
+
+gmlc_key_profile.loc[
+    missing_route_name,
+    "ROUTED_NAME"
+] = (
+    gmlc_key_profile.loc[
+        missing_route_name,
+        "PSAP_NAME"
+    ]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+fcc_profile = (
+    gmlc_key_profile
+    .groupby(
+        "FCC_PSAP_ID_NORM",
+        dropna=False
+    )
+    .agg(
+        ROWS=(
+            "FCC_PSAP_ID_NORM",
+            "size"
+        ),
+        DISTINCT_PSAP_IDS=(
+            "PSAP_ID_NORM",
+            "nunique"
+        ),
+        DISTINCT_ROUTED_NAMES=(
+            "ROUTED_NAME",
+            "nunique"
+        ),
+        PSAP_IDS=(
+            "PSAP_ID_NORM",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        {
+                            str(x)
+                            for x in s
+                            if pd.notna(x)
+                            and str(x).strip()
+                            and str(x) != "<NA>"
+                        }
+                    )
+                )[:1000]
+        ),
+        ROUTED_NAMES=(
+            "ROUTED_NAME",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        {
+                            str(x)
+                            for x in s
+                            if pd.notna(x)
+                            and str(x).strip()
+                        }
+                    )
+                )[:1500]
+        ),
+    )
+    .reset_index()
+    .sort_values(
+        [
+            "DISTINCT_ROUTED_NAMES",
+            "ROWS"
+        ],
+        ascending=False
+    )
+)
+
+
+print("\n============================================================")
+print("GMLC FCC_PSAP_ID -> routed-name multiplicity")
+print("============================================================")
+
+display(
+    fcc_profile.head(100)
+)
+
+
+print("\nFCC_PSAP_ID values mapping to >1 routed name:")
+
+display(
+    fcc_profile.loc[
+        fcc_profile[
+            "DISTINCT_ROUTED_NAMES"
+        ] > 1
+    ]
+    .head(100)
+)
+
+
+# =====================================================================
+# 2. PROFILE PSAP_ID -> ROUTED NAME
+# =====================================================================
+
+psap_id_profile = (
+    gmlc_key_profile
+    .groupby(
+        "PSAP_ID_NORM",
+        dropna=False
+    )
+    .agg(
+        ROWS=(
+            "PSAP_ID_NORM",
+            "size"
+        ),
+        DISTINCT_ROUTED_NAMES=(
+            "ROUTED_NAME",
+            "nunique"
+        ),
+        ROUTED_NAMES=(
+            "ROUTED_NAME",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        {
+                            str(x)
+                            for x in s
+                            if pd.notna(x)
+                            and str(x).strip()
+                        }
+                    )
+                )[:1500]
+        ),
+    )
+    .reset_index()
+    .sort_values(
+        [
+            "DISTINCT_ROUTED_NAMES",
+            "ROWS"
+        ],
+        ascending=False
+    )
+)
+
+
+print("\n============================================================")
+print("GMLC PSAP_ID -> routed-name multiplicity")
+print("============================================================")
+
+display(
+    psap_id_profile.head(100)
+)
+
+
+# =====================================================================
+# 3. PRINT FINAL_JOIN.TAB SCHEMA
+# =====================================================================
+
+boundary_schema = pd.DataFrame({
+    "COLUMN": boundaries.columns.astype(str),
+    "DTYPE": [
+        str(boundaries[c].dtype)
+        for c in boundaries.columns
+    ],
+})
+
+
+print("\n============================================================")
+print("Final_Join.tab columns")
+print("============================================================")
+
+display(
+    boundary_schema
+)
+
+
+# =====================================================================
+# 4. FIND POSSIBLE COMMON IDENTIFIER COLUMNS
+# =====================================================================
+
+candidate_tokens = [
+    "FCC",
+    "PSAP",
+    "ID",
+    "FIPS",
+    "AGENCY",
+    "NAME",
+]
+
+
+candidate_boundary_columns = [
+    c
+    for c in boundaries.columns
+    if any(
+        token in str(c).upper()
+        for token in candidate_tokens
+    )
+]
+
+
+print("\nPossible boundary identifier/name columns:")
+
+for c in candidate_boundary_columns:
+    print(
+        f" - {c}: {boundaries[c].dtype}"
+    )
+
+
+# =====================================================================
+# 5. TEST VALUE OVERLAP WITH GMLC FCC_PSAP_ID AND PSAP_ID
+# =====================================================================
+
+gmlc_fcc_values = set(
+    gmlc_key_profile[
+        "FCC_PSAP_ID_NORM"
+    ]
+    .dropna()
+    .astype(str)
+    .str.strip()
+)
+
+gmlc_fcc_values.discard("")
+gmlc_fcc_values.discard("<NA>")
+
+
+gmlc_psap_values = set(
+    gmlc_key_profile[
+        "PSAP_ID_NORM"
+    ]
+    .dropna()
+    .astype(str)
+    .str.strip()
+)
+
+gmlc_psap_values.discard("")
+gmlc_psap_values.discard("<NA>")
+
+
+overlap_rows = []
+
+
+for c in candidate_boundary_columns:
+
+    try:
+
+        vals = (
+            boundaries[c]
+            .astype("string")
+            .str.strip()
+            .str.replace(
+                r"\.0$",
+                "",
+                regex=True
+            )
+            .dropna()
+        )
+
+        boundary_values = set(
+            x
+            for x in vals.astype(str)
+            if x
+            and x != "<NA>"
+        )
+
+
+        fcc_overlap = (
+            gmlc_fcc_values
+            &
+            boundary_values
+        )
+
+
+        psap_overlap = (
+            gmlc_psap_values
+            &
+            boundary_values
+        )
+
+
+        overlap_rows.append({
+            "BOUNDARY_COLUMN":
+                c,
+
+            "BOUNDARY_UNIQUE_VALUES":
+                len(
+                    boundary_values
+                ),
+
+            "GMLC_FCC_PSAP_ID_OVERLAP":
+                len(
+                    fcc_overlap
+                ),
+
+            "GMLC_PSAP_ID_OVERLAP":
+                len(
+                    psap_overlap
+                ),
+
+            "FCC_OVERLAP_PCT":
+                (
+                    100
+                    * len(fcc_overlap)
+                    / max(
+                        len(gmlc_fcc_values),
+                        1
+                    )
+                ),
+
+            "PSAP_ID_OVERLAP_PCT":
+                (
+                    100
+                    * len(psap_overlap)
+                    / max(
+                        len(gmlc_psap_values),
+                        1
+                    )
+                ),
+        })
+
+
+    except Exception as e:
+
+        overlap_rows.append({
+            "BOUNDARY_COLUMN":
+                c,
+
+            "ERROR":
+                str(e),
+        })
+
+
+overlap_report = (
+    pd.DataFrame(
+        overlap_rows
+    )
+    .sort_values(
+        [
+            "GMLC_PSAP_ID_OVERLAP",
+            "GMLC_FCC_PSAP_ID_OVERLAP"
+        ],
+        ascending=False
+    )
+)
+
+
+print("\n============================================================")
+print("Exact key overlap: GMLC vs Final_Join.tab")
+print("============================================================")
+
+display(
+    overlap_report
+)
+
+
+# =====================================================================
+# 6. SPECIFIC ALASKA EXAMPLES
+# =====================================================================
+
+alaska_debug = (
+    report.loc[
+        report[
+            "STATE"
+        ]
+        .astype(str)
+        .str.upper()
+        .eq("AK"),
+        [
+            c
+            for c in [
+                "FILTER_UNIQ911_CID",
+
+                "FCC_PSAP_ID",
+                "PSAP_ID",
+
+                "PSAP_NAME",
+                "ROUTE_PSAP_NAME",
+
+                "ROUTED_PSAP_ID",
+                "ROUTED_PSAP_NAME",
+
+                "CALLER_LATITUDE",
+                "CALLER_LONGITUDE",
+
+                "CALLER_EXPECTED_PSAP_ID",
+                "CALLER_EXPECTED_PSAP_NAME",
+
+                "CALLER_EXPECTED_VS_ROUTED",
+
+                "CALLER_TO_ROUTED_BOUNDARY_KM",
+                "CALLER_TO_EXPECTED_BOUNDARY_KM",
+            ]
+            if c in report.columns
+        ]
+    ]
+    .copy()
+)
+
+
+print("\n============================================================")
+print("Alaska routed-ID diagnostic")
+print("============================================================")
+
+display(
+    alaska_debug.head(100)
+)
