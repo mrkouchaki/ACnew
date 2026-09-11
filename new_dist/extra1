@@ -2,6 +2,970 @@
 
 
 # =====================================================================
+# AUDIT GMLC: DOES THE SAME PSAP NAME MAP TO MULTIPLE PSAP/FCC IDS?
+# =====================================================================
+#
+# INPUT:
+#   C:\temp\gmlc_v2\e911_lte_master_gmlc.csv
+#
+# CHECKS:
+#
+#   ROUTE_PSAP_NAME
+#       -> how many PSAP_ID?
+#       -> how many FCC_PSAP_ID?
+#
+#   PSAP_NAME
+#       -> how many PSAP_ID?
+#       -> how many FCC_PSAP_ID?
+#
+#   PSAP_NAME_ESRK
+#       -> how many PSAP_ID?
+#       -> how many FCC_PSAP_ID?
+#
+# Also builds:
+#
+#   GMLC_ROUTED_NAME
+#
+# with priority:
+#
+#   ROUTE_PSAP_NAME
+#       ↓ fallback
+#   PSAP_NAME
+#       ↓ fallback
+#   PSAP_NAME_ESRK
+#
+# IMPORTANT:
+#   - GMLC only
+#   - no boundary data
+#   - no fuzzy matching
+#   - no trailing-code removal
+#   - only uppercase + whitespace cleanup for name comparison
+#
+# =====================================================================
+
+from pathlib import Path
+from collections import defaultdict
+import re
+
+import pandas as pd
+from IPython.display import display, Markdown
+
+
+# =====================================================================
+# 0. PATHS
+# =====================================================================
+
+DATA_DIR = Path(
+    r"C:\temp\gmlc_v2"
+)
+
+GMLC_PATH = (
+    DATA_DIR
+    / "e911_lte_master_gmlc.csv"
+)
+
+OUTPUT_DIR = (
+    DATA_DIR
+    / "outputs_psap_rca_v5"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+OUTPUT_PRIMARY = (
+    OUTPUT_DIR
+    / "gmlc_duplicate_primary_routed_names.csv"
+)
+
+OUTPUT_ALL_SOURCES = (
+    OUTPUT_DIR
+    / "gmlc_duplicate_names_by_source.csv"
+)
+
+
+CSV_CHUNK_ROWS = 100_000
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def clean_id(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+
+    if text.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    text = re.sub(
+        r"\.0$",
+        "",
+        text
+    )
+
+    # Canonical numeric identity.
+    # Example:
+    # 040500006 -> 40500006
+    if re.fullmatch(
+        r"\d+",
+        text
+    ):
+
+        try:
+            return str(
+                int(text)
+            )
+
+        except Exception:
+            pass
+
+    return text.upper()
+
+
+def clean_name(value):
+    """
+    Light normalization ONLY.
+
+    Keeps punctuation and numeric suffixes.
+    We only:
+      - trim
+      - uppercase
+      - collapse spaces
+    """
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+
+    if text.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    text = text.upper()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+    return text
+
+
+# =====================================================================
+# 2. CHECK AVAILABLE GMLC COLUMNS
+# =====================================================================
+
+header = list(
+    pd.read_csv(
+        GMLC_PATH,
+        nrows=0
+    ).columns
+)
+
+header_lookup = {
+    str(c).strip().upper(): c
+    for c in header
+}
+
+
+required = [
+    "PSAP_ID",
+    "FCC_PSAP_ID",
+]
+
+
+for column in required:
+
+    if column not in header_lookup:
+
+        raise RuntimeError(
+            f"GMLC missing required column: {column}"
+        )
+
+
+name_columns = [
+    column
+    for column in [
+        "ROUTE_PSAP_NAME",
+        "PSAP_NAME",
+        "PSAP_NAME_ESRK"
+    ]
+    if column in header_lookup
+]
+
+
+print(
+    "GMLC:",
+    GMLC_PATH
+)
+
+print(
+    "Name fields found:",
+    name_columns
+)
+
+
+# =====================================================================
+# 3. ACCUMULATORS
+# =====================================================================
+
+# key:
+#   (SOURCE_COLUMN, NORMALIZED_NAME)
+#
+# values:
+#   PSAP IDs
+#   FCC IDs
+#   PSAP/FCC combinations
+#   rows
+#   original display names
+
+source_stats = defaultdict(
+    lambda: {
+        "PSAP_IDS": set(),
+        "FCC_IDS": set(),
+        "ID_PAIRS": set(),
+        "ORIGINAL_NAMES": set(),
+        "ROWS": 0,
+    }
+)
+
+
+# Primary GMLC routed name:
+#
+# ROUTE_PSAP_NAME
+# -> PSAP_NAME
+# -> PSAP_NAME_ESRK
+
+primary_stats = defaultdict(
+    lambda: {
+        "PSAP_IDS": set(),
+        "FCC_IDS": set(),
+        "ID_PAIRS": set(),
+        "ORIGINAL_NAMES": set(),
+        "NAME_SOURCES": set(),
+        "ROWS": 0,
+    }
+)
+
+
+# =====================================================================
+# 4. STREAM FULL GMLC
+# =====================================================================
+
+usecols = [
+
+    header_lookup[
+        "PSAP_ID"
+    ],
+
+    header_lookup[
+        "FCC_PSAP_ID"
+    ],
+]
+
+
+for column in name_columns:
+
+    usecols.append(
+        header_lookup[
+            column
+        ]
+    )
+
+
+processed = 0
+
+
+for chunk_no, chunk in enumerate(
+
+    pd.read_csv(
+
+        GMLC_PATH,
+
+        dtype="string",
+
+        usecols=usecols,
+
+        chunksize=CSV_CHUNK_ROWS,
+
+        low_memory=False,
+
+        encoding_errors="replace"
+    ),
+
+    start=1
+):
+
+    chunk.columns = [
+        str(c).strip().upper()
+        for c in chunk.columns
+    ]
+
+
+    chunk["PSAP_ID_CANON"] = (
+        chunk["PSAP_ID"]
+        .map(clean_id)
+    )
+
+
+    chunk["FCC_PSAP_ID_CANON"] = (
+        chunk["FCC_PSAP_ID"]
+        .map(clean_id)
+    )
+
+
+    # =============================================================
+    # A. EACH NAME SOURCE SEPARATELY
+    # =============================================================
+
+    for source_column in name_columns:
+
+        for (
+            raw_name,
+            psap_id,
+            fcc_id
+        ) in zip(
+
+            chunk[source_column],
+
+            chunk[
+                "PSAP_ID_CANON"
+            ],
+
+            chunk[
+                "FCC_PSAP_ID_CANON"
+            ]
+        ):
+
+            normalized_name = (
+                clean_name(
+                    raw_name
+                )
+            )
+
+
+            if not normalized_name:
+
+                continue
+
+
+            key = (
+                source_column,
+                normalized_name
+            )
+
+
+            item = (
+                source_stats[
+                    key
+                ]
+            )
+
+
+            item[
+                "ROWS"
+            ] += 1
+
+
+            if psap_id:
+
+                item[
+                    "PSAP_IDS"
+                ].add(
+                    psap_id
+                )
+
+
+            if fcc_id:
+
+                item[
+                    "FCC_IDS"
+                ].add(
+                    fcc_id
+                )
+
+
+            if (
+                psap_id
+                or
+                fcc_id
+            ):
+
+                item[
+                    "ID_PAIRS"
+                ].add(
+                    (
+                        psap_id,
+                        fcc_id
+                    )
+                )
+
+
+            raw_display = (
+                str(raw_name).strip()
+                if pd.notna(raw_name)
+                else ""
+            )
+
+
+            if raw_display:
+
+                item[
+                    "ORIGINAL_NAMES"
+                ].add(
+                    raw_display
+                )
+
+
+    # =============================================================
+    # B. PRIMARY GMLC ROUTED NAME
+    #
+    # ROUTE_PSAP_NAME
+    # -> PSAP_NAME
+    # -> PSAP_NAME_ESRK
+    # =============================================================
+
+    for _, row in chunk.iterrows():
+
+        chosen_name = ""
+        chosen_source = ""
+
+
+        for candidate in [
+
+            "ROUTE_PSAP_NAME",
+            "PSAP_NAME",
+            "PSAP_NAME_ESRK",
+        ]:
+
+            if candidate not in chunk.columns:
+
+                continue
+
+
+            value = row[
+                candidate
+            ]
+
+
+            normalized = clean_name(
+                value
+            )
+
+
+            if normalized:
+
+                chosen_name = normalized
+
+                chosen_source = candidate
+
+                break
+
+
+        if not chosen_name:
+
+            continue
+
+
+        psap_id = row[
+            "PSAP_ID_CANON"
+        ]
+
+
+        fcc_id = row[
+            "FCC_PSAP_ID_CANON"
+        ]
+
+
+        item = (
+            primary_stats[
+                chosen_name
+            ]
+        )
+
+
+        item[
+            "ROWS"
+        ] += 1
+
+
+        item[
+            "NAME_SOURCES"
+        ].add(
+            chosen_source
+        )
+
+
+        if psap_id:
+
+            item[
+                "PSAP_IDS"
+            ].add(
+                psap_id
+            )
+
+
+        if fcc_id:
+
+            item[
+                "FCC_IDS"
+            ].add(
+                fcc_id
+            )
+
+
+        if (
+            psap_id
+            or
+            fcc_id
+        ):
+
+            item[
+                "ID_PAIRS"
+            ].add(
+                (
+                    psap_id,
+                    fcc_id
+                )
+            )
+
+
+        original_value = row[
+            chosen_source
+        ]
+
+
+        if pd.notna(
+            original_value
+        ):
+
+            item[
+                "ORIGINAL_NAMES"
+            ].add(
+                str(
+                    original_value
+                ).strip()
+            )
+
+
+    processed += len(
+        chunk
+    )
+
+
+    print(
+        f"Chunk {chunk_no:03d} | "
+        f"rows processed {processed:,}"
+    )
+
+
+# =====================================================================
+# 5. BUILD SOURCE-SPECIFIC REPORT
+# =====================================================================
+
+source_rows = []
+
+
+for (
+    source,
+    name
+), item in source_stats.items():
+
+    source_rows.append(
+        {
+
+            "NAME_SOURCE":
+                source,
+
+            "GMLC_NAME":
+                name,
+
+            "ROWS":
+                item[
+                    "ROWS"
+                ],
+
+            "DISTINCT_PSAP_IDS":
+                len(
+                    item[
+                        "PSAP_IDS"
+                    ]
+                ),
+
+            "DISTINCT_FCC_PSAP_IDS":
+                len(
+                    item[
+                        "FCC_IDS"
+                    ]
+                ),
+
+            "DISTINCT_PSAP_FCC_PAIRS":
+                len(
+                    item[
+                        "ID_PAIRS"
+                    ]
+                ),
+
+            "PSAP_IDS":
+                " | ".join(
+                    sorted(
+                        item[
+                            "PSAP_IDS"
+                        ]
+                    )
+                ),
+
+            "FCC_PSAP_IDS":
+                " | ".join(
+                    sorted(
+                        item[
+                            "FCC_IDS"
+                        ]
+                    )
+                ),
+
+            "PSAP_FCC_PAIRS":
+                " | ".join(
+
+                    sorted(
+
+                        f"{p}/{f}"
+
+                        for p, f
+                        in item[
+                            "ID_PAIRS"
+                        ]
+                    )
+                ),
+
+            "ORIGINAL_NAMES":
+                " | ".join(
+                    sorted(
+                        item[
+                            "ORIGINAL_NAMES"
+                        ]
+                    )
+                ),
+        }
+    )
+
+
+source_report = pd.DataFrame(
+    source_rows
+)
+
+
+source_duplicates = (
+
+    source_report.loc[
+        (
+            source_report[
+                "DISTINCT_PSAP_IDS"
+            ] > 1
+        )
+        |
+        (
+            source_report[
+                "DISTINCT_FCC_PSAP_IDS"
+            ] > 1
+        )
+        |
+        (
+            source_report[
+                "DISTINCT_PSAP_FCC_PAIRS"
+            ] > 1
+        )
+    ]
+
+    .sort_values(
+        [
+            "DISTINCT_PSAP_FCC_PAIRS",
+            "ROWS"
+        ],
+        ascending=False
+    )
+)
+
+
+source_duplicates.to_csv(
+    OUTPUT_ALL_SOURCES,
+    index=False
+)
+
+
+# =====================================================================
+# 6. BUILD PRIMARY GMLC ROUTED-NAME REPORT
+# =====================================================================
+
+primary_rows = []
+
+
+for name, item in (
+    primary_stats.items()
+):
+
+    primary_rows.append(
+        {
+
+            "GMLC_ROUTED_NAME":
+                name,
+
+            "ROWS":
+                item[
+                    "ROWS"
+                ],
+
+            "DISTINCT_PSAP_IDS":
+                len(
+                    item[
+                        "PSAP_IDS"
+                    ]
+                ),
+
+            "DISTINCT_FCC_PSAP_IDS":
+                len(
+                    item[
+                        "FCC_IDS"
+                    ]
+                ),
+
+            "DISTINCT_PSAP_FCC_PAIRS":
+                len(
+                    item[
+                        "ID_PAIRS"
+                    ]
+                ),
+
+            "PSAP_IDS":
+                " | ".join(
+                    sorted(
+                        item[
+                            "PSAP_IDS"
+                        ]
+                    )
+                ),
+
+            "FCC_PSAP_IDS":
+                " | ".join(
+                    sorted(
+                        item[
+                            "FCC_IDS"
+                        ]
+                    )
+                ),
+
+            "PSAP_FCC_PAIRS":
+                " | ".join(
+
+                    sorted(
+
+                        f"{p}/{f}"
+
+                        for p, f
+                        in item[
+                            "ID_PAIRS"
+                        ]
+                    )
+                ),
+
+            "NAME_SOURCE_USED":
+                " | ".join(
+                    sorted(
+                        item[
+                            "NAME_SOURCES"
+                        ]
+                    )
+                ),
+
+            "ORIGINAL_NAMES":
+                " | ".join(
+                    sorted(
+                        item[
+                            "ORIGINAL_NAMES"
+                        ]
+                    )
+                ),
+        }
+    )
+
+
+primary_report = pd.DataFrame(
+    primary_rows
+)
+
+
+primary_duplicates = (
+
+    primary_report.loc[
+        (
+            primary_report[
+                "DISTINCT_PSAP_IDS"
+            ] > 1
+        )
+        |
+        (
+            primary_report[
+                "DISTINCT_FCC_PSAP_IDS"
+            ] > 1
+        )
+        |
+        (
+            primary_report[
+                "DISTINCT_PSAP_FCC_PAIRS"
+            ] > 1
+        )
+    ]
+
+    .sort_values(
+        [
+            "DISTINCT_PSAP_FCC_PAIRS",
+            "ROWS"
+        ],
+        ascending=False
+    )
+)
+
+
+primary_duplicates.to_csv(
+    OUTPUT_PRIMARY,
+    index=False
+)
+
+
+# =====================================================================
+# 7. DISPLAY RESULTS
+# =====================================================================
+
+display(
+    Markdown(
+        "### GMLC primary routed-name duplication audit"
+    )
+)
+
+
+print(
+    "\nFull GMLC rows checked:",
+    f"{processed:,}"
+)
+
+
+print(
+    "\nPrimary GMLC routed names associated with >1 PSAP/FCC identity:",
+    len(
+        primary_duplicates
+    )
+)
+
+
+display(
+    primary_duplicates.head(
+        100
+    )
+)
+
+
+display(
+    Markdown(
+        "### Duplicates by individual GMLC name source"
+    )
+)
+
+
+print(
+    "Individual source/name combinations associated with >1 identity:",
+    len(
+        source_duplicates
+    )
+)
+
+
+display(
+    source_duplicates.head(
+        100
+    )
+)
+
+
+print(
+    "\nSaved:"
+)
+
+print(
+    "Primary routed-name audit:"
+)
+
+print(
+    OUTPUT_PRIMARY
+)
+
+
+print(
+    "\nIndividual name-source audit:"
+)
+
+print(
+    OUTPUT_ALL_SOURCES
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =====================================================================
 # AUDIT: CAN DIFFERENT BOUNDARY NENA/FCC IDS HAVE THE SAME AGENCY NAME?
 # =====================================================================
 #
