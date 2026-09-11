@@ -1,0 +1,380 @@
+
+
+
+# ================================================================
+# COMPARE NENA / FCC / AGENCY
+#
+# File 1: Final_Join.tab
+# File 2: e911_psap_boundaries CSV
+# ================================================================
+
+from pathlib import Path
+import re
+import pandas as pd
+import geopandas as gpd
+from IPython.display import display
+
+DATA_DIR = Path(r"C:\temp\gmlc_v2")
+
+FINAL_JOIN = DATA_DIR / "psap" / "Final_Join.tab"
+
+# Change only this line if your exact filename is different.
+CSV_FILE = DATA_DIR / "e911_psap_boundaries.csv"
+
+# If your filename really uses the typo "boudaries", use:
+# CSV_FILE = DATA_DIR / "e911_psap_boudaries.csv"
+
+
+def canon_id(x):
+    if pd.isna(x):
+        return ""
+    x = re.sub(r"\.0$", "", str(x).strip())
+    if not x:
+        return ""
+    if x.isdigit():
+        return str(int(x))       # removes leading zero for comparison
+    return x.upper()
+
+
+def norm_name(x):
+    if pd.isna(x):
+        return ""
+    return re.sub(
+        r"\s+",
+        " ",
+        str(x).strip().upper()
+    )
+
+
+def find_col(df, choices):
+    lookup = {
+        str(c).strip().upper(): c
+        for c in df.columns
+    }
+
+    for c in choices:
+        if c in lookup:
+            return lookup[c]
+
+    return None
+
+
+def prepare(df, source):
+
+    nena_col = find_col(
+        df,
+        ["NENA_ID"]
+    )
+
+    fcc_col = find_col(
+        df,
+        ["FCC_ID", "FCC_PSAP_ID"]
+    )
+
+    agency_col = find_col(
+        df,
+        ["AGENCY", "AGENCY_NAME", "PSAP_NAME"]
+    )
+
+    if nena_col is None:
+        raise RuntimeError(f"{source}: NENA_ID not found")
+
+    if fcc_col is None:
+        raise RuntimeError(f"{source}: FCC_ID/FCC_PSAP_ID not found")
+
+    if agency_col is None:
+        raise RuntimeError(f"{source}: AGENCY/name column not found")
+
+    out = pd.DataFrame({
+        "SOURCE": source,
+        "NENA_ID_RAW": df[nena_col].astype("string"),
+        "FCC_ID_RAW": df[fcc_col].astype("string"),
+        "AGENCY_RAW": df[agency_col].astype("string"),
+    })
+
+    out["NENA_ID"] = out["NENA_ID_RAW"].map(canon_id)
+    out["FCC_ID"] = out["FCC_ID_RAW"].map(canon_id)
+    out["AGENCY"] = out["AGENCY_RAW"].map(norm_name)
+
+    out = (
+        out.loc[
+            out["NENA_ID"].ne("")
+        ]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    print(
+        f"{source}: "
+        f"{len(out):,} unique NENA/FCC/Agency rows"
+    )
+
+    return out
+
+
+# ================================================================
+# 1. LOAD BOTH FILES
+# ================================================================
+
+final_raw = gpd.read_file(FINAL_JOIN)
+
+if not CSV_FILE.exists():
+    raise FileNotFoundError(
+        f"CSV not found:\n{CSV_FILE}\n"
+        "Change CSV_FILE to the exact filename."
+    )
+
+csv_raw = pd.read_csv(
+    CSV_FILE,
+    dtype="string",
+    low_memory=False
+)
+
+final = prepare(
+    final_raw,
+    "FINAL_JOIN"
+)
+
+csv_psap = prepare(
+    csv_raw,
+    "E911_PSAP_BOUNDARIES"
+)
+
+
+# ================================================================
+# 2. CHECK UNIQUENESS INSIDE EACH FILE
+# ================================================================
+
+def uniqueness_report(df, source):
+
+    by_nena = (
+        df.groupby("NENA_ID")
+        .agg(
+            FCC_COUNT=("FCC_ID", "nunique"),
+            AGENCY_COUNT=("AGENCY", "nunique"),
+            FCC_IDS=(
+                "FCC_ID",
+                lambda s: " | ".join(sorted(set(s)))
+            ),
+            AGENCIES=(
+                "AGENCY",
+                lambda s: " | ".join(sorted(set(s)))
+            )
+        )
+        .reset_index()
+    )
+
+    problems = by_nena.loc[
+        (by_nena["FCC_COUNT"] > 1)
+        |
+        (by_nena["AGENCY_COUNT"] > 1)
+    ].copy()
+
+    print(f"\n{source}")
+    print("Unique NENA IDs:", by_nena["NENA_ID"].nunique())
+    print(
+        "NENA IDs with >1 FCC or >1 Agency:",
+        len(problems)
+    )
+
+    return problems
+
+
+final_problems = uniqueness_report(
+    final,
+    "FINAL_JOIN"
+)
+
+csv_problems = uniqueness_report(
+    csv_psap,
+    "E911_PSAP_BOUNDARIES"
+)
+
+
+# ================================================================
+# 3. COLLAPSE EACH FILE BY NENA FOR CROSS-FILE COMPARISON
+# ================================================================
+
+def collapse(df, suffix):
+
+    return (
+        df.groupby("NENA_ID")
+        .agg(
+            **{
+                f"FCC_{suffix}": (
+                    "FCC_ID",
+                    lambda s:
+                        " | ".join(sorted(set(s)))
+                ),
+
+                f"AGENCY_{suffix}": (
+                    "AGENCY",
+                    lambda s:
+                        " | ".join(sorted(set(s)))
+                )
+            }
+        )
+        .reset_index()
+    )
+
+
+a = collapse(
+    final,
+    "FINAL_JOIN"
+)
+
+b = collapse(
+    csv_psap,
+    "CSV"
+)
+
+
+comparison = a.merge(
+    b,
+    on="NENA_ID",
+    how="outer",
+    indicator=True
+)
+
+
+comparison["FCC_MATCH"] = (
+    comparison["FCC_FINAL_JOIN"]
+    ==
+    comparison["FCC_CSV"]
+)
+
+
+comparison["AGENCY_MATCH"] = (
+    comparison["AGENCY_FINAL_JOIN"]
+    ==
+    comparison["AGENCY_CSV"]
+)
+
+
+comparison["OVERALL_STATUS"] = "MATCH"
+
+
+comparison.loc[
+    comparison["_merge"].eq("left_only"),
+    "OVERALL_STATUS"
+] = "ONLY_FINAL_JOIN"
+
+
+comparison.loc[
+    comparison["_merge"].eq("right_only"),
+    "OVERALL_STATUS"
+] = "ONLY_CSV"
+
+
+comparison.loc[
+    comparison["_merge"].eq("both")
+    &
+    ~comparison["FCC_MATCH"],
+    "OVERALL_STATUS"
+] = "FCC_MISMATCH"
+
+
+comparison.loc[
+    comparison["_merge"].eq("both")
+    &
+    comparison["FCC_MATCH"]
+    &
+    ~comparison["AGENCY_MATCH"],
+    "OVERALL_STATUS"
+] = "AGENCY_MISMATCH"
+
+
+# ================================================================
+# 4. SAME AGENCY NAME -> MULTIPLE IDENTITIES
+# ================================================================
+
+both = pd.concat(
+    [final, csv_psap],
+    ignore_index=True
+)
+
+
+agency_identity = (
+    both.loc[
+        both["AGENCY"].ne("")
+    ]
+    .groupby("AGENCY")
+    .agg(
+        NENA_COUNT=("NENA_ID", "nunique"),
+        FCC_COUNT=("FCC_ID", "nunique"),
+        NENA_IDS=(
+            "NENA_ID",
+            lambda s:
+                " | ".join(sorted(set(s)))
+        ),
+        FCC_IDS=(
+            "FCC_ID",
+            lambda s:
+                " | ".join(sorted(set(s)))
+        ),
+        SOURCES=(
+            "SOURCE",
+            lambda s:
+                " | ".join(sorted(set(s)))
+        )
+    )
+    .reset_index()
+)
+
+
+agency_duplicates = agency_identity.loc[
+    (agency_identity["NENA_COUNT"] > 1)
+    |
+    (agency_identity["FCC_COUNT"] > 1)
+].sort_values(
+    ["NENA_COUNT", "FCC_COUNT"],
+    ascending=False
+)
+
+
+# ================================================================
+# 5. DISPLAY
+# ================================================================
+
+print("\n==============================")
+print("CROSS-FILE STATUS")
+print("==============================")
+
+display(
+    comparison[
+        "OVERALL_STATUS"
+    ]
+    .value_counts()
+    .rename_axis("STATUS")
+    .reset_index(name="ROWS")
+)
+
+
+print("\nNENA/FCC/Agency mismatches between files:")
+
+display(
+    comparison.loc[
+        comparison["OVERALL_STATUS"].ne("MATCH")
+    ].head(200)
+)
+
+
+print("\nFINAL_JOIN internal NENA conflicts:")
+
+display(
+    final_problems.head(100)
+)
+
+
+print("\nE911_PSAP_BOUNDARIES internal NENA conflicts:")
+
+display(
+    csv_problems.head(100)
+)
+
+
+print("\nSame Agency name attached to multiple NENA/FCC identities:")
+
+display(
+    agency_duplicates.head(100)
+)
