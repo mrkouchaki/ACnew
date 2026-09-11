@@ -3,6 +3,904 @@
 
 
 
+# =====================================================================
+# TEST SECONDARY ROUTED-PSAP RESOLUTION:
+# FCC_PSAP_ID + ROUTED NAME -> UNIQUE NENA_ID
+# =====================================================================
+#
+# Does NOT change the model.
+#
+# Resolution hierarchy being tested:
+#
+# 1. GMLC PSAP_ID == Final_Join NENA_ID
+#
+# 2. If no exact NENA:
+#       GMLC FCC_PSAP_ID == Final_Join FCC_ID
+#       AND routed name ~= Final_Join AGENCY
+#
+# =====================================================================
+
+import re
+import pandas as pd
+import numpy as np
+from difflib import SequenceMatcher
+
+
+# =====================================================================
+# 0. SETTINGS
+# =====================================================================
+
+# Conservative fuzzy threshold.
+#
+# 0.90 means names need to be very similar.
+NAME_MATCH_THRESHOLD = 0.90
+
+# If best candidate and second-best candidate are too close,
+# do NOT automatically resolve.
+MIN_BEST_VS_SECOND_MARGIN = 0.08
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def id_norm(v):
+
+    if v is None or pd.isna(v):
+        return ""
+
+    s = str(v).strip()
+
+    if s.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    return re.sub(
+        r"\.0$",
+        "",
+        s
+    )
+
+
+def agency_norm(v):
+
+    if v is None or pd.isna(v):
+        return ""
+
+    s = str(v).upper().strip()
+
+    # Normalize common punctuation/separators.
+    s = s.replace("&", " AND ")
+
+    s = re.sub(
+        r"[^A-Z0-9]+",
+        " ",
+        s
+    )
+
+    s = re.sub(
+        r"\s+",
+        " ",
+        s
+    )
+
+    return s.strip()
+
+
+def similarity(a, b):
+
+    a = agency_norm(a)
+    b = agency_norm(b)
+
+    if not a or not b:
+        return 0.0
+
+    if a == b:
+        return 1.0
+
+    return SequenceMatcher(
+        None,
+        a,
+        b
+    ).ratio()
+
+
+# =====================================================================
+# 2. PREPARE FINAL_JOIN AT THE NENA IDENTITY LEVEL
+# =====================================================================
+
+boundary_identity = boundaries.copy()
+
+
+boundary_identity["NENA_ID_NORM"] = (
+    boundary_identity["NENA_ID"]
+    .map(id_norm)
+)
+
+boundary_identity["FCC_ID_NORM"] = (
+    boundary_identity["FCC_ID"]
+    .map(id_norm)
+)
+
+boundary_identity["AGENCY_CLEAN"] = (
+    boundary_identity["AGENCY"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+boundary_identity["AGENCY_NORM"] = (
+    boundary_identity["AGENCY_CLEAN"]
+    .map(agency_norm)
+)
+
+
+# One logical record per NENA ID.
+boundary_identity = (
+    boundary_identity
+    .sort_values(
+        [
+            "NENA_ID_NORM",
+            "AGENCY_CLEAN"
+        ]
+    )
+    .drop_duplicates(
+        "NENA_ID_NORM"
+    )
+    .loc[
+        lambda x:
+            x["NENA_ID_NORM"].ne("")
+    ]
+    .copy()
+)
+
+
+# =====================================================================
+# 3. SHOW WHETHER FCC_ID ITSELF IS ONE-TO-MANY
+# =====================================================================
+
+fcc_identity_profile = (
+    boundary_identity
+    .groupby(
+        "FCC_ID_NORM",
+        dropna=False
+    )
+    .agg(
+
+        NENA_COUNT=(
+            "NENA_ID_NORM",
+            "nunique"
+        ),
+
+        AGENCY_COUNT=(
+            "AGENCY_NORM",
+            "nunique"
+        ),
+
+        NENA_IDS=(
+            "NENA_ID_NORM",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        set(s)
+                    )
+                )[:1500]
+        ),
+
+        AGENCIES=(
+            "AGENCY_CLEAN",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        set(s)
+                    )
+                )[:2500]
+        ),
+    )
+    .reset_index()
+    .sort_values(
+        [
+            "NENA_COUNT",
+            "AGENCY_COUNT"
+        ],
+        ascending=False
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Final_Join FCC_ID multiplicity"
+)
+
+print(
+    "============================================================"
+)
+
+
+print(
+    "FCC IDs with multiple NENA identities:",
+    int(
+        (
+            fcc_identity_profile[
+                "NENA_COUNT"
+            ] > 1
+        ).sum()
+    )
+)
+
+
+display(
+    fcc_identity_profile.loc[
+        fcc_identity_profile[
+            "NENA_COUNT"
+        ] > 1
+    ]
+    .head(100)
+)
+
+
+# =====================================================================
+# 4. PREPARE GMLC ROUTED CALLS
+# =====================================================================
+
+route_test = report.copy()
+
+
+route_test["GMLC_PSAP_ID_NORM"] = (
+    route_test["PSAP_ID"]
+    .map(id_norm)
+)
+
+route_test["GMLC_FCC_ID_NORM"] = (
+    route_test["FCC_PSAP_ID"]
+    .map(id_norm)
+)
+
+
+route_test["GMLC_ROUTED_NAME"] = (
+    route_test[
+        "ROUTE_PSAP_NAME"
+    ]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+missing_name = (
+    route_test[
+        "GMLC_ROUTED_NAME"
+    ].eq("")
+)
+
+
+route_test.loc[
+    missing_name,
+    "GMLC_ROUTED_NAME"
+] = (
+    route_test.loc[
+        missing_name,
+        "PSAP_NAME"
+    ]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+# =====================================================================
+# 5. BUILD DIRECT NENA LOOKUP
+# =====================================================================
+
+nena_ids = set(
+    boundary_identity[
+        "NENA_ID_NORM"
+    ]
+)
+
+
+# =====================================================================
+# 6. RESOLVE EACH CALL
+# =====================================================================
+
+resolution_rows = []
+
+
+for idx, row in route_test.iterrows():
+
+    psap_id = row[
+        "GMLC_PSAP_ID_NORM"
+    ]
+
+    fcc_id = row[
+        "GMLC_FCC_ID_NORM"
+    ]
+
+    routed_name = row[
+        "GMLC_ROUTED_NAME"
+    ]
+
+
+    result = {
+        "INDEX":
+            idx,
+
+        "ROUTED_BOUNDARY_NENA_ID":
+            "",
+
+        "ROUTED_BOUNDARY_FCC_ID":
+            "",
+
+        "ROUTED_BOUNDARY_AGENCY":
+            "",
+
+        "ROUTED_BOUNDARY_RESOLUTION_METHOD":
+            "UNRESOLVED",
+
+        "ROUTED_BOUNDARY_NAME_SCORE":
+            np.nan,
+
+        "ROUTED_BOUNDARY_SECOND_SCORE":
+            np.nan,
+
+        "ROUTED_BOUNDARY_SCORE_MARGIN":
+            np.nan,
+
+        "FCC_CANDIDATE_COUNT":
+            0,
+    }
+
+
+    # -------------------------------------------------------------
+    # TIER 1:
+    # GMLC PSAP_ID -> exact NENA_ID
+    # -------------------------------------------------------------
+
+    if (
+        psap_id
+        and
+        psap_id in nena_ids
+    ):
+
+        candidate = (
+            boundary_identity.loc[
+                boundary_identity[
+                    "NENA_ID_NORM"
+                ].eq(
+                    psap_id
+                )
+            ]
+            .iloc[0]
+        )
+
+
+        result[
+            "ROUTED_BOUNDARY_NENA_ID"
+        ] = candidate[
+            "NENA_ID_NORM"
+        ]
+
+        result[
+            "ROUTED_BOUNDARY_FCC_ID"
+        ] = candidate[
+            "FCC_ID_NORM"
+        ]
+
+        result[
+            "ROUTED_BOUNDARY_AGENCY"
+        ] = candidate[
+            "AGENCY_CLEAN"
+        ]
+
+        result[
+            "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+        ] = "EXACT_PSAP_ID_TO_NENA_ID"
+
+        result[
+            "ROUTED_BOUNDARY_NAME_SCORE"
+        ] = similarity(
+            routed_name,
+            candidate[
+                "AGENCY_CLEAN"
+            ]
+        )
+
+
+        resolution_rows.append(
+            result
+        )
+
+        continue
+
+
+    # -------------------------------------------------------------
+    # TIER 2:
+    # FCC ID -> candidate NENA identities
+    # -------------------------------------------------------------
+
+    candidates = (
+        boundary_identity.loc[
+            boundary_identity[
+                "FCC_ID_NORM"
+            ].eq(
+                fcc_id
+            )
+        ]
+        .copy()
+    )
+
+
+    result[
+        "FCC_CANDIDATE_COUNT"
+    ] = len(
+        candidates
+    )
+
+
+    if candidates.empty:
+
+        resolution_rows.append(
+            result
+        )
+
+        continue
+
+
+    # If only one candidate under the FCC ID, we can inspect it,
+    # but still retain method explicitly.
+    candidates[
+        "_NAME_SCORE"
+    ] = candidates[
+        "AGENCY_CLEAN"
+    ].map(
+        lambda x:
+            similarity(
+                routed_name,
+                x
+            )
+    )
+
+
+    candidates = (
+        candidates
+        .sort_values(
+            "_NAME_SCORE",
+            ascending=False
+        )
+    )
+
+
+    best = (
+        candidates.iloc[0]
+    )
+
+
+    best_score = float(
+        best[
+            "_NAME_SCORE"
+        ]
+    )
+
+
+    if len(candidates) >= 2:
+
+        second_score = float(
+            candidates.iloc[1][
+                "_NAME_SCORE"
+            ]
+        )
+
+    else:
+
+        second_score = 0.0
+
+
+    margin = (
+        best_score
+        -
+        second_score
+    )
+
+
+    result[
+        "ROUTED_BOUNDARY_NAME_SCORE"
+    ] = best_score
+
+    result[
+        "ROUTED_BOUNDARY_SECOND_SCORE"
+    ] = second_score
+
+    result[
+        "ROUTED_BOUNDARY_SCORE_MARGIN"
+    ] = margin
+
+
+    # -------------------------------------------------------------
+    # Safe name-qualified resolution.
+    # -------------------------------------------------------------
+
+    if (
+        best_score
+        >= NAME_MATCH_THRESHOLD
+        and
+        (
+            len(candidates) == 1
+            or
+            margin
+            >= MIN_BEST_VS_SECOND_MARGIN
+        )
+    ):
+
+        result[
+            "ROUTED_BOUNDARY_NENA_ID"
+        ] = best[
+            "NENA_ID_NORM"
+        ]
+
+        result[
+            "ROUTED_BOUNDARY_FCC_ID"
+        ] = best[
+            "FCC_ID_NORM"
+        ]
+
+        result[
+            "ROUTED_BOUNDARY_AGENCY"
+        ] = best[
+            "AGENCY_CLEAN"
+        ]
+
+        result[
+            "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+        ] = "FCC_ID_PLUS_ROUTED_NAME"
+
+
+    resolution_rows.append(
+        result
+    )
+
+
+resolution = (
+    pd.DataFrame(
+        resolution_rows
+    )
+    .set_index(
+        "INDEX"
+    )
+)
+
+
+# =====================================================================
+# 7. ATTACH RESULTS
+# =====================================================================
+
+for c in resolution.columns:
+
+    route_test[c] = (
+        resolution[c]
+        .reindex(
+            route_test.index
+        )
+    )
+
+
+# =====================================================================
+# 8. COVERAGE SUMMARY
+# =====================================================================
+
+coverage = (
+    route_test[
+        "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+    ]
+    .value_counts(
+        dropna=False
+    )
+    .rename_axis(
+        "METHOD"
+    )
+    .reset_index(
+        name="CALLS"
+    )
+)
+
+
+coverage["PCT"] = (
+    100.0
+    * coverage[
+        "CALLS"
+    ]
+    / max(
+        len(route_test),
+        1
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Routed boundary resolution coverage"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    coverage
+)
+
+
+resolved_count = (
+    route_test[
+        "ROUTED_BOUNDARY_NENA_ID"
+    ]
+    .fillna("")
+    .ne("")
+    .sum()
+)
+
+
+print(
+    "Resolved:",
+    f"{resolved_count:,}",
+    "/",
+    f"{len(route_test):,}",
+    "=",
+    f"{100 * resolved_count / max(len(route_test),1):.2f}%"
+)
+
+
+# =====================================================================
+# 9. ALASKA RESULT
+# =====================================================================
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Alaska routed-boundary resolution"
+)
+
+print(
+    "============================================================"
+)
+
+
+alaska_result = (
+    route_test.loc[
+        route_test[
+            "STATE"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .eq("AK")
+    ]
+)
+
+
+alaska_columns = [
+
+    "FILTER_UNIQ911_CID",
+
+    "STATE",
+    "COUNTY",
+
+    "FCC_PSAP_ID",
+    "PSAP_ID",
+
+    "GMLC_ROUTED_NAME",
+
+    "ROUTED_BOUNDARY_NENA_ID",
+
+    "ROUTED_BOUNDARY_FCC_ID",
+
+    "ROUTED_BOUNDARY_AGENCY",
+
+    "ROUTED_BOUNDARY_RESOLUTION_METHOD",
+
+    "ROUTED_BOUNDARY_NAME_SCORE",
+
+    "ROUTED_BOUNDARY_SECOND_SCORE",
+
+    "ROUTED_BOUNDARY_SCORE_MARGIN",
+
+    "FCC_CANDIDATE_COUNT",
+]
+
+
+display(
+    alaska_result[
+        [
+            c
+            for c in alaska_columns
+            if c in alaska_result.columns
+        ]
+    ]
+    .head(150)
+)
+
+
+# =====================================================================
+# 10. SPECIFIC KETCHIKAN / FAIRBANKS / ANCHORAGE EXAMPLES
+# =====================================================================
+
+debug_names = (
+
+    route_test[
+        "GMLC_ROUTED_NAME"
+    ]
+    .fillna("")
+    .str.upper()
+    .str.contains(
+        "KETCHIKAN|FAIRBANKS|ANCHORAGE",
+        regex=True
+    )
+)
+
+
+display(
+    route_test.loc[
+        debug_names,
+        [
+            c
+            for c in alaska_columns
+            if c in route_test.columns
+        ]
+    ]
+    .head(150)
+)
+
+
+# =====================================================================
+# 11. UNRESOLVED CALLS
+# =====================================================================
+
+unresolved = (
+    route_test.loc[
+        route_test[
+            "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+        ]
+        .eq(
+            "UNRESOLVED"
+        )
+    ]
+)
+
+
+unresolved_profile = (
+
+    unresolved
+
+    .groupby(
+        [
+            "GMLC_FCC_ID_NORM",
+            "GMLC_PSAP_ID_NORM",
+            "GMLC_ROUTED_NAME"
+        ],
+        dropna=False
+    )
+
+    .agg(
+
+        ROWS=(
+            "GMLC_ROUTED_NAME",
+            "size"
+        ),
+
+        STATES=(
+            "STATE",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        set(
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        )
+                    )
+                )
+        )
+    )
+
+    .reset_index()
+
+    .sort_values(
+        "ROWS",
+        ascending=False
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Still unresolved"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    unresolved_profile.head(100)
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # =====================================================================
 # VALIDATE GMLC PSAP_ID -> FINAL_JOIN.NENA_ID AS ROUTED PSAP KEY
