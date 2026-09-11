@@ -1,6 +1,274 @@
 
 
 
+# =====================================================================
+# AUDIT: CAN DIFFERENT BOUNDARY NENA/FCC IDS HAVE THE SAME AGENCY NAME?
+# =====================================================================
+#
+# This is QA only.
+# It does NOT modify the main analysis.
+#
+# It checks Final_Join itself:
+#
+#   Boundary NENA_ID
+#   Boundary FCC_ID
+#   Boundary AGENCY
+#
+# No fuzzy matching.
+# No suffix removal.
+# No GMLC names.
+# =====================================================================
+
+import pandas as pd
+from IPython.display import display
+
+
+# ---------------------------------------------------------------------
+# 1. Find the columns that actually exist in the current boundary_raw
+# ---------------------------------------------------------------------
+
+def pick_existing(columns, candidates):
+
+    for c in candidates:
+
+        if c is not None and c in columns:
+            return c
+
+    return None
+
+
+nena_col = pick_existing(
+    boundary_raw.columns,
+    [
+        "_NENA_CANON",
+        "_NENA",
+        "NENA_ID"
+    ]
+)
+
+
+fcc_col = pick_existing(
+    boundary_raw.columns,
+    [
+        "_FCC_CANON",
+        "_FCC",
+        "FCC_ID",
+        "FCC_PSAP_ID"
+    ]
+)
+
+
+agency_col = pick_existing(
+    boundary_raw.columns,
+    [
+        "_AGENCY",
+        "_NAME_AGENCY",
+        "AGENCY",
+        "AGENCY_NAME"
+    ]
+)
+
+
+if nena_col is None:
+    raise RuntimeError(
+        "Could not find NENA_ID column in boundary_raw."
+    )
+
+if fcc_col is None:
+    raise RuntimeError(
+        "Could not find FCC_ID column in boundary_raw."
+    )
+
+if agency_col is None:
+    raise RuntimeError(
+        "Could not find AGENCY/name column in boundary_raw."
+    )
+
+
+print("Using:")
+print(" NENA  :", nena_col)
+print(" FCC   :", fcc_col)
+print(" AGENCY:", agency_col)
+
+
+# ---------------------------------------------------------------------
+# 2. Build clean audit table
+# ---------------------------------------------------------------------
+
+audit = boundary_raw[
+    [
+        nena_col,
+        fcc_col,
+        agency_col
+    ]
+].copy()
+
+
+audit = audit.rename(
+    columns={
+        nena_col: "NENA_ID",
+        fcc_col: "FCC_ID",
+        agency_col: "AGENCY"
+    }
+)
+
+
+audit["NENA_ID"] = (
+    audit["NENA_ID"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+audit["FCC_ID"] = (
+    audit["FCC_ID"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+audit["AGENCY"] = (
+    audit["AGENCY"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+# ---------------------------------------------------------------------
+# IMPORTANT:
+#
+# Exact/light normalization only.
+# We are NOT removing trailing codes.
+# We are NOT fuzzy matching.
+# ---------------------------------------------------------------------
+
+audit["AGENCY_EXACT_NORM"] = (
+    audit["AGENCY"]
+    .str.upper()
+    .str.replace(r"\s+", " ", regex=True)
+    .str.strip()
+)
+
+
+audit = audit.loc[
+    audit["AGENCY_EXACT_NORM"].ne("")
+].copy()
+
+
+# ---------------------------------------------------------------------
+# 3. For each agency name, count unique NENA and FCC IDs
+# ---------------------------------------------------------------------
+
+duplicate_names = (
+    audit
+
+    .groupby(
+        "AGENCY_EXACT_NORM"
+    )
+
+    .agg(
+
+        DISTINCT_NENA_IDS=(
+            "NENA_ID",
+            "nunique"
+        ),
+
+        DISTINCT_FCC_IDS=(
+            "FCC_ID",
+            "nunique"
+        ),
+
+        NENA_IDS=(
+            "NENA_ID",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        set(
+                            x for x in s
+                            if str(x).strip()
+                        )
+                    )
+                )
+        ),
+
+        FCC_IDS=(
+            "FCC_ID",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        set(
+                            x for x in s
+                            if str(x).strip()
+                        )
+                    )
+                )
+        ),
+
+        ORIGINAL_AGENCY_NAMES=(
+            "AGENCY",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        set(
+                            x for x in s
+                            if str(x).strip()
+                        )
+                    )
+                )
+        )
+    )
+
+    .reset_index()
+)
+
+
+# ---------------------------------------------------------------------
+# 4. Only names connected to >1 PSAP identity
+# ---------------------------------------------------------------------
+
+duplicate_names = (
+    duplicate_names.loc[
+        (
+            duplicate_names["DISTINCT_NENA_IDS"] > 1
+        )
+        |
+        (
+            duplicate_names["DISTINCT_FCC_IDS"] > 1
+        )
+    ]
+
+    .sort_values(
+        [
+            "DISTINCT_NENA_IDS",
+            "DISTINCT_FCC_IDS"
+        ],
+        ascending=False
+    )
+)
+
+
+print(
+    "\nExact boundary agency names associated with >1 NENA/FCC identity:",
+    len(duplicate_names)
+)
+
+
+display(
+    duplicate_names.head(100)
+)
+
+
+
+
+
+
+
+
+
+
 
 
 
