@@ -1,0 +1,1995 @@
+# =====================================================================
+# FINAL CORRECTED NENA-BASED GEOGRAPHIC CROSSCHECK v2
+# =====================================================================
+#
+# REQUIRED OBJECTS FROM CURRENT NOTEBOOK:
+#   report      = cohort joined to original GMLC records
+#   boundaries  = Final_Join.tab GeoDataFrame
+#
+# CORRECT IDENTITY MODEL
+# ----------------------
+#
+# ROUTED:
+#   GMLC.PSAP_ID
+#       -> canonical numeric form
+#       -> Final_Join.NENA_ID canonical form
+#
+# EXPECTED:
+#   coordinate
+#       -> GeoPandas sjoin
+#       -> Final_Join.NENA_ID canonical form
+#
+# Therefore comparison is:
+#
+#       ROUTED NENA ID  vs  EXPECTED NENA ID
+#
+# FCC_ID is retained only as metadata.
+#
+# IMPORTANT:
+# Calls whose GMLC PSAP_ID does not resolve to Final_Join.NENA_ID
+# are marked UNRESOLVED_ROUTED_BOUNDARY.
+#
+# NO FCC fallback is used for distance calculation.
+#
+# =====================================================================
+
+from pathlib import Path
+import re
+import math
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+from shapely.geometry import Point
+from shapely.ops import nearest_points
+from pyproj import Geod
+
+from IPython.display import display, Markdown
+
+
+# =====================================================================
+# 0. CONFIGURATION
+# =====================================================================
+
+DATA_DIR = Path(
+    r"C:\temp\gmlc_v2"
+)
+
+OUTPUT_DIR = (
+    DATA_DIR
+    / "outputs_psap_rca_v5"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+OUTPUT_CORRECTED = (
+    OUTPUT_DIR
+    / "psap_nena_corrected_crosscheck_v2.csv"
+)
+
+OUTPUT_SUMMARY = (
+    OUTPUT_DIR
+    / "psap_nena_corrected_routed_summary_v2.csv"
+)
+
+OUTPUT_PATTERN = (
+    OUTPUT_DIR
+    / "psap_nena_corrected_pattern_summary_v2.csv"
+)
+
+
+CLOSE_BOUNDARY_KM = 5.0
+
+GEOD = Geod(
+    ellps="WGS84"
+)
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def canonical_nena_id(value):
+    """
+    Canonical numeric identity.
+
+    Examples:
+        040500006 -> 40500006
+        020200005 -> 20200005
+        20200005  -> 20200005
+    """
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = (
+        str(value)
+        .strip()
+        .strip('"')
+    )
+
+    if text.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    text = re.sub(
+        r"\.0$",
+        "",
+        text
+    )
+
+    if re.fullmatch(
+        r"\d+",
+        text
+    ):
+        return str(
+            int(text)
+        )
+
+    return text.upper()
+
+
+def clean_text(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+def numeric(value):
+
+    value = pd.to_numeric(
+        value,
+        errors="coerce"
+    )
+
+    try:
+        value = float(value)
+    except Exception:
+        return np.nan
+
+    if not math.isfinite(value):
+        return np.nan
+
+    return value
+
+
+def valid_coordinate(
+    lat,
+    lon
+):
+
+    lat = numeric(lat)
+    lon = numeric(lon)
+
+    if (
+        not np.isfinite(lat)
+        or
+        not np.isfinite(lon)
+    ):
+        return False
+
+    if not (
+        -90 <= lat <= 90
+        and
+        -180 <= lon <= 180
+    ):
+        return False
+
+    if (
+        abs(lat) < 1e-10
+        and
+        abs(lon) < 1e-10
+    ):
+        return False
+
+    return True
+
+
+def repair_geometry(g):
+
+    if (
+        g is None
+        or g.is_empty
+    ):
+        return None
+
+    try:
+
+        if not g.is_valid:
+            g = g.buffer(0)
+
+        if (
+            g is None
+            or g.is_empty
+            or not g.is_valid
+        ):
+            return None
+
+        return g
+
+    except Exception:
+        return None
+
+
+def geodesic_km(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+):
+
+    if not (
+        valid_coordinate(lat1, lon1)
+        and
+        valid_coordinate(lat2, lon2)
+    ):
+        return np.nan
+
+    _, _, meters = GEOD.inv(
+
+        float(lon1),
+        float(lat1),
+
+        float(lon2),
+        float(lat2)
+    )
+
+    return (
+        abs(float(meters))
+        / 1000.0
+    )
+
+
+# =====================================================================
+# 2. PREPARE FINAL_JOIN USING NENA_ID AS THE IDENTITY
+# =====================================================================
+
+b = boundaries.copy()
+
+
+required_boundary_cols = [
+    "NENA_ID",
+    "FCC_ID",
+    "AGENCY",
+]
+
+
+missing = [
+    c
+    for c in required_boundary_cols
+    if c not in b.columns
+]
+
+
+if missing:
+
+    raise RuntimeError(
+        "Final_Join missing required columns: "
+        + ", ".join(missing)
+    )
+
+
+if b.crs is None:
+
+    raise RuntimeError(
+        "Final_Join boundary CRS is missing."
+    )
+
+
+if b.crs.to_epsg() != 4326:
+
+    b = b.to_crs(
+        epsg=4326
+    )
+
+
+b["NENA_ID_RAW"] = (
+    b["NENA_ID"]
+    .astype("string")
+)
+
+
+b["NENA_ID_CANON"] = (
+    b["NENA_ID"]
+    .map(
+        canonical_nena_id
+    )
+)
+
+
+b["FCC_ID_META"] = (
+    b["FCC_ID"]
+    .map(
+        canonical_nena_id
+    )
+)
+
+
+b["PSAP_AGENCY"] = (
+    b["AGENCY"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+b["geometry"] = (
+    b["geometry"]
+    .apply(
+        repair_geometry
+    )
+)
+
+
+b = (
+    b.loc[
+        b["NENA_ID_CANON"].ne("")
+        &
+        b["geometry"].notna()
+    ]
+    .copy()
+)
+
+
+# ---------------------------------------------------------------------
+# Confirm canonical NENA remains one agency / FCC identity.
+# ---------------------------------------------------------------------
+
+nena_identity_check = (
+
+    b.groupby(
+        "NENA_ID_CANON"
+    )
+
+    .agg(
+
+        AGENCY_COUNT=(
+            "PSAP_AGENCY",
+            "nunique"
+        ),
+
+        FCC_COUNT=(
+            "FCC_ID_META",
+            "nunique"
+        )
+    )
+
+    .reset_index()
+)
+
+
+unsafe_ids = set(
+
+    nena_identity_check.loc[
+        (
+            nena_identity_check["AGENCY_COUNT"] > 1
+        )
+        |
+        (
+            nena_identity_check["FCC_COUNT"] > 1
+        ),
+        "NENA_ID_CANON"
+    ]
+)
+
+
+if unsafe_ids:
+
+    raise RuntimeError(
+        f"{len(unsafe_ids)} canonical NENA IDs became ambiguous."
+    )
+
+
+# ---------------------------------------------------------------------
+# Dissolve polygon pieces by NENA_ID — NOT FCC_ID.
+# ---------------------------------------------------------------------
+
+psap_nena = (
+
+    b[
+        [
+            "NENA_ID_CANON",
+            "NENA_ID_RAW",
+            "FCC_ID_META",
+            "PSAP_AGENCY",
+            "geometry"
+        ]
+    ]
+
+    .dissolve(
+        by="NENA_ID_CANON",
+        as_index=False,
+        aggfunc={
+            "NENA_ID_RAW":
+                "first",
+
+            "FCC_ID_META":
+                "first",
+
+            "PSAP_AGENCY":
+                "first",
+        }
+    )
+)
+
+
+psap_nena["geometry"] = (
+    psap_nena["geometry"]
+    .apply(
+        repair_geometry
+    )
+)
+
+
+psap_nena = (
+    psap_nena.loc[
+        psap_nena["geometry"].notna()
+    ]
+    .copy()
+)
+
+
+print(
+    "Canonical NENA boundaries:",
+    f"{len(psap_nena):,}"
+)
+
+
+boundary_by_nena = {
+
+    row.NENA_ID_CANON:
+        row.geometry
+
+    for row
+    in psap_nena.itertuples(
+        index=False
+    )
+}
+
+
+agency_by_nena = {
+
+    row.NENA_ID_CANON:
+        row.PSAP_AGENCY
+
+    for row
+    in psap_nena.itertuples(
+        index=False
+    )
+}
+
+
+fcc_by_nena = {
+
+    row.NENA_ID_CANON:
+        row.FCC_ID_META
+
+    for row
+    in psap_nena.itertuples(
+        index=False
+    )
+}
+
+
+# =====================================================================
+# 3. PREPARE ORIGINAL GMLC RECORDS
+# =====================================================================
+
+result = report.copy()
+
+
+if "PSAP_ID" not in result.columns:
+
+    raise RuntimeError(
+        "Original GMLC PSAP_ID is required."
+    )
+
+
+# ---------------------------------------------------------------------
+# Routed canonical NENA identity
+# ---------------------------------------------------------------------
+
+result[
+    "ROUTED_GMLC_PSAP_ID"
+] = (
+    result["PSAP_ID"]
+    .map(
+        canonical_nena_id
+    )
+)
+
+
+available_nena_ids = set(
+    boundary_by_nena
+)
+
+
+result[
+    "ROUTED_NENA_ID"
+] = (
+    result[
+        "ROUTED_GMLC_PSAP_ID"
+    ]
+    .where(
+        result[
+            "ROUTED_GMLC_PSAP_ID"
+        ]
+        .isin(
+            available_nena_ids
+        ),
+        ""
+    )
+)
+
+
+result[
+    "ROUTED_BOUNDARY_STATUS"
+] = np.where(
+
+    result[
+        "ROUTED_NENA_ID"
+    ].ne(""),
+
+    "RESOLVED_EXACT_PSAP_ID_TO_NENA",
+
+    "UNRESOLVED_ROUTED_BOUNDARY"
+)
+
+
+result[
+    "ROUTED_BOUNDARY_PSAP_NAME"
+] = (
+    result[
+        "ROUTED_NENA_ID"
+    ]
+    .map(
+        agency_by_nena
+    )
+    .fillna("")
+)
+
+
+result[
+    "ROUTED_BOUNDARY_FCC_ID"
+] = (
+    result[
+        "ROUTED_NENA_ID"
+    ]
+    .map(
+        fcc_by_nena
+    )
+    .fillna("")
+)
+
+
+# Keep original GMLC routed name separately.
+if "ROUTE_PSAP_NAME" in result.columns:
+
+    result[
+        "GMLC_ROUTED_PSAP_NAME"
+    ] = (
+        result[
+            "ROUTE_PSAP_NAME"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+else:
+
+    result[
+        "GMLC_ROUTED_PSAP_NAME"
+    ] = ""
+
+
+if "PSAP_NAME" in result.columns:
+
+    fallback = (
+        result[
+            "GMLC_ROUTED_PSAP_NAME"
+        ].eq("")
+    )
+
+    result.loc[
+        fallback,
+        "GMLC_ROUTED_PSAP_NAME"
+    ] = (
+        result.loc[
+            fallback,
+            "PSAP_NAME"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+
+# =====================================================================
+# 4. COORDINATE ALIASES
+# =====================================================================
+
+coordinate_sources = {
+
+    "CALLER": (
+        "LATITUDE",
+        "LONGITUDE"
+    ),
+
+    "CELL": (
+        "CELL_LATITUDE",
+        "CELL_LONGITUDE"
+    ),
+
+    "ESPOSREQ": (
+        "ESPOSREQ_LOC_LATITUDE",
+        "ESPOSREQ_LOC_LONGITUDE"
+    ),
+}
+
+
+for prefix, (
+    lat_source,
+    lon_source
+) in coordinate_sources.items():
+
+    lat_col = (
+        f"{prefix}_LATITUDE"
+    )
+
+    lon_col = (
+        f"{prefix}_LONGITUDE"
+    )
+
+
+    if lat_source in result.columns:
+
+        result[
+            lat_col
+        ] = pd.to_numeric(
+            result[
+                lat_source
+            ],
+            errors="coerce"
+        )
+
+    else:
+
+        result[
+            lat_col
+        ] = np.nan
+
+
+    if lon_source in result.columns:
+
+        result[
+            lon_col
+        ] = pd.to_numeric(
+            result[
+                lon_source
+            ],
+            errors="coerce"
+        )
+
+    else:
+
+        result[
+            lon_col
+        ] = np.nan
+
+
+# =====================================================================
+# 5. EXPECTED PSAP = GEOPANDAS SJOIN TO NENA BOUNDARIES
+# =====================================================================
+
+result[
+    "_ROW_ID_NENA"
+] = np.arange(
+    len(result),
+    dtype=np.int64
+)
+
+
+def assign_expected_nena(
+    frame,
+    prefix
+):
+
+    lat_col = (
+        f"{prefix}_LATITUDE"
+    )
+
+    lon_col = (
+        f"{prefix}_LONGITUDE"
+    )
+
+
+    valid = [
+
+        valid_coordinate(
+            lat,
+            lon
+        )
+
+        for lat, lon
+        in zip(
+            frame[
+                lat_col
+            ],
+            frame[
+                lon_col
+            ]
+        )
+    ]
+
+
+    point_data = (
+        frame.loc[
+            valid,
+            [
+                "_ROW_ID_NENA",
+                lat_col,
+                lon_col
+            ]
+        ]
+        .copy()
+    )
+
+
+    points = gpd.GeoDataFrame(
+
+        point_data,
+
+        geometry=gpd.points_from_xy(
+
+            point_data[
+                lon_col
+            ],
+
+            point_data[
+                lat_col
+            ]
+        ),
+
+        crs="EPSG:4326"
+    )
+
+
+    joined = gpd.sjoin(
+
+        points,
+
+        psap_nena[
+            [
+                "NENA_ID_CANON",
+                "NENA_ID_RAW",
+                "FCC_ID_META",
+                "PSAP_AGENCY",
+                "geometry"
+            ]
+        ],
+
+        how="left",
+
+        predicate="intersects"
+    )
+
+
+    lookup = {}
+
+
+    for row_id, group in joined.groupby(
+        "_ROW_ID_NENA",
+        sort=False
+    ):
+
+        ids = sorted(
+            {
+                canonical_nena_id(x)
+
+                for x
+                in group[
+                    "NENA_ID_CANON"
+                ]
+
+                if canonical_nena_id(x)
+            }
+        )
+
+
+        if len(ids) == 1:
+
+            nena = ids[0]
+
+            lookup[
+                int(row_id)
+            ] = {
+
+                "ID":
+                    nena,
+
+                "NAME":
+                    agency_by_nena.get(
+                        nena,
+                        ""
+                    ),
+
+                "FCC":
+                    fcc_by_nena.get(
+                        nena,
+                        ""
+                    ),
+
+                "STATUS":
+                    "UNIQUE_NENA_PSAP",
+            }
+
+
+        elif len(ids) == 0:
+
+            lookup[
+                int(row_id)
+            ] = {
+
+                "ID":
+                    "",
+
+                "NAME":
+                    "",
+
+                "FCC":
+                    "",
+
+                "STATUS":
+                    "NO_CONTAINING_PSAP",
+            }
+
+
+        else:
+
+            lookup[
+                int(row_id)
+            ] = {
+
+                "ID":
+                    "|".join(
+                        ids
+                    ),
+
+                "NAME":
+                    "",
+
+                "FCC":
+                    "",
+
+                "STATUS":
+                    "MULTIPLE_CONTAINING_PSAP",
+            }
+
+
+    frame[
+        f"{prefix}_EXPECTED_NENA_ID"
+    ] = ""
+
+
+    frame[
+        f"{prefix}_EXPECTED_PSAP_NAME"
+    ] = ""
+
+
+    frame[
+        f"{prefix}_EXPECTED_FCC_ID"
+    ] = ""
+
+
+    frame[
+        f"{prefix}_EXPECTED_GEOMETRY_STATUS"
+    ] = (
+        "INVALID_OR_MISSING_COORDINATE"
+    )
+
+
+    for idx in frame.index:
+
+        row_id = int(
+            frame.at[
+                idx,
+                "_ROW_ID_NENA"
+            ]
+        )
+
+
+        item = lookup.get(
+            row_id
+        )
+
+
+        if item is None:
+            continue
+
+
+        frame.at[
+            idx,
+            f"{prefix}_EXPECTED_NENA_ID"
+        ] = item[
+            "ID"
+        ]
+
+
+        frame.at[
+            idx,
+            f"{prefix}_EXPECTED_PSAP_NAME"
+        ] = item[
+            "NAME"
+        ]
+
+
+        frame.at[
+            idx,
+            f"{prefix}_EXPECTED_FCC_ID"
+        ] = item[
+            "FCC"
+        ]
+
+
+        frame.at[
+            idx,
+            f"{prefix}_EXPECTED_GEOMETRY_STATUS"
+        ] = item[
+            "STATUS"
+        ]
+
+
+    return frame
+
+
+for prefix in [
+    "CALLER",
+    "CELL",
+    "ESPOSREQ"
+]:
+
+    result = assign_expected_nena(
+        result,
+        prefix
+    )
+
+
+# =====================================================================
+# 6. ROUTED / EXPECTED DISTANCES
+# =====================================================================
+
+def calculate_nena_distances(
+    frame,
+    prefix
+):
+
+    lat_col = (
+        f"{prefix}_LATITUDE"
+    )
+
+    lon_col = (
+        f"{prefix}_LONGITUDE"
+    )
+
+    expected_col = (
+        f"{prefix}_EXPECTED_NENA_ID"
+    )
+
+
+    routed_distances = []
+    signed_routed_distances = []
+    routed_relations = []
+
+    expected_distances = []
+
+    expected_vs_routed = []
+
+
+    for _, row in frame.iterrows():
+
+        lat = numeric(
+            row[
+                lat_col
+            ]
+        )
+
+        lon = numeric(
+            row[
+                lon_col
+            ]
+        )
+
+
+        if not valid_coordinate(
+            lat,
+            lon
+        ):
+
+            routed_distances.append(
+                np.nan
+            )
+
+            signed_routed_distances.append(
+                np.nan
+            )
+
+            routed_relations.append(
+                "INVALID_OR_MISSING_COORDINATE"
+            )
+
+            expected_distances.append(
+                np.nan
+            )
+
+            expected_vs_routed.append(
+                "INVALID_COORDINATE"
+            )
+
+            continue
+
+
+        point = Point(
+            lon,
+            lat
+        )
+
+
+        routed_nena = clean_text(
+            row[
+                "ROUTED_NENA_ID"
+            ]
+        )
+
+
+        expected_nena = clean_text(
+            row[
+                expected_col
+            ]
+        )
+
+
+        # =========================================================
+        # ROUTED DISTANCE
+        # =========================================================
+
+        if not routed_nena:
+
+            routed_km = np.nan
+
+            signed_km = np.nan
+
+            relation = (
+                "UNRESOLVED_ROUTED_BOUNDARY"
+            )
+
+
+        else:
+
+            routed_geom = (
+                boundary_by_nena.get(
+                    routed_nena
+                )
+            )
+
+
+            if routed_geom is None:
+
+                routed_km = np.nan
+
+                signed_km = np.nan
+
+                relation = (
+                    "UNRESOLVED_ROUTED_BOUNDARY"
+                )
+
+
+            else:
+
+                try:
+
+                    _, nearest = nearest_points(
+
+                        point,
+
+                        routed_geom.boundary
+                    )
+
+
+                    routed_km = geodesic_km(
+
+                        lat,
+                        lon,
+
+                        nearest.y,
+                        nearest.x
+                    )
+
+
+                    if (
+                        routed_geom
+                        .boundary
+                        .intersects(
+                            point
+                        )
+                    ):
+
+                        relation = (
+                            "BOUNDARY"
+                        )
+
+                        signed_km = 0.0
+
+
+                    elif routed_geom.covers(
+                        point
+                    ):
+
+                        relation = (
+                            "INSIDE"
+                        )
+
+                        signed_km = (
+                            -routed_km
+                        )
+
+
+                    else:
+
+                        relation = (
+                            "OUTSIDE"
+                        )
+
+                        signed_km = (
+                            routed_km
+                        )
+
+
+                except Exception:
+
+                    routed_km = np.nan
+
+                    signed_km = np.nan
+
+                    relation = (
+                        "ROUTED_DISTANCE_ERROR"
+                    )
+
+
+        routed_distances.append(
+            routed_km
+        )
+
+        signed_routed_distances.append(
+            signed_km
+        )
+
+        routed_relations.append(
+            relation
+        )
+
+
+        # =========================================================
+        # EXPECTED DISTANCE
+        # =========================================================
+
+        if (
+            expected_nena
+            and
+            "|" not in expected_nena
+        ):
+
+            expected_geom = (
+                boundary_by_nena.get(
+                    expected_nena
+                )
+            )
+
+        else:
+
+            expected_geom = None
+
+
+        if expected_geom is None:
+
+            expected_km = np.nan
+
+
+        else:
+
+            try:
+
+                _, nearest = nearest_points(
+
+                    point,
+
+                    expected_geom.boundary
+                )
+
+
+                expected_km = geodesic_km(
+
+                    lat,
+                    lon,
+
+                    nearest.y,
+                    nearest.x
+                )
+
+
+            except Exception:
+
+                expected_km = np.nan
+
+
+        expected_distances.append(
+            expected_km
+        )
+
+
+        # =========================================================
+        # SAME / CLOSE / DIFFERENT / UNRESOLVED
+        # =========================================================
+
+        if not routed_nena:
+
+            comparison = (
+                "UNRESOLVED_ROUTED_BOUNDARY"
+            )
+
+
+        elif not expected_nena:
+
+            comparison = (
+                "UNRESOLVED_EXPECTED_PSAP"
+            )
+
+
+        elif "|" in expected_nena:
+
+            comparison = (
+                "AMBIGUOUS_EXPECTED_PSAP"
+            )
+
+
+        elif (
+            expected_nena
+            ==
+            routed_nena
+        ):
+
+            comparison = (
+                "SAME"
+            )
+
+
+        elif (
+            np.isfinite(
+                routed_km
+            )
+            and
+            routed_km
+            <= CLOSE_BOUNDARY_KM
+        ):
+
+            comparison = (
+                "CLOSE"
+            )
+
+
+        else:
+
+            comparison = (
+                "DIFFERENT"
+            )
+
+
+        expected_vs_routed.append(
+            comparison
+        )
+
+
+    frame[
+        f"{prefix}_TO_ROUTED_BOUNDARY_KM"
+    ] = routed_distances
+
+
+    frame[
+        f"{prefix}_SIGNED_TO_ROUTED_BOUNDARY_KM"
+    ] = signed_routed_distances
+
+
+    frame[
+        f"{prefix}_RELATION_TO_ROUTED_PSAP"
+    ] = routed_relations
+
+
+    frame[
+        f"{prefix}_TO_EXPECTED_BOUNDARY_KM"
+    ] = expected_distances
+
+
+    frame[
+        f"{prefix}_EXPECTED_VS_ROUTED"
+    ] = expected_vs_routed
+
+
+    return frame
+
+
+for prefix in [
+    "CALLER",
+    "CELL",
+    "ESPOSREQ"
+]:
+
+    result = calculate_nena_distances(
+        result,
+        prefix
+    )
+
+
+# =====================================================================
+# 7. CALLER <-> CELL DISTANCE
+# =====================================================================
+
+result[
+    "CALLER_TO_CELL_KM"
+] = [
+
+    geodesic_km(
+
+        caller_lat,
+        caller_lon,
+
+        cell_lat,
+        cell_lon
+    )
+
+    for (
+        caller_lat,
+        caller_lon,
+        cell_lat,
+        cell_lon
+    )
+    in zip(
+
+        result[
+            "CALLER_LATITUDE"
+        ],
+
+        result[
+            "CALLER_LONGITUDE"
+        ],
+
+        result[
+            "CELL_LATITUDE"
+        ],
+
+        result[
+            "CELL_LONGITUDE"
+        ]
+    )
+]
+
+
+# =====================================================================
+# 8. ROUTED PSAP GROUP MIN / MEAN / MAX
+# =====================================================================
+
+resolved_group = (
+    result[
+        "ROUTED_NENA_ID"
+    ]
+    .replace(
+        "",
+        pd.NA
+    )
+)
+
+
+result[
+    "ROUTED_PSAP_CALLS"
+] = (
+
+    result
+
+    .groupby(
+        resolved_group
+    )[
+        "ROUTED_NENA_ID"
+    ]
+
+    .transform(
+        "size"
+    )
+)
+
+
+for prefix in [
+    "CALLER",
+    "CELL",
+    "ESPOSREQ"
+]:
+
+    distance_col = (
+        f"{prefix}_TO_ROUTED_BOUNDARY_KM"
+    )
+
+
+    grouped = (
+        result
+
+        .groupby(
+            resolved_group
+        )[
+            distance_col
+        ]
+    )
+
+
+    result[
+        f"{prefix}_ROUTED_MIN_KM"
+    ] = grouped.transform(
+        "min"
+    )
+
+
+    result[
+        f"{prefix}_ROUTED_MEAN_KM"
+    ] = grouped.transform(
+        "mean"
+    )
+
+
+    result[
+        f"{prefix}_ROUTED_MAX_KM"
+    ] = grouped.transform(
+        "max"
+    )
+
+
+# =====================================================================
+# 9. NUMERIC NORMALIZATION
+# =====================================================================
+
+numeric_columns = [
+
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+
+    "CELL_LATITUDE",
+    "CELL_LONGITUDE",
+
+    "ESPOSREQ_LATITUDE",
+    "ESPOSREQ_LONGITUDE",
+
+    "CALLER_TO_ROUTED_BOUNDARY_KM",
+    "CALLER_SIGNED_TO_ROUTED_BOUNDARY_KM",
+    "CALLER_TO_EXPECTED_BOUNDARY_KM",
+
+    "CELL_TO_ROUTED_BOUNDARY_KM",
+    "CELL_SIGNED_TO_ROUTED_BOUNDARY_KM",
+    "CELL_TO_EXPECTED_BOUNDARY_KM",
+
+    "ESPOSREQ_TO_ROUTED_BOUNDARY_KM",
+    "ESPOSREQ_SIGNED_TO_ROUTED_BOUNDARY_KM",
+    "ESPOSREQ_TO_EXPECTED_BOUNDARY_KM",
+
+    "CALLER_TO_CELL_KM",
+
+    "CALLER_ROUTED_MIN_KM",
+    "CALLER_ROUTED_MEAN_KM",
+    "CALLER_ROUTED_MAX_KM",
+
+    "CELL_ROUTED_MIN_KM",
+    "CELL_ROUTED_MEAN_KM",
+    "CELL_ROUTED_MAX_KM",
+
+    "ESPOSREQ_ROUTED_MIN_KM",
+    "ESPOSREQ_ROUTED_MEAN_KM",
+    "ESPOSREQ_ROUTED_MAX_KM",
+
+    "CALL_DURATION_SEC",
+
+    "UNCERT_METERS",
+
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+]
+
+
+for column in numeric_columns:
+
+    if column in result.columns:
+
+        result[
+            column
+        ] = pd.to_numeric(
+            result[
+                column
+            ],
+            errors="coerce"
+        )
+
+
+# =====================================================================
+# 10. SUMMARY
+# =====================================================================
+
+resolution_summary = (
+
+    result[
+        "ROUTED_BOUNDARY_STATUS"
+    ]
+
+    .value_counts(
+        dropna=False
+    )
+
+    .rename_axis(
+        "ROUTED_BOUNDARY_STATUS"
+    )
+
+    .reset_index(
+        name="CALLS"
+    )
+)
+
+
+resolution_summary[
+    "PCT"
+] = (
+
+    100.0
+
+    * resolution_summary[
+        "CALLS"
+    ]
+
+    / max(
+        len(result),
+        1
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "ROUTED NENA RESOLUTION"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    resolution_summary
+)
+
+
+# ---------------------------------------------------------------------
+# Caller comparison summary
+# ---------------------------------------------------------------------
+
+caller_comparison_summary = (
+
+    result[
+        "CALLER_EXPECTED_VS_ROUTED"
+    ]
+
+    .value_counts(
+        dropna=False
+    )
+
+    .rename_axis(
+        "CALLER_EXPECTED_VS_ROUTED"
+    )
+
+    .reset_index(
+        name="CALLS"
+    )
+)
+
+
+caller_comparison_summary[
+    "PCT"
+] = (
+
+    100.0
+
+    * caller_comparison_summary[
+        "CALLS"
+    ]
+
+    / max(
+        len(result),
+        1
+    )
+)
+
+
+display(
+    Markdown(
+        "### Caller expected vs routed — corrected NENA identity"
+    )
+)
+
+
+display(
+    caller_comparison_summary
+)
+
+
+# =====================================================================
+# 11. ROUTED PSAP SUMMARY
+# =====================================================================
+
+summary = (
+
+    result.loc[
+        result[
+            "ROUTED_NENA_ID"
+        ].ne("")
+    ]
+
+    .groupby(
+        [
+            "ROUTED_NENA_ID",
+            "ROUTED_BOUNDARY_PSAP_NAME"
+        ],
+        dropna=False
+    )
+
+    .agg(
+
+        CALLS=(
+            "ROUTED_NENA_ID",
+            "size"
+        ),
+
+        CALLER_MIN_KM=(
+            "CALLER_TO_ROUTED_BOUNDARY_KM",
+            "min"
+        ),
+
+        CALLER_MEAN_KM=(
+            "CALLER_TO_ROUTED_BOUNDARY_KM",
+            "mean"
+        ),
+
+        CALLER_MAX_KM=(
+            "CALLER_TO_ROUTED_BOUNDARY_KM",
+            "max"
+        ),
+
+        CELL_MIN_KM=(
+            "CELL_TO_ROUTED_BOUNDARY_KM",
+            "min"
+        ),
+
+        CELL_MEAN_KM=(
+            "CELL_TO_ROUTED_BOUNDARY_KM",
+            "mean"
+        ),
+
+        CELL_MAX_KM=(
+            "CELL_TO_ROUTED_BOUNDARY_KM",
+            "max"
+        )
+    )
+
+    .reset_index()
+)
+
+
+# =====================================================================
+# 12. COLUMN ORDER
+# =====================================================================
+
+front = [
+
+    "FILTER_UNIQ911_CID",
+
+    "GMLC_ROW_ID",
+    "RAW_GMLC_ROW_ID",
+
+    "MARKET",
+    "STATE",
+    "COUNTY",
+
+
+    # -------------------------------------------------------------
+    # ROUTED
+    # -------------------------------------------------------------
+
+    "PSAP_ID",
+
+    "GMLC_ROUTED_PSAP_NAME",
+
+    "ROUTED_NENA_ID",
+
+    "ROUTED_BOUNDARY_PSAP_NAME",
+
+    "ROUTED_BOUNDARY_FCC_ID",
+
+    "ROUTED_BOUNDARY_STATUS",
+
+
+    # -------------------------------------------------------------
+    # CALLER
+    # -------------------------------------------------------------
+
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+
+    "CALLER_EXPECTED_NENA_ID",
+
+    "CALLER_EXPECTED_PSAP_NAME",
+
+    "CALLER_EXPECTED_FCC_ID",
+
+    "CALLER_EXPECTED_GEOMETRY_STATUS",
+
+    "CALLER_EXPECTED_VS_ROUTED",
+
+    "CALLER_RELATION_TO_ROUTED_PSAP",
+
+    "CALLER_TO_ROUTED_BOUNDARY_KM",
+
+    "CALLER_SIGNED_TO_ROUTED_BOUNDARY_KM",
+
+    "CALLER_TO_EXPECTED_BOUNDARY_KM",
+
+    "CALLER_ROUTED_MIN_KM",
+    "CALLER_ROUTED_MEAN_KM",
+    "CALLER_ROUTED_MAX_KM",
+
+
+    # -------------------------------------------------------------
+    # CELL
+    # -------------------------------------------------------------
+
+    "CELL_LATITUDE",
+    "CELL_LONGITUDE",
+
+    "CELL_EXPECTED_NENA_ID",
+
+    "CELL_EXPECTED_PSAP_NAME",
+
+    "CELL_EXPECTED_FCC_ID",
+
+    "CELL_EXPECTED_VS_ROUTED",
+
+    "CELL_RELATION_TO_ROUTED_PSAP",
+
+    "CELL_TO_ROUTED_BOUNDARY_KM",
+
+    "CELL_TO_EXPECTED_BOUNDARY_KM",
+
+    "CELL_ROUTED_MIN_KM",
+    "CELL_ROUTED_MEAN_KM",
+    "CELL_ROUTED_MAX_KM",
+
+
+    # -------------------------------------------------------------
+    # BETWEEN LOCATION SOURCES
+    # -------------------------------------------------------------
+
+    "CALLER_TO_CELL_KM",
+
+
+    # -------------------------------------------------------------
+    # CALL CONTEXT
+    # -------------------------------------------------------------
+
+    "CALL_DURATION_SEC",
+
+    "UNCERT_METERS",
+
+    "ROUTE_STATUS_GMLC",
+
+    "ROUTE_FALLBACK",
+
+    "DEFAULT_ROUTED_CALL",
+
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+]
+
+
+front = [
+    c
+    for c in front
+    if c in result.columns
+]
+
+
+front = list(
+    dict.fromkeys(
+        front
+    )
+)
+
+
+remaining = [
+    c
+    for c in result.columns
+    if c not in front
+]
+
+
+result_out = (
+    result[
+        front
+        + remaining
+    ]
+    .copy()
+)
+
+
+# =====================================================================
+# 13. SAVE
+# =====================================================================
+
+result_out.to_csv(
+
+    OUTPUT_CORRECTED,
+
+    index=False,
+
+    float_format="%.6f"
+)
+
+
+summary.to_csv(
+
+    OUTPUT_SUMMARY,
+
+    index=False,
+
+    float_format="%.6f"
+)
+
+
+caller_comparison_summary.to_csv(
+
+    OUTPUT_PATTERN,
+
+    index=False,
+
+    float_format="%.6f"
+)
+
+
+print(
+    "\nSaved corrected crosscheck:"
+)
+
+print(
+    OUTPUT_CORRECTED
+)
+
+
+print(
+    "\nSaved corrected PSAP summary:"
+)
+
+print(
+    OUTPUT_SUMMARY
+)
+
+
+# =====================================================================
+# 14. IMPORTANT QA
+# =====================================================================
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "DISTANCE QA"
+)
+
+print(
+    "============================================================"
+)
+
+
+resolved_rows = (
+    result_out.loc[
+        result_out[
+            "ROUTED_BOUNDARY_STATUS"
+        ]
+        .eq(
+            "RESOLVED_EXACT_PSAP_ID_TO_NENA"
+        )
+    ]
+)
+
+
+print(
+    "Resolved calls:",
+    f"{len(resolved_rows):,}"
+)
+
+
+print(
+    "Unresolved calls:",
+    f"{(
+        result_out['ROUTED_BOUNDARY_STATUS']
+        == 'UNRESOLVED_ROUTED_BOUNDARY'
+    ).sum():,}"
+)
+
+
+print(
+    "\nCaller -> Routed km:"
+)
+
+
+display(
+    resolved_rows[
+        [
+            c
+            for c in [
+
+                "FILTER_UNIQ911_CID",
+
+                "STATE",
+                "COUNTY",
+
+                "PSAP_ID",
+
+                "GMLC_ROUTED_PSAP_NAME",
+
+                "ROUTED_NENA_ID",
+
+                "ROUTED_BOUNDARY_PSAP_NAME",
+
+                "CALLER_EXPECTED_NENA_ID",
+
+                "CALLER_EXPECTED_PSAP_NAME",
+
+                "CALLER_EXPECTED_VS_ROUTED",
+
+                "CALLER_TO_ROUTED_BOUNDARY_KM",
+
+                "CALLER_TO_EXPECTED_BOUNDARY_KM",
+
+                "CELL_TO_ROUTED_BOUNDARY_KM",
+
+                "CALLER_TO_CELL_KM",
+            ]
+
+            if c in resolved_rows.columns
+        ]
+    ]
+
+    .sort_values(
+        "CALLER_TO_ROUTED_BOUNDARY_KM",
+        ascending=False
+    )
+
+    .head(
+        100
+    )
+)
