@@ -1,6 +1,43 @@
 
 
 
+layers = [
+    routed_layer,
+    expected_layer,
+
+    uncertainty_layer,
+
+    caller_routed_line_layer,
+    caller_expected_line_layer,
+    cell_routed_line_layer,
+
+    caller_cell_line_layer,
+
+    caller_layer,
+    cell_layer,
+
+    min_layer,
+    mean_layer,
+    max_layer,
+]
+
+# Add ESPOSREQ only when explicitly enabled.
+if SHOW_ESPOSREQ_ROUTED_LINE:
+    layers.append(
+        esposreq_routed_line_layer
+    )
+
+if SHOW_ESPOSREQ:
+    layers.append(
+        esposreq_layer
+    )
+
+for layer in layers:
+    layer.add_to(
+        psap_map
+    )
+
+
 
 # =====================================================================
 # THREE-LOCATION PSAP / COORDINATE RECONCILIATION REPORT
