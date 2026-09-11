@@ -1,0 +1,791 @@
+
+
+
+
+
+
+# =====================================================================
+# TIER 3 ROUTED-BOUNDARY RESOLUTION:
+# GLOBAL ROUTED NAME -> UNIQUE FINAL_JOIN AGENCY/NENA_ID
+# =====================================================================
+#
+# Run AFTER the previous routed-boundary resolution cell.
+#
+# Existing resolution:
+#
+#   1. EXACT_PSAP_ID_TO_NENA_ID
+#   2. FCC_ID_PLUS_ROUTED_NAME
+#
+# New safe tiers:
+#
+#   3. GLOBAL_EXACT_ROUTED_NAME
+#   4. GLOBAL_TOKEN_NAME
+#   5. GLOBAL_TOKEN_NAME_NO_TRAILING_CODE
+#
+# IMPORTANT:
+# A name-based resolution is accepted ONLY when that normalized name
+# maps to exactly ONE NENA_ID in Final_Join.
+#
+# No fuzzy threshold is used in this cell.
+#
+# =====================================================================
+
+import re
+import pandas as pd
+import numpy as np
+
+
+# =====================================================================
+# 1. NAME NORMALIZATION
+# =====================================================================
+
+def routed_name_norm(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = str(value).upper().strip()
+
+    # Normalize 9-1-1 / 9 1 1 / 911
+    text = re.sub(
+        r"\b9[\s\-]*1[\s\-]*1\b",
+        "911",
+        text
+    )
+
+    text = text.replace(
+        "&",
+        " AND "
+    )
+
+    # Remove punctuation
+    text = re.sub(
+        r"[^A-Z0-9]+",
+        " ",
+        text
+    )
+
+    # Collapse spaces
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+def token_signature(value):
+
+    normalized = routed_name_norm(
+        value
+    )
+
+    if not normalized:
+        return ""
+
+    tokens = normalized.split()
+
+    # Sorting handles:
+    #
+    # WASHINGTON DC 911 PSAP
+    # vs
+    # 911 WASHINGTON DC PSAP
+    #
+    return " ".join(
+        sorted(
+            tokens
+        )
+    )
+
+
+def token_signature_no_trailing_code(value):
+
+    normalized = routed_name_norm(
+        value
+    )
+
+    if not normalized:
+        return ""
+
+    tokens = normalized.split()
+
+    # Remove only a final long numeric facility/site code.
+    #
+    # Example:
+    #   ALASKA STATE TROOPERS KETCHIKAN GATEWAY 9775
+    #
+    # becomes:
+    #   ALASKA STATE TROOPERS KETCHIKAN GATEWAY
+    #
+    # This is safe only because we later require the resulting
+    # boundary key to identify exactly ONE NENA_ID.
+    if (
+        tokens
+        and
+        tokens[-1].isdigit()
+        and
+        len(tokens[-1]) >= 3
+    ):
+        tokens = tokens[:-1]
+
+    return " ".join(
+        sorted(
+            tokens
+        )
+    )
+
+
+# =====================================================================
+# 2. PREPARE FINAL_JOIN AGENCY IDENTITIES
+# =====================================================================
+
+agency_ref = boundary_identity.copy()
+
+
+agency_ref[
+    "AGENCY_EXACT_NORM"
+] = (
+    agency_ref[
+        "AGENCY_CLEAN"
+    ]
+    .map(
+        routed_name_norm
+    )
+)
+
+
+agency_ref[
+    "AGENCY_TOKEN_KEY"
+] = (
+    agency_ref[
+        "AGENCY_CLEAN"
+    ]
+    .map(
+        token_signature
+    )
+)
+
+
+agency_ref[
+    "AGENCY_TOKEN_NO_CODE_KEY"
+] = (
+    agency_ref[
+        "AGENCY_CLEAN"
+    ]
+    .map(
+        token_signature_no_trailing_code
+    )
+)
+
+
+# =====================================================================
+# 3. CREATE ONLY UNIQUE NAME -> NENA LOOKUPS
+# =====================================================================
+
+def build_unique_lookup(
+    frame,
+    key_column
+):
+
+    valid = (
+        frame.loc[
+            frame[
+                key_column
+            ].ne("")
+        ]
+        .copy()
+    )
+
+
+    profile = (
+        valid
+        .groupby(
+            key_column
+        )
+        .agg(
+
+            NENA_COUNT=(
+                "NENA_ID_NORM",
+                "nunique"
+            ),
+
+            NENA_ID=(
+                "NENA_ID_NORM",
+                "first"
+            ),
+
+            FCC_ID=(
+                "FCC_ID_NORM",
+                "first"
+            ),
+
+            AGENCY=(
+                "AGENCY_CLEAN",
+                "first"
+            ),
+        )
+        .reset_index()
+    )
+
+
+    # Critical safety condition:
+    # accept only names identifying ONE NENA boundary.
+    unique_profile = (
+        profile.loc[
+            profile[
+                "NENA_COUNT"
+            ].eq(1)
+        ]
+        .copy()
+    )
+
+
+    return {
+        row[
+            key_column
+        ]: {
+            "NENA_ID":
+                row[
+                    "NENA_ID"
+                ],
+
+            "FCC_ID":
+                row[
+                    "FCC_ID"
+                ],
+
+            "AGENCY":
+                row[
+                    "AGENCY"
+                ],
+        }
+
+        for _, row
+        in unique_profile.iterrows()
+    }
+
+
+exact_name_lookup = build_unique_lookup(
+    agency_ref,
+    "AGENCY_EXACT_NORM"
+)
+
+
+token_name_lookup = build_unique_lookup(
+    agency_ref,
+    "AGENCY_TOKEN_KEY"
+)
+
+
+token_no_code_lookup = build_unique_lookup(
+    agency_ref,
+    "AGENCY_TOKEN_NO_CODE_KEY"
+)
+
+
+print(
+    "Unique exact agency names:",
+    f"{len(exact_name_lookup):,}"
+)
+
+print(
+    "Unique token signatures:",
+    f"{len(token_name_lookup):,}"
+)
+
+print(
+    "Unique token signatures without trailing code:",
+    f"{len(token_no_code_lookup):,}"
+)
+
+
+# =====================================================================
+# 4. START WITH EXISTING ROUTE_TEST RESULTS
+# =====================================================================
+
+resolved_v2 = (
+    route_test.copy()
+)
+
+
+resolved_v2[
+    "_ROUTE_NAME_EXACT"
+] = (
+    resolved_v2[
+        "GMLC_ROUTED_NAME"
+    ]
+    .map(
+        routed_name_norm
+    )
+)
+
+
+resolved_v2[
+    "_ROUTE_NAME_TOKEN"
+] = (
+    resolved_v2[
+        "GMLC_ROUTED_NAME"
+    ]
+    .map(
+        token_signature
+    )
+)
+
+
+resolved_v2[
+    "_ROUTE_NAME_TOKEN_NO_CODE"
+] = (
+    resolved_v2[
+        "GMLC_ROUTED_NAME"
+    ]
+    .map(
+        token_signature_no_trailing_code
+    )
+)
+
+
+# =====================================================================
+# 5. APPLY GLOBAL UNIQUE-NAME RESOLUTION
+# =====================================================================
+
+new_resolution_count = {
+    "GLOBAL_EXACT_ROUTED_NAME": 0,
+    "GLOBAL_TOKEN_NAME": 0,
+    "GLOBAL_TOKEN_NAME_NO_TRAILING_CODE": 0,
+}
+
+
+for idx in resolved_v2.index:
+
+    # Do NOT replace stronger existing resolution.
+    if (
+        str(
+            resolved_v2.at[
+                idx,
+                "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+            ]
+        )
+        !=
+        "UNRESOLVED"
+    ):
+        continue
+
+
+    result = None
+    method = None
+
+
+    # -------------------------------------------------------------
+    # TIER 3:
+    # Exact normalized routed name
+    # -------------------------------------------------------------
+
+    key = (
+        resolved_v2.at[
+            idx,
+            "_ROUTE_NAME_EXACT"
+        ]
+    )
+
+
+    if key:
+
+        result = (
+            exact_name_lookup.get(
+                key
+            )
+        )
+
+
+        if result is not None:
+
+            method = (
+                "GLOBAL_EXACT_ROUTED_NAME"
+            )
+
+
+    # -------------------------------------------------------------
+    # TIER 4:
+    # Same tokens but order-independent
+    # -------------------------------------------------------------
+
+    if result is None:
+
+        key = (
+            resolved_v2.at[
+                idx,
+                "_ROUTE_NAME_TOKEN"
+            ]
+        )
+
+
+        if key:
+
+            result = (
+                token_name_lookup.get(
+                    key
+                )
+            )
+
+
+            if result is not None:
+
+                method = (
+                    "GLOBAL_TOKEN_NAME"
+                )
+
+
+    # -------------------------------------------------------------
+    # TIER 5:
+    # Token identity after dropping a final numeric site code.
+    # -------------------------------------------------------------
+
+    if result is None:
+
+        key = (
+            resolved_v2.at[
+                idx,
+                "_ROUTE_NAME_TOKEN_NO_CODE"
+            ]
+        )
+
+
+        if key:
+
+            result = (
+                token_no_code_lookup.get(
+                    key
+                )
+            )
+
+
+            if result is not None:
+
+                method = (
+                    "GLOBAL_TOKEN_NAME_NO_TRAILING_CODE"
+                )
+
+
+    # -------------------------------------------------------------
+    # Accept only uniquely identified boundary.
+    # -------------------------------------------------------------
+
+    if result is not None:
+
+        resolved_v2.at[
+            idx,
+            "ROUTED_BOUNDARY_NENA_ID"
+        ] = (
+            result[
+                "NENA_ID"
+            ]
+        )
+
+
+        resolved_v2.at[
+            idx,
+            "ROUTED_BOUNDARY_FCC_ID"
+        ] = (
+            result[
+                "FCC_ID"
+            ]
+        )
+
+
+        resolved_v2.at[
+            idx,
+            "ROUTED_BOUNDARY_AGENCY"
+        ] = (
+            result[
+                "AGENCY"
+            ]
+        )
+
+
+        resolved_v2.at[
+            idx,
+            "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+        ] = method
+
+
+        new_resolution_count[
+            method
+        ] += 1
+
+
+# =====================================================================
+# 6. NEW COVERAGE
+# =====================================================================
+
+coverage_v2 = (
+    resolved_v2[
+        "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+    ]
+    .value_counts(
+        dropna=False
+    )
+    .rename_axis(
+        "METHOD"
+    )
+    .reset_index(
+        name="CALLS"
+    )
+)
+
+
+coverage_v2[
+    "PCT"
+] = (
+    100.0
+    * coverage_v2[
+        "CALLS"
+    ]
+    / max(
+        len(
+            resolved_v2
+        ),
+        1
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "UPDATED ROUTED-BOUNDARY RESOLUTION COVERAGE"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    coverage_v2
+)
+
+
+resolved_total = int(
+    resolved_v2[
+        "ROUTED_BOUNDARY_NENA_ID"
+    ]
+    .fillna("")
+    .ne("")
+    .sum()
+)
+
+
+print(
+    "\nResolved:",
+    f"{resolved_total:,}",
+    "/",
+    f"{len(resolved_v2):,}",
+    "=",
+    f"{100 * resolved_total / max(len(resolved_v2),1):.2f}%"
+)
+
+
+print(
+    "\nNew resolutions:"
+)
+
+for method, count in (
+    new_resolution_count.items()
+):
+
+    print(
+        f" {method:<45}",
+        f"{count:,}"
+    )
+
+
+# =====================================================================
+# 7. ALASKA CHECK
+# =====================================================================
+
+alaska_v2 = (
+    resolved_v2.loc[
+        resolved_v2[
+            "STATE"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .eq("AK")
+    ]
+)
+
+
+alaska_columns = [
+
+    "FILTER_UNIQ911_CID",
+
+    "STATE",
+    "COUNTY",
+
+    "FCC_PSAP_ID",
+    "PSAP_ID",
+
+    "GMLC_ROUTED_NAME",
+
+    "ROUTED_BOUNDARY_NENA_ID",
+
+    "ROUTED_BOUNDARY_FCC_ID",
+
+    "ROUTED_BOUNDARY_AGENCY",
+
+    "ROUTED_BOUNDARY_RESOLUTION_METHOD",
+]
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "ALASKA AFTER GLOBAL NAME RESOLUTION"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    alaska_v2[
+        [
+            c
+            for c in alaska_columns
+            if c in alaska_v2.columns
+        ]
+    ]
+    .head(150)
+)
+
+
+# =====================================================================
+# 8. KETCHIKAN SPECIFIC CHECK
+# =====================================================================
+
+ketchikan = (
+    resolved_v2.loc[
+        resolved_v2[
+            "GMLC_ROUTED_NAME"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .str.contains(
+            "KETCHIKAN",
+            regex=False
+        )
+    ]
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "KETCHIKAN"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    ketchikan[
+        [
+            c
+            for c in alaska_columns
+            if c in ketchikan.columns
+        ]
+    ]
+    .head(100)
+)
+
+
+# =====================================================================
+# 9. STILL UNRESOLVED
+# =====================================================================
+
+still_unresolved = (
+    resolved_v2.loc[
+        resolved_v2[
+            "ROUTED_BOUNDARY_RESOLUTION_METHOD"
+        ]
+        .eq(
+            "UNRESOLVED"
+        )
+    ]
+)
+
+
+unresolved_profile_v2 = (
+
+    still_unresolved
+
+    .groupby(
+        [
+            "GMLC_FCC_ID_NORM",
+            "GMLC_PSAP_ID_NORM",
+            "GMLC_ROUTED_NAME"
+        ],
+        dropna=False
+    )
+
+    .agg(
+
+        ROWS=(
+            "GMLC_ROUTED_NAME",
+            "size"
+        ),
+
+        STATES=(
+            "STATE",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        {
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        }
+                    )
+                )
+        )
+    )
+
+    .reset_index()
+
+    .sort_values(
+        "ROWS",
+        ascending=False
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "STILL UNRESOLVED"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    unresolved_profile_v2.head(100)
+)
+
+
