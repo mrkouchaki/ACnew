@@ -1,0 +1,3483 @@
+# =====================================================================
+# INDEPENDENT GEOPANDAS PSAP COORDINATE CROSSCHECK v1.1
+# =====================================================================
+#
+# IMPORTANT
+# ---------
+# Does NOT use:
+#   psap_three_location_coordinate_crosscheck_v5.csv
+#
+# INPUTS:
+#   1. psap_routing_definite_misroutes_filtered_by_routed_distance.csv
+#   2. e911_lte_master_gmlc.csv
+#   3. psap\Final_Join.tab
+#
+# PIPELINE:
+#
+# filtered cohort
+#       ↓
+# exact original GMLC row
+#       ↓
+# CALLER / CELL / ESPOSREQ coordinates
+#       ↓
+# GeoPandas sjoin()
+#       ↓
+# expected PSAP ID + name
+#       ↓
+# Shapely nearest_points()
+#       ↓
+# nearest routed / expected boundary
+#       ↓
+# PyProj.Geod
+#       ↓
+# accurate distance
+#       ↓
+# Pandas groupby()
+#       ↓
+# MIN / MEAN / MAX by routed PSAP
+#
+# NUMERIC EXPORT FIX:
+# -------------------
+# Actual numeric measurements are explicitly converted to numeric
+# pandas dtypes before CSV export.
+#
+# IDs remain strings intentionally:
+#   UNIQ911_CID
+#   FCC/PSAP identifiers
+#   ECGI-like identifiers
+#   route codes
+#
+# =====================================================================
+
+
+from pathlib import Path
+import re
+import math
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+from shapely.geometry import Point
+from shapely.ops import nearest_points
+
+from pyproj import Geod
+
+from IPython.display import display, Markdown
+
+
+# =====================================================================
+# 0. CONFIGURATION
+# =====================================================================
+
+DATA_DIR = Path(
+    r"C:\temp\gmlc_v2"
+)
+
+OUTPUT_DIR = (
+    DATA_DIR
+    / "outputs_psap_rca_v5"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+INPUT_FILE = (
+    "psap_routing_definite_misroutes_filtered_by_routed_distance.csv"
+)
+
+input_candidates = [
+    OUTPUT_DIR / INPUT_FILE,
+    DATA_DIR / INPUT_FILE,
+]
+
+INPUT_PATH = next(
+    (
+        p
+        for p in input_candidates
+        if p.exists()
+    ),
+    None
+)
+
+if INPUT_PATH is None:
+
+    matches = list(
+        DATA_DIR.rglob(
+            INPUT_FILE
+        )
+    )
+
+    if matches:
+        INPUT_PATH = matches[0]
+
+if INPUT_PATH is None:
+    raise FileNotFoundError(
+        INPUT_FILE
+    )
+
+
+GMLC_PATH = (
+    DATA_DIR
+    / "e911_lte_master_gmlc.csv"
+)
+
+BOUNDARY_PATH = (
+    DATA_DIR
+    / "psap"
+    / "Final_Join.tab"
+)
+
+
+OUTPUT_CSV = (
+    OUTPUT_DIR
+    / "psap_geopandas_independent_crosscheck_v1.csv"
+)
+
+SUMMARY_CSV = (
+    OUTPUT_DIR
+    / "psap_geopandas_routed_psap_summary_v1.csv"
+)
+
+PATTERN_CSV = (
+    OUTPUT_DIR
+    / "psap_geopandas_coordinate_pattern_summary_v1.csv"
+)
+
+
+if not GMLC_PATH.exists():
+    raise FileNotFoundError(
+        GMLC_PATH
+    )
+
+if not BOUNDARY_PATH.exists():
+    raise FileNotFoundError(
+        BOUNDARY_PATH
+    )
+
+
+CSV_CHUNK_ROWS = 100_000
+
+CLOSE_BOUNDARY_KM = 5.0
+
+
+print(
+    "Filtered cohort:",
+    INPUT_PATH
+)
+
+print(
+    "Original GMLC:",
+    GMLC_PATH
+)
+
+print(
+    "PSAP boundaries:",
+    BOUNDARY_PATH
+)
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+GEOD = Geod(
+    ellps="WGS84"
+)
+
+
+def norm_id(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = (
+        str(value)
+        .strip()
+        .strip('"')
+    )
+
+    if text.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    return re.sub(
+        r"\.0$",
+        "",
+        text
+    )
+
+
+def clean_text(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+def numeric(value):
+
+    value = pd.to_numeric(
+        value,
+        errors="coerce"
+    )
+
+    try:
+        value = float(value)
+    except Exception:
+        return np.nan
+
+    if not math.isfinite(
+        value
+    ):
+        return np.nan
+
+    return value
+
+
+def valid_coordinate(
+    lat,
+    lon
+):
+
+    lat = numeric(
+        lat
+    )
+
+    lon = numeric(
+        lon
+    )
+
+    if (
+        not np.isfinite(lat)
+        or
+        not np.isfinite(lon)
+    ):
+        return False
+
+    if not (
+        -90 <= lat <= 90
+        and
+        -180 <= lon <= 180
+    ):
+        return False
+
+    # common missing placeholder
+    if (
+        abs(lat) < 1e-10
+        and
+        abs(lon) < 1e-10
+    ):
+        return False
+
+    return True
+
+
+def repair_geometry(
+    geometry
+):
+
+    if (
+        geometry is None
+        or
+        geometry.is_empty
+    ):
+        return None
+
+    try:
+
+        if not geometry.is_valid:
+            geometry = (
+                geometry.buffer(0)
+            )
+
+        if (
+            geometry is None
+            or
+            geometry.is_empty
+            or
+            not geometry.is_valid
+        ):
+            return None
+
+        return geometry
+
+    except Exception:
+        return None
+
+
+def geodesic_distance_km(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+):
+
+    if not (
+        valid_coordinate(
+            lat1,
+            lon1
+        )
+        and
+        valid_coordinate(
+            lat2,
+            lon2
+        )
+    ):
+        return np.nan
+
+    _, _, distance_m = GEOD.inv(
+
+        float(lon1),
+        float(lat1),
+
+        float(lon2),
+        float(lat2)
+    )
+
+    return (
+        abs(
+            float(distance_m)
+        )
+        / 1000.0
+    )
+
+
+# =====================================================================
+# 2. READ FILTERED COHORT
+# =====================================================================
+
+cohort_raw = pd.read_csv(
+    INPUT_PATH,
+    dtype="string",
+    low_memory=False
+)
+
+cohort_raw.columns = [
+    str(c)
+    .strip()
+    .upper()
+
+    for c
+    in cohort_raw.columns
+]
+
+
+if "UNIQ911_CID" not in cohort_raw.columns:
+
+    raise RuntimeError(
+        "Filtered cohort must contain UNIQ911_CID."
+    )
+
+
+cohort_raw[
+    "CID_NORM"
+] = (
+    cohort_raw[
+        "UNIQ911_CID"
+    ]
+    .map(
+        norm_id
+    )
+)
+
+
+# Preserve original v5 values ONLY for comparison.
+original_fields = [
+
+    "GMLC_ROW_ID",
+    "UNIQ911_CID",
+
+    "EXPECTED_FCC_PSAP_ID",
+    "FCC_PSAP_ID",
+    "PSAP_NAME",
+
+    "ROUTE_INTEGRITY_STATUS",
+
+    "DISTANCE_TO_ROUTED_BOUNDARY_M",
+    "DISTANCE_TO_EXPECTED_BOUNDARY_M",
+
+    "MISROUTE_LABEL",
+]
+
+
+keep_original = [
+    c
+    for c in original_fields
+    if c in cohort_raw.columns
+]
+
+
+cohort = (
+    cohort_raw[
+        keep_original
+        + ["CID_NORM"]
+    ]
+    .copy()
+)
+
+
+rename_original = {
+
+    "UNIQ911_CID":
+        "FILTER_UNIQ911_CID",
+
+    "EXPECTED_FCC_PSAP_ID":
+        "ORIGINAL_FILTER_EXPECTED_PSAP_ID",
+
+    "FCC_PSAP_ID":
+        "ORIGINAL_FILTER_ROUTED_PSAP_ID",
+
+    "PSAP_NAME":
+        "ORIGINAL_FILTER_ROUTED_PSAP_NAME",
+
+    "ROUTE_INTEGRITY_STATUS":
+        "ORIGINAL_FILTER_ROUTE_INTEGRITY_STATUS",
+
+    "DISTANCE_TO_ROUTED_BOUNDARY_M":
+        "ORIGINAL_FILTER_CALLER_TO_ROUTED_BOUNDARY_M",
+
+    "DISTANCE_TO_EXPECTED_BOUNDARY_M":
+        "ORIGINAL_FILTER_CALLER_TO_EXPECTED_BOUNDARY_M",
+
+    "MISROUTE_LABEL":
+        "ORIGINAL_FILTER_MISROUTE_LABEL",
+}
+
+
+cohort = cohort.rename(
+    columns={
+        old: new
+        for old, new
+        in rename_original.items()
+        if old in cohort.columns
+    }
+)
+
+
+if "GMLC_ROW_ID" in cohort.columns:
+
+    cohort[
+        "GMLC_ROW_ID"
+    ] = pd.to_numeric(
+        cohort[
+            "GMLC_ROW_ID"
+        ],
+        errors="coerce"
+    ).astype(
+        "Int64"
+    )
+
+
+target_cids = set(
+    cohort.loc[
+        cohort[
+            "CID_NORM"
+        ].ne(""),
+        "CID_NORM"
+    ]
+)
+
+
+target_row_ids = set()
+
+if "GMLC_ROW_ID" in cohort.columns:
+
+    target_row_ids = set(
+        cohort[
+            "GMLC_ROW_ID"
+        ]
+        .dropna()
+        .astype(int)
+    )
+
+
+print(
+    "\nFiltered cohort calls:",
+    f"{len(cohort):,}"
+)
+
+
+# =====================================================================
+# 3. ORIGINAL GMLC FIELDS
+# =====================================================================
+
+raw_header = list(
+    pd.read_csv(
+        GMLC_PATH,
+        nrows=0
+    ).columns
+)
+
+
+header_map = {
+    str(c).strip().upper(): c
+    for c in raw_header
+}
+
+
+required_raw = [
+
+    "UNIQ911_CID",
+
+    "LATITUDE",
+    "LONGITUDE",
+
+    "CELL_LATITUDE",
+    "CELL_LONGITUDE",
+
+    "FCC_PSAP_ID",
+]
+
+
+missing_required_raw = [
+    c
+    for c in required_raw
+    if c not in header_map
+]
+
+
+if missing_required_raw:
+
+    raise RuntimeError(
+        "Original GMLC CSV missing required fields: "
+        + ", ".join(
+            missing_required_raw
+        )
+    )
+
+
+wanted_raw = [
+
+    "UNIQ911_CID",
+
+    # coordinates
+    "LATITUDE",
+    "LONGITUDE",
+
+    "CELL_LATITUDE",
+    "CELL_LONGITUDE",
+
+    "ESPOSREQ_LOC_LATITUDE",
+    "ESPOSREQ_LOC_LONGITUDE",
+
+    # routed PSAP
+    "FCC_PSAP_ID",
+    "PSAP_ID",
+    "PSAP_NAME",
+    "ROUTE_PSAP_NAME",
+
+    # context
+    "MARKET",
+    "STATE",
+    "COUNTY",
+
+    # call
+    "CALL_BEGIN_TIME_UTC",
+    "CALL_END_TIME_UTC",
+    "CALL_DURATION_SEC",
+
+    # quality
+    "UNCERT_METERS",
+
+    "ESPOSREQ_LOC_HORIZONTAL_UNCERT",
+    "ESPOSREQ_LOC_CONFIDENCE",
+
+    "LOCATION_FIRST_HORIZONTAL_UNCERT",
+    "LOCATION_FIRST_CONFIDENCE",
+
+    "VERTICAL_UNCERT",
+    "CONFIDENCE",
+
+    # location source
+    "ESPOSREQ_INITIAL_LOCATION_SOURCE",
+    "ESPOSREQ_LASTKNOWN_LOCATION_SOURCE",
+    "ROUTE_LOCATION_POS_SOURCE",
+
+    "POS_METHOD_USED",
+    "NW_METHOD_USED",
+
+    # routing
+    "ROUTE_STATUS_GMLC",
+    "ROUTE_ESZ",
+    "ROUTE_ESINET",
+    "ROUTE_FALLBACK",
+    "DEFAULT_ROUTED_CALL",
+
+    "LBR_ATTEMPTED",
+    "LBR_SUCCESS",
+    "LBR_PSAP_DIFF",
+
+    # existing source distances
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+
+    "CALL_ANOMALY",
+    "COMPLETE_CALL",
+]
+
+
+available_raw = [
+    c
+    for c in wanted_raw
+    if c in header_map
+]
+
+
+actual_usecols = [
+    header_map[c]
+    for c in available_raw
+]
+
+
+missing_optional_raw = [
+    c
+    for c in wanted_raw
+    if c not in header_map
+]
+
+
+if missing_optional_raw:
+
+    print(
+        "\nOptional GMLC fields not found:"
+    )
+
+    for c in missing_optional_raw:
+        print(
+            " -",
+            c
+        )
+
+
+# =====================================================================
+# 4. STREAM ORIGINAL GMLC
+# =====================================================================
+
+selected_chunks = []
+
+row_offset = 0
+
+
+for chunk_no, chunk in enumerate(
+
+    pd.read_csv(
+
+        GMLC_PATH,
+
+        dtype="string",
+
+        chunksize=CSV_CHUNK_ROWS,
+
+        usecols=actual_usecols,
+
+        low_memory=False,
+
+        encoding_errors="replace"
+    ),
+
+    start=1
+):
+
+    chunk.columns = [
+        str(c)
+        .strip()
+        .upper()
+
+        for c
+        in chunk.columns
+    ]
+
+
+    chunk[
+        "RAW_GMLC_ROW_ID"
+    ] = np.arange(
+
+        row_offset + 1,
+
+        row_offset
+        + len(chunk)
+        + 1,
+
+        dtype=np.int64
+    )
+
+
+    row_offset += len(
+        chunk
+    )
+
+
+    chunk[
+        "CID_NORM"
+    ] = (
+        chunk[
+            "UNIQ911_CID"
+        ]
+        .map(
+            norm_id
+        )
+    )
+
+
+    mask = (
+        chunk[
+            "CID_NORM"
+        ]
+        .isin(
+            target_cids
+        )
+    )
+
+
+    if target_row_ids:
+
+        mask |= (
+            chunk[
+                "RAW_GMLC_ROW_ID"
+            ]
+            .isin(
+                target_row_ids
+            )
+        )
+
+
+    if mask.any():
+
+        selected_chunks.append(
+            chunk.loc[
+                mask
+            ]
+            .copy()
+        )
+
+
+    if chunk_no % 10 == 0:
+
+        print(
+            f"Scanned "
+            f"{row_offset:,} "
+            f"GMLC rows..."
+        )
+
+
+if not selected_chunks:
+
+    raise RuntimeError(
+        "No cohort calls found in original GMLC CSV."
+    )
+
+
+raw = pd.concat(
+    selected_chunks,
+    ignore_index=True
+)
+
+
+raw[
+    "RAW_ROWS_FOR_CID"
+] = (
+    raw
+
+    .groupby(
+        "CID_NORM"
+    )[
+        "RAW_GMLC_ROW_ID"
+    ]
+
+    .transform(
+        "size"
+    )
+)
+
+
+raw = raw.rename(
+    columns={
+        "UNIQ911_CID":
+            "RAW_UNIQ911_CID"
+    }
+)
+
+
+print(
+    "\nRaw candidate rows:",
+    f"{len(raw):,}"
+)
+
+
+# =====================================================================
+# 5. EXACT ORIGINAL ROW MATCH
+# =====================================================================
+
+raw = raw.reset_index(
+    drop=True
+)
+
+
+exact_lookup = {
+
+    (
+        int(row["RAW_GMLC_ROW_ID"]),
+        row["CID_NORM"]
+    ):
+        idx
+
+    for idx, row
+    in raw[
+        [
+            "RAW_GMLC_ROW_ID",
+            "CID_NORM"
+        ]
+    ].iterrows()
+}
+
+
+cid_counts = (
+    raw[
+        "CID_NORM"
+    ]
+    .value_counts()
+)
+
+
+unique_cid_lookup = {}
+
+
+for idx, row in raw.iterrows():
+
+    cid = row[
+        "CID_NORM"
+    ]
+
+    if (
+        cid
+        and
+        cid_counts.get(
+            cid,
+            0
+        )
+        == 1
+    ):
+
+        unique_cid_lookup[
+            cid
+        ] = idx
+
+
+selected_raw_rows = []
+
+match_methods = []
+
+
+for _, cohort_row in cohort.iterrows():
+
+    cid = cohort_row[
+        "CID_NORM"
+    ]
+
+
+    row_id = (
+        cohort_row[
+            "GMLC_ROW_ID"
+        ]
+        if "GMLC_ROW_ID"
+        in cohort.columns
+        else pd.NA
+    )
+
+
+    matched_index = None
+
+
+    if (
+        pd.notna(
+            row_id
+        )
+        and
+        cid
+    ):
+
+        matched_index = (
+            exact_lookup.get(
+                (
+                    int(row_id),
+                    cid
+                )
+            )
+        )
+
+
+    if matched_index is not None:
+
+        selected_raw_rows.append(
+            raw.loc[
+                matched_index
+            ]
+            .to_dict()
+        )
+
+        match_methods.append(
+            "GMLC_ROW_ID+UNIQ911_CID"
+        )
+
+        continue
+
+
+    matched_index = (
+        unique_cid_lookup.get(
+            cid
+        )
+    )
+
+
+    if matched_index is not None:
+
+        selected_raw_rows.append(
+            raw.loc[
+                matched_index
+            ]
+            .to_dict()
+        )
+
+        match_methods.append(
+            "UNIQUE_UNIQ911_CID_FALLBACK"
+        )
+
+        continue
+
+
+    selected_raw_rows.append(
+        {}
+    )
+
+    match_methods.append(
+        "UNMATCHED_OR_AMBIGUOUS"
+    )
+
+
+matched_raw = pd.DataFrame(
+    selected_raw_rows
+)
+
+
+if "CID_NORM" in matched_raw.columns:
+
+    matched_raw = matched_raw.drop(
+        columns=[
+            "CID_NORM"
+        ]
+    )
+
+
+report = pd.concat(
+
+    [
+        cohort.reset_index(
+            drop=True
+        ),
+
+        matched_raw.reset_index(
+            drop=True
+        )
+    ],
+
+    axis=1
+)
+
+
+report[
+    "RAW_MATCH_METHOD"
+] = match_methods
+
+
+report[
+    "RAW_EXACT_MATCH"
+] = (
+    report[
+        "RAW_MATCH_METHOD"
+    ]
+    ==
+    "GMLC_ROW_ID+UNIQ911_CID"
+)
+
+
+print(
+    "\nMatch methods:"
+)
+
+print(
+    report[
+        "RAW_MATCH_METHOD"
+    ]
+    .value_counts(
+        dropna=False
+    )
+)
+
+
+# =====================================================================
+# 6. ORIGINAL COORDINATES / ROUTED PSAP
+# =====================================================================
+
+report[
+    "ROUTED_PSAP_ID"
+] = (
+    report[
+        "FCC_PSAP_ID"
+    ]
+    .map(
+        norm_id
+    )
+)
+
+
+if "ROUTE_PSAP_NAME" not in report.columns:
+    report[
+        "ROUTE_PSAP_NAME"
+    ] = ""
+
+
+if "PSAP_NAME" not in report.columns:
+    report[
+        "PSAP_NAME"
+    ] = ""
+
+
+report[
+    "ROUTED_PSAP_NAME"
+] = (
+    report[
+        "ROUTE_PSAP_NAME"
+    ]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+missing_name = (
+    report[
+        "ROUTED_PSAP_NAME"
+    ].eq("")
+)
+
+
+report.loc[
+    missing_name,
+    "ROUTED_PSAP_NAME"
+] = (
+    report.loc[
+        missing_name,
+        "PSAP_NAME"
+    ]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+coordinate_columns = {
+
+    "CALLER_LATITUDE":
+        "LATITUDE",
+
+    "CALLER_LONGITUDE":
+        "LONGITUDE",
+
+    "CELL_LATITUDE_RECALC":
+        "CELL_LATITUDE",
+
+    "CELL_LONGITUDE_RECALC":
+        "CELL_LONGITUDE",
+
+    "ESPOSREQ_LATITUDE_RECALC":
+        "ESPOSREQ_LOC_LATITUDE",
+
+    "ESPOSREQ_LONGITUDE_RECALC":
+        "ESPOSREQ_LOC_LONGITUDE",
+}
+
+
+for new_col, raw_col in coordinate_columns.items():
+
+    if raw_col in report.columns:
+
+        report[
+            new_col
+        ] = pd.to_numeric(
+            report[
+                raw_col
+            ],
+            errors="coerce"
+        )
+
+    else:
+
+        report[
+            new_col
+        ] = np.nan
+
+
+# =====================================================================
+# 7. LOAD PSAP BOUNDARIES
+# =====================================================================
+
+try:
+
+    boundaries = gpd.read_file(
+        BOUNDARY_PATH,
+        engine="pyogrio"
+    )
+
+except Exception:
+
+    boundaries = gpd.read_file(
+        BOUNDARY_PATH
+    )
+
+
+if boundaries.empty:
+
+    raise RuntimeError(
+        "No PSAP polygons loaded."
+    )
+
+
+if boundaries.crs is None:
+
+    raise RuntimeError(
+        "Boundary file has no CRS."
+    )
+
+
+if boundaries.crs.to_epsg() != 4326:
+
+    boundaries = (
+        boundaries
+        .to_crs(
+            epsg=4326
+        )
+    )
+
+
+boundary_columns = {
+    str(c)
+    .strip()
+    .upper():
+        c
+
+    for c
+    in boundaries.columns
+}
+
+
+BOUNDARY_ID_COL = next(
+    (
+        boundary_columns[c]
+
+        for c in [
+            "FCC_ID",
+            "FCC_PSAP_ID"
+        ]
+
+        if c in boundary_columns
+    ),
+    None
+)
+
+
+if BOUNDARY_ID_COL is None:
+
+    raise RuntimeError(
+        "Final_Join.tab has no FCC_ID/FCC_PSAP_ID."
+    )
+
+
+BOUNDARY_NAME_COL = next(
+    (
+        boundary_columns[c]
+
+        for c in [
+            "PSAP_NAME",
+            "NAME",
+            "AGENCY_NAME",
+            "AGENCY",
+            "PSAP"
+        ]
+
+        if c in boundary_columns
+    ),
+    None
+)
+
+
+boundaries[
+    "PSAP_ID_GEO"
+] = (
+    boundaries[
+        BOUNDARY_ID_COL
+    ]
+    .map(
+        norm_id
+    )
+)
+
+
+if BOUNDARY_NAME_COL is not None:
+
+    boundaries[
+        "PSAP_NAME_GEO"
+    ] = (
+        boundaries[
+            BOUNDARY_NAME_COL
+        ]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+else:
+
+    boundaries[
+        "PSAP_NAME_GEO"
+    ] = ""
+
+
+boundaries[
+    "geometry"
+] = (
+    boundaries[
+        "geometry"
+    ]
+    .apply(
+        repair_geometry
+    )
+)
+
+
+boundaries = (
+    boundaries.loc[
+        boundaries[
+            "PSAP_ID_GEO"
+        ].ne("")
+        &
+        boundaries[
+            "geometry"
+        ].notna()
+    ]
+    .copy()
+)
+
+
+psap = (
+    boundaries[
+        [
+            "PSAP_ID_GEO",
+            "PSAP_NAME_GEO",
+            "geometry"
+        ]
+    ]
+
+    .dissolve(
+        by="PSAP_ID_GEO",
+        as_index=False,
+        aggfunc={
+            "PSAP_NAME_GEO":
+                "first"
+        }
+    )
+)
+
+
+psap[
+    "geometry"
+] = (
+    psap[
+        "geometry"
+    ]
+    .apply(
+        repair_geometry
+    )
+)
+
+
+psap = (
+    psap.loc[
+        psap[
+            "geometry"
+        ].notna()
+    ]
+    .copy()
+)
+
+
+print(
+    "\nUsable dissolved PSAPs:",
+    f"{len(psap):,}"
+)
+
+
+boundary_by_id = {
+
+    row.PSAP_ID_GEO:
+        row.geometry
+
+    for row
+    in psap.itertuples(
+        index=False
+    )
+}
+
+
+boundary_name_by_id = {
+
+    row.PSAP_ID_GEO:
+        row.PSAP_NAME_GEO
+
+    for row
+    in psap.itertuples(
+        index=False
+    )
+}
+
+
+missing_name = (
+    report[
+        "ROUTED_PSAP_NAME"
+    ].eq("")
+)
+
+
+report.loc[
+    missing_name,
+    "ROUTED_PSAP_NAME"
+] = (
+    report.loc[
+        missing_name,
+        "ROUTED_PSAP_ID"
+    ]
+    .map(
+        boundary_name_by_id
+    )
+    .fillna("")
+)
+
+
+# =====================================================================
+# 8. GEOPANDAS SJOIN -> EXPECTED PSAP
+# =====================================================================
+
+report[
+    "_REPORT_ROW_ID"
+] = np.arange(
+    len(report),
+    dtype=np.int64
+)
+
+
+def assign_expected_psap(
+    frame,
+    prefix,
+    lat_col,
+    lon_col
+):
+
+    valid_mask = [
+
+        valid_coordinate(
+            lat,
+            lon
+        )
+
+        for lat, lon
+        in zip(
+            frame[
+                lat_col
+            ],
+            frame[
+                lon_col
+            ]
+        )
+    ]
+
+
+    point_source = (
+        frame.loc[
+            valid_mask,
+            [
+                "_REPORT_ROW_ID",
+                lat_col,
+                lon_col
+            ]
+        ]
+        .copy()
+    )
+
+
+    points = gpd.GeoDataFrame(
+
+        point_source,
+
+        geometry=gpd.points_from_xy(
+
+            point_source[
+                lon_col
+            ],
+
+            point_source[
+                lat_col
+            ]
+        ),
+
+        crs="EPSG:4326"
+    )
+
+
+    joined = gpd.sjoin(
+
+        points,
+
+        psap[
+            [
+                "PSAP_ID_GEO",
+                "PSAP_NAME_GEO",
+                "geometry"
+            ]
+        ],
+
+        how="left",
+
+        predicate="intersects"
+    )
+
+
+    result_lookup = {}
+
+
+    for row_id, group in joined.groupby(
+        "_REPORT_ROW_ID",
+        sort=False
+    ):
+
+        pairs = []
+
+
+        for psap_id, psap_name in zip(
+
+            group[
+                "PSAP_ID_GEO"
+            ],
+
+            group[
+                "PSAP_NAME_GEO"
+            ]
+        ):
+
+            pid = norm_id(
+                psap_id
+            )
+
+            if not pid:
+                continue
+
+
+            pair = (
+                pid,
+                clean_text(
+                    psap_name
+                )
+            )
+
+
+            if pair not in pairs:
+
+                pairs.append(
+                    pair
+                )
+
+
+        pairs = sorted(
+            pairs,
+            key=lambda x: x[0]
+        )
+
+
+        if len(pairs) == 1:
+
+            result_lookup[
+                int(row_id)
+            ] = (
+
+                pairs[0][0],
+
+                pairs[0][1],
+
+                "UNIQUE_PSAP"
+            )
+
+
+        elif len(pairs) == 0:
+
+            result_lookup[
+                int(row_id)
+            ] = (
+
+                "",
+                "",
+
+                "NO_CONTAINING_PSAP"
+            )
+
+
+        else:
+
+            result_lookup[
+                int(row_id)
+            ] = (
+
+                "|".join(
+                    p[0]
+                    for p in pairs
+                ),
+
+                "|".join(
+                    p[1]
+                    for p in pairs
+                ),
+
+                "MULTIPLE_PSAP"
+            )
+
+
+    id_col = (
+        f"{prefix}_EXPECTED_PSAP_ID"
+    )
+
+    name_col = (
+        f"{prefix}_EXPECTED_PSAP_NAME"
+    )
+
+    status_col = (
+        f"{prefix}_EXPECTED_GEOMETRY_STATUS"
+    )
+
+
+    frame[
+        id_col
+    ] = ""
+
+
+    frame[
+        name_col
+    ] = ""
+
+
+    frame[
+        status_col
+    ] = (
+        "INVALID_OR_MISSING_COORDINATE"
+    )
+
+
+    for idx in frame.index:
+
+        row_id = int(
+            frame.at[
+                idx,
+                "_REPORT_ROW_ID"
+            ]
+        )
+
+
+        result = (
+            result_lookup.get(
+                row_id
+            )
+        )
+
+
+        if result is None:
+            continue
+
+
+        frame.at[
+            idx,
+            id_col
+        ] = result[0]
+
+
+        frame.at[
+            idx,
+            name_col
+        ] = result[1]
+
+
+        frame.at[
+            idx,
+            status_col
+        ] = result[2]
+
+
+    print(
+        f"\n{prefix} GeoPandas sjoin:"
+    )
+
+    print(
+        frame[
+            status_col
+        ]
+        .value_counts(
+            dropna=False
+        )
+    )
+
+
+    return frame
+
+
+report = assign_expected_psap(
+
+    report,
+
+    "CALLER",
+
+    "CALLER_LATITUDE",
+
+    "CALLER_LONGITUDE"
+)
+
+
+report = assign_expected_psap(
+
+    report,
+
+    "CELL",
+
+    "CELL_LATITUDE_RECALC",
+
+    "CELL_LONGITUDE_RECALC"
+)
+
+
+report = assign_expected_psap(
+
+    report,
+
+    "ESPOSREQ",
+
+    "ESPOSREQ_LATITUDE_RECALC",
+
+    "ESPOSREQ_LONGITUDE_RECALC"
+)
+
+
+# =====================================================================
+# 9. SHAPELY + PYPROJ DISTANCES
+# =====================================================================
+
+def calculate_boundary_distances(
+    frame,
+    prefix,
+    lat_col,
+    lon_col
+):
+
+    expected_id_col = (
+        f"{prefix}_EXPECTED_PSAP_ID"
+    )
+
+
+    routed_distance = []
+    routed_signed_distance = []
+    routed_relation = []
+
+    expected_distance = []
+
+    nearest_routed_lat = []
+    nearest_routed_lon = []
+
+    nearest_expected_lat = []
+    nearest_expected_lon = []
+
+    expected_vs_routed = []
+
+
+    for _, row in frame.iterrows():
+
+        lat = numeric(
+            row[
+                lat_col
+            ]
+        )
+
+        lon = numeric(
+            row[
+                lon_col
+            ]
+        )
+
+
+        routed_id = norm_id(
+            row[
+                "ROUTED_PSAP_ID"
+            ]
+        )
+
+
+        expected_id = norm_id(
+            row[
+                expected_id_col
+            ]
+        )
+
+
+        if not valid_coordinate(
+            lat,
+            lon
+        ):
+
+            routed_distance.append(
+                np.nan
+            )
+
+            routed_signed_distance.append(
+                np.nan
+            )
+
+            routed_relation.append(
+                "INVALID_OR_MISSING"
+            )
+
+            expected_distance.append(
+                np.nan
+            )
+
+            nearest_routed_lat.append(
+                np.nan
+            )
+
+            nearest_routed_lon.append(
+                np.nan
+            )
+
+            nearest_expected_lat.append(
+                np.nan
+            )
+
+            nearest_expected_lon.append(
+                np.nan
+            )
+
+            expected_vs_routed.append(
+                "INVALID"
+            )
+
+            continue
+
+
+        point = Point(
+            lon,
+            lat
+        )
+
+
+        # ---------------------------------------------------------
+        # ROUTED
+        # ---------------------------------------------------------
+
+        routed_geom = (
+            boundary_by_id.get(
+                routed_id
+            )
+        )
+
+
+        if routed_geom is None:
+
+            route_km = np.nan
+
+            signed_km = np.nan
+
+            relation = (
+                "MISSING_ROUTED_BOUNDARY"
+            )
+
+            rlat = np.nan
+            rlon = np.nan
+
+
+        else:
+
+            try:
+
+                _, nearest = nearest_points(
+
+                    point,
+
+                    routed_geom.boundary
+                )
+
+
+                rlat = float(
+                    nearest.y
+                )
+
+                rlon = float(
+                    nearest.x
+                )
+
+
+                route_km = (
+                    geodesic_distance_km(
+
+                        lat,
+                        lon,
+
+                        rlat,
+                        rlon
+                    )
+                )
+
+
+                if (
+                    routed_geom
+                    .boundary
+                    .intersects(
+                        point
+                    )
+                ):
+
+                    relation = (
+                        "BOUNDARY"
+                    )
+
+                    signed_km = 0.0
+
+
+                elif routed_geom.covers(
+                    point
+                ):
+
+                    relation = (
+                        "INSIDE"
+                    )
+
+                    signed_km = (
+                        -route_km
+                    )
+
+
+                else:
+
+                    relation = (
+                        "OUTSIDE"
+                    )
+
+                    signed_km = (
+                        route_km
+                    )
+
+
+            except Exception:
+
+                route_km = np.nan
+
+                signed_km = np.nan
+
+                relation = (
+                    "ROUTED_DISTANCE_ERROR"
+                )
+
+                rlat = np.nan
+                rlon = np.nan
+
+
+        routed_distance.append(
+            route_km
+        )
+
+        routed_signed_distance.append(
+            signed_km
+        )
+
+        routed_relation.append(
+            relation
+        )
+
+        nearest_routed_lat.append(
+            rlat
+        )
+
+        nearest_routed_lon.append(
+            rlon
+        )
+
+
+        # ---------------------------------------------------------
+        # EXPECTED
+        # ---------------------------------------------------------
+
+        if (
+            expected_id
+            and
+            "|" not in expected_id
+        ):
+
+            expected_geom = (
+                boundary_by_id.get(
+                    expected_id
+                )
+            )
+
+        else:
+
+            expected_geom = None
+
+
+        if expected_geom is None:
+
+            expected_km = np.nan
+
+            elat = np.nan
+            elon = np.nan
+
+
+        else:
+
+            try:
+
+                _, nearest = nearest_points(
+
+                    point,
+
+                    expected_geom.boundary
+                )
+
+
+                elat = float(
+                    nearest.y
+                )
+
+                elon = float(
+                    nearest.x
+                )
+
+
+                expected_km = (
+                    geodesic_distance_km(
+
+                        lat,
+                        lon,
+
+                        elat,
+                        elon
+                    )
+                )
+
+
+            except Exception:
+
+                expected_km = np.nan
+
+                elat = np.nan
+                elon = np.nan
+
+
+        expected_distance.append(
+            expected_km
+        )
+
+        nearest_expected_lat.append(
+            elat
+        )
+
+        nearest_expected_lon.append(
+            elon
+        )
+
+
+        # ---------------------------------------------------------
+        # SAME / CLOSE / DIFFERENT
+        # ---------------------------------------------------------
+
+        if (
+            expected_id
+            and
+            routed_id
+            and
+            expected_id == routed_id
+        ):
+
+            comparison = "SAME"
+
+
+        elif (
+            expected_id
+            and
+            routed_id
+            and
+            np.isfinite(
+                route_km
+            )
+            and
+            route_km
+            <= CLOSE_BOUNDARY_KM
+        ):
+
+            comparison = "CLOSE"
+
+
+        else:
+
+            comparison = (
+                "DIFFERENT"
+            )
+
+
+        expected_vs_routed.append(
+            comparison
+        )
+
+
+    frame[
+        f"{prefix}_TO_ROUTED_BOUNDARY_KM"
+    ] = routed_distance
+
+
+    frame[
+        f"{prefix}_SIGNED_TO_ROUTED_BOUNDARY_KM"
+    ] = routed_signed_distance
+
+
+    frame[
+        f"{prefix}_RELATION_TO_ROUTED_PSAP"
+    ] = routed_relation
+
+
+    frame[
+        f"{prefix}_TO_EXPECTED_BOUNDARY_KM"
+    ] = expected_distance
+
+
+    frame[
+        f"{prefix}_NEAREST_ROUTED_BOUNDARY_LAT"
+    ] = nearest_routed_lat
+
+
+    frame[
+        f"{prefix}_NEAREST_ROUTED_BOUNDARY_LON"
+    ] = nearest_routed_lon
+
+
+    frame[
+        f"{prefix}_NEAREST_EXPECTED_BOUNDARY_LAT"
+    ] = nearest_expected_lat
+
+
+    frame[
+        f"{prefix}_NEAREST_EXPECTED_BOUNDARY_LON"
+    ] = nearest_expected_lon
+
+
+    frame[
+        f"{prefix}_EXPECTED_VS_ROUTED"
+    ] = expected_vs_routed
+
+
+    return frame
+
+
+report = calculate_boundary_distances(
+
+    report,
+
+    "CALLER",
+
+    "CALLER_LATITUDE",
+
+    "CALLER_LONGITUDE"
+)
+
+
+report = calculate_boundary_distances(
+
+    report,
+
+    "CELL",
+
+    "CELL_LATITUDE_RECALC",
+
+    "CELL_LONGITUDE_RECALC"
+)
+
+
+report = calculate_boundary_distances(
+
+    report,
+
+    "ESPOSREQ",
+
+    "ESPOSREQ_LATITUDE_RECALC",
+
+    "ESPOSREQ_LONGITUDE_RECALC"
+)
+
+
+# =====================================================================
+# 10. DISTANCE BETWEEN LOCATION SOURCES
+# =====================================================================
+
+report[
+    "CALLER_TO_CELL_KM"
+] = [
+
+    geodesic_distance_km(
+
+        caller_lat,
+        caller_lon,
+
+        cell_lat,
+        cell_lon
+    )
+
+    for (
+        caller_lat,
+        caller_lon,
+        cell_lat,
+        cell_lon
+    )
+    in zip(
+
+        report[
+            "CALLER_LATITUDE"
+        ],
+
+        report[
+            "CALLER_LONGITUDE"
+        ],
+
+        report[
+            "CELL_LATITUDE_RECALC"
+        ],
+
+        report[
+            "CELL_LONGITUDE_RECALC"
+        ]
+    )
+]
+
+
+report[
+    "CALLER_TO_ESPOSREQ_KM"
+] = [
+
+    geodesic_distance_km(
+
+        caller_lat,
+        caller_lon,
+
+        espos_lat,
+        espos_lon
+    )
+
+    for (
+        caller_lat,
+        caller_lon,
+        espos_lat,
+        espos_lon
+    )
+    in zip(
+
+        report[
+            "CALLER_LATITUDE"
+        ],
+
+        report[
+            "CALLER_LONGITUDE"
+        ],
+
+        report[
+            "ESPOSREQ_LATITUDE_RECALC"
+        ],
+
+        report[
+            "ESPOSREQ_LONGITUDE_RECALC"
+        ]
+    )
+]
+
+
+report[
+    "CELL_TO_ESPOSREQ_KM"
+] = [
+
+    geodesic_distance_km(
+
+        cell_lat,
+        cell_lon,
+
+        espos_lat,
+        espos_lon
+    )
+
+    for (
+        cell_lat,
+        cell_lon,
+        espos_lat,
+        espos_lon
+    )
+    in zip(
+
+        report[
+            "CELL_LATITUDE_RECALC"
+        ],
+
+        report[
+            "CELL_LONGITUDE_RECALC"
+        ],
+
+        report[
+            "ESPOSREQ_LATITUDE_RECALC"
+        ],
+
+        report[
+            "ESPOSREQ_LONGITUDE_RECALC"
+        ]
+    )
+]
+
+
+# =====================================================================
+# 11. COORDINATE PATTERN
+# =====================================================================
+
+def coordinate_pattern(
+    row
+):
+
+    caller = row[
+        "CALLER_EXPECTED_VS_ROUTED"
+    ]
+
+    cell = row[
+        "CELL_EXPECTED_VS_ROUTED"
+    ]
+
+    espos = row[
+        "ESPOSREQ_EXPECTED_VS_ROUTED"
+    ]
+
+
+    if (
+        caller == "SAME"
+        and
+        cell == "SAME"
+        and
+        espos == "SAME"
+    ):
+
+        return (
+            "ALL_3_SUPPORT_ROUTED_PSAP"
+        )
+
+
+    if (
+        caller == "DIFFERENT"
+        and
+        cell == "SAME"
+        and
+        espos == "SAME"
+    ):
+
+        return (
+            "CALLER_DIFFERS_CELL_ESPOSREQ_SUPPORT_ROUTED"
+        )
+
+
+    if (
+        caller == "SAME"
+        and
+        cell == "DIFFERENT"
+        and
+        espos == "SAME"
+    ):
+
+        return (
+            "CELL_DIFFERS_CALLER_ESPOSREQ_SUPPORT_ROUTED"
+        )
+
+
+    if (
+        caller == "SAME"
+        and
+        cell == "SAME"
+        and
+        espos == "DIFFERENT"
+    ):
+
+        return (
+            "ESPOSREQ_DIFFERS_CALLER_CELL_SUPPORT_ROUTED"
+        )
+
+
+    if (
+        caller == "DIFFERENT"
+        and
+        cell == "DIFFERENT"
+        and
+        espos == "DIFFERENT"
+    ):
+
+        return (
+            "NONE_SUPPORT_ROUTED_PSAP"
+        )
+
+
+    if "CLOSE" in {
+        caller,
+        cell,
+        espos
+    }:
+
+        return (
+            "NEAR_BOUNDARY_OR_MIXED"
+        )
+
+
+    if "INVALID" in {
+        caller,
+        cell,
+        espos
+    }:
+
+        return (
+            "INVALID_OR_MISSING_COORDINATE"
+        )
+
+
+    return (
+        "MIXED_COORDINATE_EVIDENCE"
+    )
+
+
+report[
+    "COORDINATE_PATTERN"
+] = report.apply(
+    coordinate_pattern,
+    axis=1
+)
+
+
+# =====================================================================
+# 12. MIN / MEAN / MAX BY SAME ROUTED PSAP
+# =====================================================================
+
+group_key = (
+    report[
+        "ROUTED_PSAP_ID"
+    ]
+    .replace(
+        "",
+        pd.NA
+    )
+)
+
+
+report[
+    "ROUTED_PSAP_CALLS_IN_COHORT"
+] = (
+
+    report
+
+    .groupby(
+        group_key
+    )[
+        "FILTER_UNIQ911_CID"
+    ]
+
+    .transform(
+        "size"
+    )
+)
+
+
+for prefix in [
+    "CALLER",
+    "CELL",
+    "ESPOSREQ"
+]:
+
+    distance_column = (
+        f"{prefix}_TO_ROUTED_BOUNDARY_KM"
+    )
+
+
+    grouped = (
+        report
+
+        .groupby(
+            group_key
+        )[
+            distance_column
+        ]
+    )
+
+
+    report[
+        f"{prefix}_SAME_ROUTED_PSAP_MIN_KM"
+    ] = (
+        grouped.transform(
+            "min"
+        )
+    )
+
+
+    report[
+        f"{prefix}_SAME_ROUTED_PSAP_MEAN_KM"
+    ] = (
+        grouped.transform(
+            "mean"
+        )
+    )
+
+
+    report[
+        f"{prefix}_SAME_ROUTED_PSAP_MAX_KM"
+    ] = (
+        grouped.transform(
+            "max"
+        )
+    )
+
+
+# =====================================================================
+# 13. QA AGAINST ORIGINAL V5
+# =====================================================================
+
+if (
+    "ORIGINAL_FILTER_CALLER_TO_ROUTED_BOUNDARY_M"
+    in report.columns
+):
+
+    report[
+        "QA_ORIGINAL_VS_NEW_CALLER_ROUTED_ABS_DIFF_M"
+    ] = (
+
+        pd.to_numeric(
+
+            report[
+                "ORIGINAL_FILTER_CALLER_TO_ROUTED_BOUNDARY_M"
+            ],
+
+            errors="coerce"
+        )
+
+        -
+
+        (
+            report[
+                "CALLER_TO_ROUTED_BOUNDARY_KM"
+            ]
+            * 1000.0
+        )
+    ).abs()
+
+
+if (
+    "ORIGINAL_FILTER_CALLER_TO_EXPECTED_BOUNDARY_M"
+    in report.columns
+):
+
+    report[
+        "QA_ORIGINAL_VS_NEW_CALLER_EXPECTED_ABS_DIFF_M"
+    ] = (
+
+        pd.to_numeric(
+
+            report[
+                "ORIGINAL_FILTER_CALLER_TO_EXPECTED_BOUNDARY_M"
+            ],
+
+            errors="coerce"
+        )
+
+        -
+
+        (
+            report[
+                "CALLER_TO_EXPECTED_BOUNDARY_KM"
+            ]
+            * 1000.0
+        )
+    ).abs()
+
+
+if (
+    "ORIGINAL_FILTER_EXPECTED_PSAP_ID"
+    in report.columns
+):
+
+    report[
+        "QA_ORIGINAL_EXPECTED_ID_EQUALS_NEW_CALLER_EXPECTED"
+    ] = (
+
+        report[
+            "ORIGINAL_FILTER_EXPECTED_PSAP_ID"
+        ]
+        .map(
+            norm_id
+        )
+
+        ==
+
+        report[
+            "CALLER_EXPECTED_PSAP_ID"
+        ]
+        .map(
+            norm_id
+        )
+    )
+
+
+if "DISTCELL2XY_M" in report.columns:
+
+    report[
+        "QA_SOURCE_DISTCELL2XY_VS_NEW_CALLER_CELL_ABS_DIFF_M"
+    ] = (
+
+        pd.to_numeric(
+            report[
+                "DISTCELL2XY_M"
+            ],
+            errors="coerce"
+        )
+
+        -
+
+        (
+            report[
+                "CALLER_TO_CELL_KM"
+            ]
+            * 1000.0
+        )
+    ).abs()
+
+
+# =====================================================================
+# 14. ROUTED PSAP SUMMARY
+# =====================================================================
+
+summary = (
+
+    report
+
+    .groupby(
+        [
+            "ROUTED_PSAP_ID",
+            "ROUTED_PSAP_NAME"
+        ],
+        dropna=False
+    )
+
+    .agg(
+
+        CALLS=(
+            "FILTER_UNIQ911_CID",
+            "size"
+        ),
+
+        CALLER_MIN_KM=(
+            "CALLER_TO_ROUTED_BOUNDARY_KM",
+            "min"
+        ),
+
+        CALLER_MEAN_KM=(
+            "CALLER_TO_ROUTED_BOUNDARY_KM",
+            "mean"
+        ),
+
+        CALLER_MAX_KM=(
+            "CALLER_TO_ROUTED_BOUNDARY_KM",
+            "max"
+        ),
+
+        CELL_MIN_KM=(
+            "CELL_TO_ROUTED_BOUNDARY_KM",
+            "min"
+        ),
+
+        CELL_MEAN_KM=(
+            "CELL_TO_ROUTED_BOUNDARY_KM",
+            "mean"
+        ),
+
+        CELL_MAX_KM=(
+            "CELL_TO_ROUTED_BOUNDARY_KM",
+            "max"
+        ),
+
+        ESPOSREQ_MIN_KM=(
+            "ESPOSREQ_TO_ROUTED_BOUNDARY_KM",
+            "min"
+        ),
+
+        ESPOSREQ_MEAN_KM=(
+            "ESPOSREQ_TO_ROUTED_BOUNDARY_KM",
+            "mean"
+        ),
+
+        ESPOSREQ_MAX_KM=(
+            "ESPOSREQ_TO_ROUTED_BOUNDARY_KM",
+            "max"
+        ),
+
+        CALLER_CELL_MEAN_KM=(
+            "CALLER_TO_CELL_KM",
+            "mean"
+        ),
+
+        CALLER_CELL_MAX_KM=(
+            "CALLER_TO_CELL_KM",
+            "max"
+        )
+    )
+
+    .reset_index()
+)
+
+
+# =====================================================================
+# 15. PATTERN SUMMARY
+# =====================================================================
+
+pattern_summary = (
+
+    report[
+        "COORDINATE_PATTERN"
+    ]
+
+    .value_counts(
+        dropna=False
+    )
+
+    .rename_axis(
+        "COORDINATE_PATTERN"
+    )
+
+    .reset_index(
+        name="CALLS"
+    )
+)
+
+
+pattern_summary[
+    "PCT"
+] = (
+
+    100.0
+
+    * pattern_summary[
+        "CALLS"
+    ]
+
+    / max(
+        len(report),
+        1
+    )
+)
+
+
+# =====================================================================
+# 16. NUMERIC TYPE NORMALIZATION BEFORE EXPORT
+# =====================================================================
+#
+# CRITICAL FIX:
+#
+# CSV itself has no schema, but pandas will now write actual numeric
+# tokens rather than string values.
+#
+# Excel should therefore recognize these columns as numbers.
+#
+# IDENTIFIERS are deliberately NOT converted:
+#
+#   UNIQ911_CID
+#   ROUTED_PSAP_ID
+#   EXPECTED_PSAP_ID
+#   PSAP_ID
+#   FCC identifiers
+#
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# Integer/count columns
+# ---------------------------------------------------------------------
+
+integer_columns = [
+
+    "GMLC_ROW_ID",
+    "RAW_GMLC_ROW_ID",
+    "RAW_ROWS_FOR_CID",
+
+    "_REPORT_ROW_ID",
+
+    "ROUTED_PSAP_CALLS_IN_COHORT",
+
+    "DEFAULT_ROUTED_CALL",
+
+    "LBR_ATTEMPTED",
+    "LBR_SUCCESS",
+    "LBR_PSAP_DIFF",
+]
+
+
+for column in integer_columns:
+
+    if column in report.columns:
+
+        report[
+            column
+        ] = (
+            pd.to_numeric(
+                report[
+                    column
+                ],
+                errors="coerce"
+            )
+            .round()
+            .astype(
+                "Int64"
+            )
+        )
+
+
+# ---------------------------------------------------------------------
+# Explicit raw numeric measurements
+# ---------------------------------------------------------------------
+
+raw_numeric_columns = [
+
+    # original coordinates
+    "LATITUDE",
+    "LONGITUDE",
+
+    "CELL_LATITUDE",
+    "CELL_LONGITUDE",
+
+    "ESPOSREQ_LOC_LATITUDE",
+    "ESPOSREQ_LOC_LONGITUDE",
+
+    # aliases
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+
+    "CELL_LATITUDE_RECALC",
+    "CELL_LONGITUDE_RECALC",
+
+    "ESPOSREQ_LATITUDE_RECALC",
+    "ESPOSREQ_LONGITUDE_RECALC",
+
+    # call duration
+    "CALL_DURATION_SEC",
+
+    # quality
+    "UNCERT_METERS",
+
+    "ESPOSREQ_LOC_HORIZONTAL_UNCERT",
+    "ESPOSREQ_LOC_CONFIDENCE",
+
+    "LOCATION_FIRST_HORIZONTAL_UNCERT",
+    "LOCATION_FIRST_CONFIDENCE",
+
+    "VERTICAL_UNCERT",
+    "CONFIDENCE",
+
+    # source distance fields
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+
+    # original filter numeric evidence
+    "ORIGINAL_FILTER_CALLER_TO_ROUTED_BOUNDARY_M",
+    "ORIGINAL_FILTER_CALLER_TO_EXPECTED_BOUNDARY_M",
+]
+
+
+for column in raw_numeric_columns:
+
+    if column in report.columns:
+
+        report[
+            column
+        ] = pd.to_numeric(
+            report[
+                column
+            ],
+            errors="coerce"
+        )
+
+
+# ---------------------------------------------------------------------
+# Automatically convert ALL calculated measurement columns.
+#
+# This catches:
+#   *_KM
+#   *_M
+#   *_LAT
+#   *_LON
+#   *_LATITUDE
+#   *_LONGITUDE
+#   QA_* numeric differences
+# ---------------------------------------------------------------------
+
+numeric_suffixes = (
+
+    "_KM",
+    "_M",
+
+    "_LAT",
+    "_LON",
+
+    "_LATITUDE",
+    "_LONGITUDE",
+)
+
+
+for column in report.columns:
+
+    is_numeric_measurement = (
+        column.endswith(
+            numeric_suffixes
+        )
+        or
+        column.startswith(
+            "QA_ORIGINAL_VS_NEW_"
+        )
+        or
+        column.startswith(
+            "QA_SOURCE_DISTCELL2XY_"
+        )
+    )
+
+
+    # Boolean QA column must remain bool.
+    if (
+        column
+        ==
+        "QA_ORIGINAL_EXPECTED_ID_EQUALS_NEW_CALLER_EXPECTED"
+    ):
+
+        continue
+
+
+    if is_numeric_measurement:
+
+        report[
+            column
+        ] = pd.to_numeric(
+            report[
+                column
+            ],
+            errors="coerce"
+        )
+
+
+# ---------------------------------------------------------------------
+# Explicitly normalize summary numeric columns
+# ---------------------------------------------------------------------
+
+summary_integer_columns = [
+    "CALLS"
+]
+
+
+for column in summary_integer_columns:
+
+    if column in summary.columns:
+
+        summary[
+            column
+        ] = pd.to_numeric(
+            summary[
+                column
+            ],
+            errors="coerce"
+        ).astype(
+            "Int64"
+        )
+
+
+for column in summary.columns:
+
+    if column.endswith(
+        "_KM"
+    ):
+
+        summary[
+            column
+        ] = pd.to_numeric(
+            summary[
+                column
+            ],
+            errors="coerce"
+        )
+
+
+# ---------------------------------------------------------------------
+# Pattern summary
+# ---------------------------------------------------------------------
+
+if "CALLS" in pattern_summary.columns:
+
+    pattern_summary[
+        "CALLS"
+    ] = pd.to_numeric(
+        pattern_summary[
+            "CALLS"
+        ],
+        errors="coerce"
+    ).astype(
+        "Int64"
+    )
+
+
+if "PCT" in pattern_summary.columns:
+
+    pattern_summary[
+        "PCT"
+    ] = pd.to_numeric(
+        pattern_summary[
+            "PCT"
+        ],
+        errors="coerce"
+    )
+
+
+# =====================================================================
+# 17. MAIN REPORT COLUMN ORDER
+# =====================================================================
+
+important_columns = [
+
+    # CALL
+    "FILTER_UNIQ911_CID",
+    "GMLC_ROW_ID",
+    "RAW_GMLC_ROW_ID",
+
+    "RAW_MATCH_METHOD",
+    "RAW_EXACT_MATCH",
+
+    "MARKET",
+    "STATE",
+    "COUNTY",
+
+
+    # ROUTED PSAP
+    "ROUTED_PSAP_ID",
+    "PSAP_ID",
+    "ROUTED_PSAP_NAME",
+
+    "ROUTED_PSAP_CALLS_IN_COHORT",
+
+
+    # CALLER
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+
+    "CALLER_EXPECTED_PSAP_ID",
+    "CALLER_EXPECTED_PSAP_NAME",
+
+    "CALLER_EXPECTED_GEOMETRY_STATUS",
+    "CALLER_EXPECTED_VS_ROUTED",
+    "CALLER_RELATION_TO_ROUTED_PSAP",
+
+    "CALLER_TO_ROUTED_BOUNDARY_KM",
+    "CALLER_SIGNED_TO_ROUTED_BOUNDARY_KM",
+    "CALLER_TO_EXPECTED_BOUNDARY_KM",
+
+    "CALLER_SAME_ROUTED_PSAP_MIN_KM",
+    "CALLER_SAME_ROUTED_PSAP_MEAN_KM",
+    "CALLER_SAME_ROUTED_PSAP_MAX_KM",
+
+    "CALLER_NEAREST_ROUTED_BOUNDARY_LAT",
+    "CALLER_NEAREST_ROUTED_BOUNDARY_LON",
+
+    "CALLER_NEAREST_EXPECTED_BOUNDARY_LAT",
+    "CALLER_NEAREST_EXPECTED_BOUNDARY_LON",
+
+
+    # CELL
+    "CELL_LATITUDE_RECALC",
+    "CELL_LONGITUDE_RECALC",
+
+    "CELL_EXPECTED_PSAP_ID",
+    "CELL_EXPECTED_PSAP_NAME",
+
+    "CELL_EXPECTED_GEOMETRY_STATUS",
+    "CELL_EXPECTED_VS_ROUTED",
+    "CELL_RELATION_TO_ROUTED_PSAP",
+
+    "CELL_TO_ROUTED_BOUNDARY_KM",
+    "CELL_SIGNED_TO_ROUTED_BOUNDARY_KM",
+    "CELL_TO_EXPECTED_BOUNDARY_KM",
+
+    "CELL_SAME_ROUTED_PSAP_MIN_KM",
+    "CELL_SAME_ROUTED_PSAP_MEAN_KM",
+    "CELL_SAME_ROUTED_PSAP_MAX_KM",
+
+
+    # ESPOSREQ
+    "ESPOSREQ_LATITUDE_RECALC",
+    "ESPOSREQ_LONGITUDE_RECALC",
+
+    "ESPOSREQ_EXPECTED_PSAP_ID",
+    "ESPOSREQ_EXPECTED_PSAP_NAME",
+
+    "ESPOSREQ_EXPECTED_GEOMETRY_STATUS",
+    "ESPOSREQ_EXPECTED_VS_ROUTED",
+    "ESPOSREQ_RELATION_TO_ROUTED_PSAP",
+
+    "ESPOSREQ_TO_ROUTED_BOUNDARY_KM",
+    "ESPOSREQ_SIGNED_TO_ROUTED_BOUNDARY_KM",
+    "ESPOSREQ_TO_EXPECTED_BOUNDARY_KM",
+
+    "ESPOSREQ_SAME_ROUTED_PSAP_MIN_KM",
+    "ESPOSREQ_SAME_ROUTED_PSAP_MEAN_KM",
+    "ESPOSREQ_SAME_ROUTED_PSAP_MAX_KM",
+
+
+    # BETWEEN LOCATIONS
+    "CALLER_TO_CELL_KM",
+    "CALLER_TO_ESPOSREQ_KM",
+    "CELL_TO_ESPOSREQ_KM",
+
+    "COORDINATE_PATTERN",
+
+
+    # QUALITY
+    "UNCERT_METERS",
+
+    "ESPOSREQ_LOC_HORIZONTAL_UNCERT",
+    "ESPOSREQ_LOC_CONFIDENCE",
+
+    "LOCATION_FIRST_HORIZONTAL_UNCERT",
+    "LOCATION_FIRST_CONFIDENCE",
+
+    "VERTICAL_UNCERT",
+    "CONFIDENCE",
+
+    "ESPOSREQ_INITIAL_LOCATION_SOURCE",
+    "ESPOSREQ_LASTKNOWN_LOCATION_SOURCE",
+    "ROUTE_LOCATION_POS_SOURCE",
+
+    "POS_METHOD_USED",
+    "NW_METHOD_USED",
+
+
+    # ROUTING
+    "ROUTE_STATUS_GMLC",
+    "ROUTE_ESZ",
+    "ROUTE_ESINET",
+
+    "ROUTE_FALLBACK",
+    "DEFAULT_ROUTED_CALL",
+
+    "LBR_ATTEMPTED",
+    "LBR_SUCCESS",
+    "LBR_PSAP_DIFF",
+
+
+    # CALL CONTEXT
+    "CALL_BEGIN_TIME_UTC",
+    "CALL_END_TIME_UTC",
+
+    "CALL_DURATION_SEC",
+
+    "CALL_ANOMALY",
+    "COMPLETE_CALL",
+
+
+    # SOURCE DISTANCES
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+
+
+    # QA
+    "QA_ORIGINAL_VS_NEW_CALLER_ROUTED_ABS_DIFF_M",
+
+    "QA_ORIGINAL_VS_NEW_CALLER_EXPECTED_ABS_DIFF_M",
+
+    "QA_ORIGINAL_EXPECTED_ID_EQUALS_NEW_CALLER_EXPECTED",
+
+    "QA_SOURCE_DISTCELL2XY_VS_NEW_CALLER_CELL_ABS_DIFF_M",
+
+
+    # ORIGINAL FILTERED v5
+    "ORIGINAL_FILTER_ROUTED_PSAP_ID",
+    "ORIGINAL_FILTER_ROUTED_PSAP_NAME",
+
+    "ORIGINAL_FILTER_EXPECTED_PSAP_ID",
+
+    "ORIGINAL_FILTER_ROUTE_INTEGRITY_STATUS",
+
+    "ORIGINAL_FILTER_CALLER_TO_ROUTED_BOUNDARY_M",
+
+    "ORIGINAL_FILTER_CALLER_TO_EXPECTED_BOUNDARY_M",
+
+    "ORIGINAL_FILTER_MISROUTE_LABEL",
+]
+
+
+important_columns = [
+    c
+    for c in important_columns
+    if c in report.columns
+]
+
+
+important_columns = list(
+    dict.fromkeys(
+        important_columns
+    )
+)
+
+
+remaining_columns = [
+    c
+    for c in report.columns
+    if c not in important_columns
+]
+
+
+report_out = (
+    report[
+        important_columns
+        + remaining_columns
+    ]
+    .copy()
+)
+
+
+# =====================================================================
+# 18. FINAL NUMERIC QA BEFORE SAVE
+# =====================================================================
+
+print(
+    "\nNumeric dtype examples:"
+)
+
+
+dtype_check_columns = [
+
+    "CALLER_LATITUDE",
+
+    "CALLER_TO_ROUTED_BOUNDARY_KM",
+
+    "CELL_TO_ROUTED_BOUNDARY_KM",
+
+    "CALLER_TO_CELL_KM",
+
+    "CALL_DURATION_SEC",
+
+    "DISTCELL2XY_M",
+
+    "ROUTED_PSAP_CALLS_IN_COHORT",
+]
+
+
+for column in dtype_check_columns:
+
+    if column in report_out.columns:
+
+        print(
+            f" {column:<45}",
+            report_out[
+                column
+            ].dtype
+        )
+
+
+# =====================================================================
+# 19. SAVE OUTPUTS
+# =====================================================================
+#
+# float_format controls presentation only.
+# Values remain numeric and are written as unquoted numeric CSV fields.
+# =====================================================================
+
+report_out.to_csv(
+
+    OUTPUT_CSV,
+
+    index=False,
+
+    float_format="%.6f"
+)
+
+
+summary.to_csv(
+
+    SUMMARY_CSV,
+
+    index=False,
+
+    float_format="%.6f"
+)
+
+
+pattern_summary.to_csv(
+
+    PATTERN_CSV,
+
+    index=False,
+
+    float_format="%.6f"
+)
+
+
+# =====================================================================
+# 20. DISPLAY
+# =====================================================================
+
+display(
+    Markdown(
+        "### Independent GeoPandas / Shapely / PyProj crosscheck"
+    )
+)
+
+
+print(
+    "\nNEW independent crosscheck:"
+)
+
+print(
+    OUTPUT_CSV
+)
+
+
+print(
+    "\nRouted PSAP summary:"
+)
+
+print(
+    SUMMARY_CSV
+)
+
+
+print(
+    "\nCoordinate pattern summary:"
+)
+
+print(
+    PATTERN_CSV
+)
+
+
+display(
+    pattern_summary
+)
+
+
+preview_columns = [
+
+    "FILTER_UNIQ911_CID",
+
+    "ROUTED_PSAP_ID",
+    "ROUTED_PSAP_NAME",
+
+    "CALLER_EXPECTED_PSAP_ID",
+    "CALLER_EXPECTED_PSAP_NAME",
+    "CALLER_EXPECTED_VS_ROUTED",
+
+    "CALLER_TO_ROUTED_BOUNDARY_KM",
+
+    "CELL_EXPECTED_PSAP_ID",
+    "CELL_EXPECTED_PSAP_NAME",
+    "CELL_EXPECTED_VS_ROUTED",
+
+    "CELL_TO_ROUTED_BOUNDARY_KM",
+
+    "ESPOSREQ_EXPECTED_PSAP_ID",
+    "ESPOSREQ_EXPECTED_PSAP_NAME",
+    "ESPOSREQ_EXPECTED_VS_ROUTED",
+
+    "ESPOSREQ_TO_ROUTED_BOUNDARY_KM",
+
+    "CALLER_TO_CELL_KM",
+
+    "COORDINATE_PATTERN",
+]
+
+
+preview_columns = [
+    c
+    for c in preview_columns
+    if c in report_out.columns
+]
+
+
+display(
+    report_out[
+        preview_columns
+    ]
+    .head(
+        100
+    )
+)
+
+
+display(
+    Markdown(
+        "### MIN / MEAN / MAX by routed PSAP"
+    )
+)
+
+
+display(
+    summary
+    .sort_values(
+        "CALLER_MAX_KM",
+        ascending=False
+    )
+    .head(
+        100
+    )
+)
+
+
+# =====================================================================
+# 21. QA SUMMARY
+# =====================================================================
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "QA AGAINST ORIGINAL FILTERED v5 RESULT"
+)
+
+print(
+    "============================================================"
+)
+
+
+qa_distance_cols = [
+
+    "QA_ORIGINAL_VS_NEW_CALLER_ROUTED_ABS_DIFF_M",
+
+    "QA_ORIGINAL_VS_NEW_CALLER_EXPECTED_ABS_DIFF_M",
+
+    "QA_SOURCE_DISTCELL2XY_VS_NEW_CALLER_CELL_ABS_DIFF_M",
+]
+
+
+for column in qa_distance_cols:
+
+    if column not in report_out.columns:
+        continue
+
+
+    values = (
+        pd.to_numeric(
+            report_out[
+                column
+            ],
+            errors="coerce"
+        )
+        .dropna()
+    )
+
+
+    if values.empty:
+        continue
+
+
+    print(
+        f"\n{column}"
+    )
+
+    print(
+        " count :",
+        f"{len(values):,}"
+    )
+
+    print(
+        " median:",
+        f"{values.median():,.3f}",
+        "m"
+    )
+
+    print(
+        " p95   :",
+        f"{values.quantile(0.95):,.3f}",
+        "m"
+    )
+
+    print(
+        " max   :",
+        f"{values.max():,.3f}",
+        "m"
+    )
+
+
+if (
+    "QA_ORIGINAL_EXPECTED_ID_EQUALS_NEW_CALLER_EXPECTED"
+    in report_out.columns
+):
+
+    print(
+        "\nOriginal expected PSAP ID "
+        "vs new GeoPandas Caller expected PSAP:"
+    )
+
+    print(
+        report_out[
+            "QA_ORIGINAL_EXPECTED_ID_EQUALS_NEW_CALLER_EXPECTED"
+        ]
+        .value_counts(
+            dropna=False
+        )
+    )
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "NEW CALCULATION INPUTS"
+)
+
+print(
+    "============================================================"
+)
+
+print(
+    "Filtered cohort:",
+    INPUT_PATH
+)
+
+print(
+    "Original GMLC:",
+    GMLC_PATH
+)
+
+print(
+    "Boundary polygons:",
+    BOUNDARY_PATH
+)
+
+print(
+    "\nCurrent crosscheck CSV was NOT used."
+)
