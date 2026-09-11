@@ -1,0 +1,915 @@
+# =====================================================================
+# 10. RESOLVE ROUTED PSAP CORRECTLY
+#
+# CRITICAL CORRECTION
+# -------------------
+#
+# DO NOT assume:
+#
+#     GMLC.PSAP_ID == Final_Join.NENA_ID
+#
+# simply because the numeric values are equal.
+#
+#
+# RESOLUTION PRIORITY
+# -------------------
+#
+# TIER 1
+#   GMLC routed PSAP NAME
+#       -> unique Final_Join AGENCY
+#       -> NENA_ID
+#
+#   This is strongest because ROUTE_PSAP_NAME / PSAP_NAME explicitly
+#   identifies the PSAP the GMLC record says received the call.
+#
+#
+# TIER 2
+#   GMLC PSAP_ID -> NENA_ID
+#
+#   BUT ONLY if the Final_Join agency attached to that NENA_ID agrees
+#   with the GMLC routed PSAP name.
+#
+#
+# TIER 3
+#   If GMLC routed name is absent, allow the exact canonical PSAP_ID
+#   match, but identify the method clearly as ID_ONLY_NO_ROUTED_NAME.
+#
+#
+# CONFLICT
+# --------
+#
+# Example:
+#
+#   GMLC:
+#       PSAP_ID = 80950002
+#       ROUTED NAME = Jefferson County Communications Authority
+#
+#   Final_Join NENA_ID 080950002:
+#       Phillips County Communication Center
+#
+#   -> numeric ID match is REJECTED
+#
+#   If "Jefferson County Communications Authority" uniquely maps to
+#   another Final_Join NENA_ID, that NENA boundary is used instead.
+#
+# =====================================================================
+
+
+# =====================================================================
+# 10.1 NORMALIZE PSAP NAMES
+# =====================================================================
+
+def normalize_psap_name(
+    value,
+    remove_trailing_numeric_code=False
+):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = (
+        str(value)
+        .upper()
+        .strip()
+    )
+
+
+    if text in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+
+        return ""
+
+
+    # Normalize different 911 spellings.
+    text = re.sub(
+        r"\b9[\s\-]*1[\s\-]*1\b",
+        "911",
+        text
+    )
+
+
+    # Normalize ampersand.
+    text = text.replace(
+        "&",
+        " AND "
+    )
+
+
+    # Remove punctuation.
+    text = re.sub(
+        r"[^A-Z0-9]+",
+        " ",
+        text
+    )
+
+
+    # Collapse spaces.
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+
+    # Some GMLC names carry a terminal operational/site number:
+    #
+    # Alaska State Troopers - Ketchikan Gateway - 9775
+    #
+    # If requested, remove only a trailing numeric token.
+    if remove_trailing_numeric_code:
+
+        text = re.sub(
+            r"\s+\d{3,6}$",
+            "",
+            text
+        ).strip()
+
+
+    return text
+
+
+# =====================================================================
+# 10.2 BUILD NORMALIZED FINAL_JOIN NAME KEYS
+# =====================================================================
+
+psap[
+    "_PSAP_NAME_KEY"
+] = (
+    psap[
+        "BOUNDARY_PSAP_NAME"
+    ]
+    .map(
+        lambda x:
+            normalize_psap_name(
+                x,
+                False
+            )
+    )
+)
+
+
+psap[
+    "_PSAP_NAME_NO_CODE_KEY"
+] = (
+    psap[
+        "BOUNDARY_PSAP_NAME"
+    ]
+    .map(
+        lambda x:
+            normalize_psap_name(
+                x,
+                True
+            )
+    )
+)
+
+
+# =====================================================================
+# 10.3 BUILD SAFE UNIQUE NAME -> NENA LOOKUPS
+#
+# A normalized name is accepted only if it identifies exactly ONE
+# canonical NENA ID.
+# =====================================================================
+
+def build_unique_name_lookup(
+    dataframe,
+    key_column
+):
+
+    lookup = {}
+
+
+    for key, group in (
+        dataframe.loc[
+            dataframe[
+                key_column
+            ].ne("")
+        ]
+        .groupby(
+            key_column,
+            dropna=False
+        )
+    ):
+
+        ids = sorted(
+            {
+                canonical_nena_id(
+                    x
+                )
+
+                for x
+                in group[
+                    "NENA_ID_CANON"
+                ]
+
+                if canonical_nena_id(
+                    x
+                )
+            }
+        )
+
+
+        # Only accept unambiguous name identities.
+        if len(ids) == 1:
+
+            lookup[
+                key
+            ] = ids[0]
+
+
+    return lookup
+
+
+exact_name_to_nena = (
+    build_unique_name_lookup(
+        psap,
+        "_PSAP_NAME_KEY"
+    )
+)
+
+
+no_code_name_to_nena = (
+    build_unique_name_lookup(
+        psap,
+        "_PSAP_NAME_NO_CODE_KEY"
+    )
+)
+
+
+print(
+    "\nUnique exact Final_Join agency names:",
+    f"{len(exact_name_to_nena):,}"
+)
+
+
+print(
+    "Unique Final_Join agency names without trailing code:",
+    f"{len(no_code_name_to_nena):,}"
+)
+
+
+# =====================================================================
+# 10.4 NORMALIZE GMLC ROUTED NAME
+# =====================================================================
+
+report[
+    "_GMLC_ROUTED_NAME_KEY"
+] = (
+    report[
+        "GMLC_ROUTED_PSAP_NAME"
+    ]
+    .map(
+        lambda x:
+            normalize_psap_name(
+                x,
+                False
+            )
+    )
+)
+
+
+report[
+    "_GMLC_ROUTED_NAME_NO_CODE_KEY"
+] = (
+    report[
+        "GMLC_ROUTED_PSAP_NAME"
+    ]
+    .map(
+        lambda x:
+            normalize_psap_name(
+                x,
+                True
+            )
+    )
+)
+
+
+# =====================================================================
+# 10.5 RESOLVE EACH ROUTED PSAP
+# =====================================================================
+
+resolved_nena = []
+
+resolution_method = []
+
+id_candidate_nena = []
+
+id_candidate_name = []
+
+id_name_conflict = []
+
+name_match_nena = []
+
+
+for _, row in report.iterrows():
+
+    # -------------------------------------------------------------
+    # GMLC values
+    # -------------------------------------------------------------
+
+    gmlc_id = canonical_nena_id(
+        row[
+            "GMLC_ROUTED_PSAP_ID_CANON"
+        ]
+    )
+
+
+    gmlc_name = clean_text(
+        row[
+            "GMLC_ROUTED_PSAP_NAME"
+        ]
+    )
+
+
+    exact_name_key = clean_text(
+        row[
+            "_GMLC_ROUTED_NAME_KEY"
+        ]
+    )
+
+
+    no_code_name_key = clean_text(
+        row[
+            "_GMLC_ROUTED_NAME_NO_CODE_KEY"
+        ]
+    )
+
+
+    # -------------------------------------------------------------
+    # Candidate from numeric PSAP_ID -> NENA_ID
+    # -------------------------------------------------------------
+
+    if (
+        gmlc_id
+        and
+        gmlc_id
+        in boundary_by_nena
+    ):
+
+        candidate_id = gmlc_id
+
+        candidate_name = (
+            name_by_nena.get(
+                candidate_id,
+                ""
+            )
+        )
+
+    else:
+
+        candidate_id = ""
+
+        candidate_name = ""
+
+
+    id_candidate_nena.append(
+        candidate_id
+    )
+
+
+    id_candidate_name.append(
+        candidate_name
+    )
+
+
+    # -------------------------------------------------------------
+    # Candidate from exact routed PSAP NAME
+    # -------------------------------------------------------------
+
+    name_nena = ""
+
+
+    if exact_name_key:
+
+        name_nena = (
+            exact_name_to_nena.get(
+                exact_name_key,
+                ""
+            )
+        )
+
+
+    name_method = ""
+
+
+    if name_nena:
+
+        name_method = (
+            "UNIQUE_EXACT_ROUTED_NAME"
+        )
+
+
+    # -------------------------------------------------------------
+    # Secondary deterministic name normalization:
+    # ignore only terminal facility number.
+    # NO fuzzy matching.
+    # -------------------------------------------------------------
+
+    if (
+        not name_nena
+        and
+        no_code_name_key
+    ):
+
+        name_nena = (
+            no_code_name_to_nena.get(
+                no_code_name_key,
+                ""
+            )
+        )
+
+
+        if name_nena:
+
+            name_method = (
+                "UNIQUE_ROUTED_NAME_NO_TRAILING_CODE"
+            )
+
+
+    name_match_nena.append(
+        name_nena
+    )
+
+
+    # -------------------------------------------------------------
+    # Does numeric ID candidate agree with GMLC routed name?
+    # -------------------------------------------------------------
+
+    candidate_name_key = (
+        normalize_psap_name(
+            candidate_name,
+            False
+        )
+    )
+
+
+    candidate_name_no_code_key = (
+        normalize_psap_name(
+            candidate_name,
+            True
+        )
+    )
+
+
+    name_available = bool(
+        exact_name_key
+    )
+
+
+    id_agrees_with_name = (
+
+        candidate_id
+        and
+        name_available
+
+        and
+
+        (
+            candidate_name_key
+            ==
+            exact_name_key
+
+            or
+
+            candidate_name_no_code_key
+            ==
+            no_code_name_key
+        )
+    )
+
+
+    conflict = (
+
+        bool(
+            candidate_id
+        )
+
+        and
+
+        bool(
+            name_nena
+        )
+
+        and
+
+        candidate_id
+        !=
+        name_nena
+    )
+
+
+    id_name_conflict.append(
+        conflict
+    )
+
+
+    # =============================================================
+    # RESOLUTION DECISION
+    # =============================================================
+
+    # -------------------------------------------------------------
+    # TIER 1:
+    # Unique routed name directly identifies boundary.
+    #
+    # Name wins even when numeric PSAP_ID points elsewhere.
+    # -------------------------------------------------------------
+
+    if name_nena:
+
+        chosen_nena = (
+            name_nena
+        )
+
+
+        if conflict:
+
+            method = (
+                "ROUTED_NAME_OVERRIDES_ID_NAME_CONFLICT"
+            )
+
+        else:
+
+            method = (
+                name_method
+            )
+
+
+    # -------------------------------------------------------------
+    # TIER 2:
+    # ID may be used only if its boundary agency agrees with the
+    # GMLC routed PSAP name.
+    # -------------------------------------------------------------
+
+    elif (
+        candidate_id
+        and
+        id_agrees_with_name
+    ):
+
+        chosen_nena = (
+            candidate_id
+        )
+
+
+        method = (
+            "PSAP_ID_TO_NENA_NAME_VALIDATED"
+        )
+
+
+    # -------------------------------------------------------------
+    # TIER 3:
+    # GMLC has no routed name.
+    #
+    # The canonical ID can still be retained, but this method is
+    # clearly distinguished.
+    # -------------------------------------------------------------
+
+    elif (
+        candidate_id
+        and
+        not name_available
+    ):
+
+        chosen_nena = (
+            candidate_id
+        )
+
+
+        method = (
+            "PSAP_ID_ONLY_NO_ROUTED_NAME"
+        )
+
+
+    # -------------------------------------------------------------
+    # Numeric ID exists but its boundary name conflicts with the
+    # GMLC routed PSAP name and no unique correct name could be
+    # resolved.
+    #
+    # DO NOT calculate distance to the wrong polygon.
+    # -------------------------------------------------------------
+
+    elif candidate_id:
+
+        chosen_nena = ""
+
+
+        method = (
+            "ID_NAME_CONFLICT_UNRESOLVED"
+        )
+
+
+    else:
+
+        chosen_nena = ""
+
+
+        method = (
+            "UNRESOLVED_ROUTED_BOUNDARY"
+        )
+
+
+    resolved_nena.append(
+        chosen_nena
+    )
+
+
+    resolution_method.append(
+        method
+    )
+
+
+# =====================================================================
+# 10.6 ATTACH CORRECTED ROUTED IDENTITY
+# =====================================================================
+
+report[
+    "ROUTED_NENA_ID"
+] = (
+    resolved_nena
+)
+
+
+report[
+    "ROUTED_RESOLUTION_METHOD"
+] = (
+    resolution_method
+)
+
+
+report[
+    "ROUTED_ID_CANDIDATE_NENA_ID"
+] = (
+    id_candidate_nena
+)
+
+
+report[
+    "ROUTED_ID_CANDIDATE_PSAP_NAME"
+] = (
+    id_candidate_name
+)
+
+
+report[
+    "ROUTED_NAME_MATCH_NENA_ID"
+] = (
+    name_match_nena
+)
+
+
+report[
+    "ROUTED_ID_NAME_CONFLICT"
+] = (
+    id_name_conflict
+)
+
+
+report[
+    "ROUTED_NENA_ID_RAW"
+] = (
+    report[
+        "ROUTED_NENA_ID"
+    ]
+    .map(
+        raw_nena_by_canon
+    )
+    .fillna("")
+)
+
+
+report[
+    "ROUTED_BOUNDARY_PSAP_NAME"
+] = (
+    report[
+        "ROUTED_NENA_ID"
+    ]
+    .map(
+        name_by_nena
+    )
+    .fillna("")
+)
+
+
+report[
+    "ROUTED_BOUNDARY_FCC_ID"
+] = (
+    report[
+        "ROUTED_NENA_ID"
+    ]
+    .map(
+        fcc_by_nena
+    )
+    .fillna("")
+)
+
+
+report[
+    "ROUTED_BOUNDARY_STATUS"
+] = np.where(
+
+    report[
+        "ROUTED_NENA_ID"
+    ].ne(""),
+
+    "RESOLVED",
+
+    "UNRESOLVED_ROUTED_BOUNDARY"
+)
+
+
+# =====================================================================
+# 10.7 QA: SHOW THE EXACT ERROR WE JUST CORRECTED
+# =====================================================================
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "ROUTED PSAP RESOLUTION"
+)
+
+print(
+    "============================================================"
+)
+
+
+resolution_summary = (
+
+    report[
+        "ROUTED_RESOLUTION_METHOD"
+    ]
+
+    .value_counts(
+        dropna=False
+    )
+
+    .rename_axis(
+        "METHOD"
+    )
+
+    .reset_index(
+        name="CALLS"
+    )
+)
+
+
+resolution_summary[
+    "PCT"
+] = (
+
+    100.0
+
+    * resolution_summary[
+        "CALLS"
+    ]
+
+    / max(
+        len(report),
+        1
+    )
+)
+
+
+display(
+    resolution_summary
+)
+
+
+print(
+    "\nID / routed-name conflicts:",
+    f"{int(report['ROUTED_ID_NAME_CONFLICT'].sum()):,}"
+)
+
+
+conflict_columns = [
+
+    "FILTER_UNIQ911_CID",
+
+    "STATE",
+    "COUNTY",
+
+    "GMLC_ROUTED_PSAP_ID",
+
+    "GMLC_ROUTED_PSAP_NAME",
+
+    "ROUTED_ID_CANDIDATE_NENA_ID",
+
+    "ROUTED_ID_CANDIDATE_PSAP_NAME",
+
+    "ROUTED_NAME_MATCH_NENA_ID",
+
+    "ROUTED_NENA_ID",
+
+    "ROUTED_BOUNDARY_PSAP_NAME",
+
+    "ROUTED_RESOLUTION_METHOD",
+]
+
+
+conflict_columns = [
+    c
+    for c in conflict_columns
+    if c in report.columns
+]
+
+
+display(
+    Markdown(
+        "### PSAP_ID / routed-name conflicts corrected"
+    )
+)
+
+
+display(
+    report.loc[
+        report[
+            "ROUTED_ID_NAME_CONFLICT"
+        ],
+        conflict_columns
+    ]
+    .head(
+        150
+    )
+)
+
+
+# =====================================================================
+# 10.8 DIRECT NAME CONSISTENCY CHECK
+# =====================================================================
+
+report[
+    "ROUTED_GMLC_NAME_EQUALS_BOUNDARY_NAME"
+] = [
+
+    (
+        normalize_psap_name(
+            gmlc_name,
+            True
+        )
+
+        ==
+
+        normalize_psap_name(
+            boundary_name,
+            True
+        )
+    )
+
+    if (
+        clean_text(
+            gmlc_name
+        )
+        and
+        clean_text(
+            boundary_name
+        )
+    )
+
+    else False
+
+    for gmlc_name, boundary_name
+    in zip(
+
+        report[
+            "GMLC_ROUTED_PSAP_NAME"
+        ],
+
+        report[
+            "ROUTED_BOUNDARY_PSAP_NAME"
+        ]
+    )
+]
+
+
+print(
+    "\nResolved rows where GMLC routed name "
+    "equals selected boundary name:",
+    f"{int(report['ROUTED_GMLC_NAME_EQUALS_BOUNDARY_NAME'].sum()):,}"
+)
+
+
+print(
+    "Resolved rows:",
+    f"{int(report['ROUTED_BOUNDARY_STATUS'].eq('RESOLVED').sum()):,}"
+)
+
+
+# =====================================================================
+# IMPORTANT:
+#
+# AFTER THIS CELL, rerun the existing sections:
+#
+#   11. GeoPandas sjoin -> Expected NENA PSAP
+#   12. Shapely + PyProj boundary distances
+#   13. Distances between location sources
+#   14. Coordinate pattern
+#   15. MIN / MEAN / MAX
+#   16+ QA / output / save
+#
+# Those sections will now use the CORRECTED ROUTED_NENA_ID.
+# =====================================================================
