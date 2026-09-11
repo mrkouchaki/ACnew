@@ -1,3 +1,818 @@
+
+
+
+
+
+
+# =====================================================================
+# VALIDATE GMLC PSAP_ID -> FINAL_JOIN.NENA_ID AS ROUTED PSAP KEY
+# =====================================================================
+#
+# PURPOSE
+# -------
+# Determine whether:
+#
+#       GMLC.PSAP_ID
+#              ↓ exact
+#       Final_Join.NENA_ID
+#
+# is a safe routed-PSAP boundary mapping.
+#
+# This DOES NOT change the geographic calculation yet.
+#
+# =====================================================================
+
+import re
+import pandas as pd
+import numpy as np
+
+
+# =====================================================================
+# 1. NORMALIZATION
+# =====================================================================
+
+def key_norm(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+
+    if text.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    return re.sub(
+        r"\.0$",
+        "",
+        text
+    )
+
+
+def name_norm(value):
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = str(value).upper().strip()
+
+    # Remove punctuation for diagnostic comparison only.
+    text = re.sub(
+        r"[^A-Z0-9]+",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# =====================================================================
+# 2. PREPARE FINAL_JOIN BOUNDARY TABLE
+# =====================================================================
+
+b = boundaries.copy()
+
+
+if "NENA_ID" not in b.columns:
+    raise RuntimeError(
+        "Final_Join.tab does not contain NENA_ID."
+    )
+
+if "FCC_ID" not in b.columns:
+    raise RuntimeError(
+        "Final_Join.tab does not contain FCC_ID."
+    )
+
+if "AGENCY" not in b.columns:
+    raise RuntimeError(
+        "Final_Join.tab does not contain AGENCY."
+    )
+
+
+b["NENA_ID_NORM"] = (
+    b["NENA_ID"]
+    .map(key_norm)
+)
+
+b["FCC_ID_NORM"] = (
+    b["FCC_ID"]
+    .map(key_norm)
+)
+
+b["AGENCY_CLEAN"] = (
+    b["AGENCY"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+b["AGENCY_NORM"] = (
+    b["AGENCY_CLEAN"]
+    .map(name_norm)
+)
+
+
+if "STATE" not in b.columns:
+    b["STATE"] = ""
+
+if "CITY" not in b.columns:
+    b["CITY"] = ""
+
+if "COUNTY" not in b.columns:
+    b["COUNTY"] = ""
+
+
+# =====================================================================
+# 3. PROFILE NENA_ID UNIQUENESS
+#
+# Multiple polygon pieces are okay.
+#
+# What matters is whether one NENA_ID points to multiple different:
+#   - agencies
+#   - FCC IDs
+#   - states
+# =====================================================================
+
+nena_profile = (
+
+    b.loc[
+        b["NENA_ID_NORM"].ne("")
+    ]
+
+    .groupby(
+        "NENA_ID_NORM",
+        dropna=False
+    )
+
+    .agg(
+
+        BOUNDARY_ROWS=(
+            "NENA_ID_NORM",
+            "size"
+        ),
+
+        DISTINCT_AGENCIES=(
+            "AGENCY_NORM",
+            "nunique"
+        ),
+
+        DISTINCT_FCC_IDS=(
+            "FCC_ID_NORM",
+            "nunique"
+        ),
+
+        DISTINCT_STATES=(
+            "STATE",
+            "nunique"
+        ),
+
+        AGENCIES=(
+            "AGENCY_CLEAN",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        {
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        }
+                    )
+                )[:1500]
+        ),
+
+        FCC_IDS=(
+            "FCC_ID_NORM",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        {
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        }
+                    )
+                )
+        ),
+
+        STATES=(
+            "STATE",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        {
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        }
+                    )
+                )
+        ),
+
+        CITIES=(
+            "CITY",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        {
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        }
+                    )
+                )[:1000]
+        ),
+
+        COUNTIES=(
+            "COUNTY",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        {
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        }
+                    )
+                )[:1000]
+        ),
+    )
+
+    .reset_index()
+)
+
+
+nena_profile["UNIQUE_BOUNDARY_IDENTITY"] = (
+
+    nena_profile["DISTINCT_AGENCIES"].eq(1)
+    &
+    nena_profile["DISTINCT_FCC_IDS"].eq(1)
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Final_Join NENA_ID uniqueness"
+)
+
+print(
+    "============================================================"
+)
+
+
+print(
+    "NENA IDs:",
+    f"{len(nena_profile):,}"
+)
+
+
+print(
+    "Unique agency + FCC identity:",
+    f"{int(nena_profile['UNIQUE_BOUNDARY_IDENTITY'].sum()):,}"
+)
+
+
+print(
+    "Ambiguous NENA IDs:",
+    f"{int((~nena_profile['UNIQUE_BOUNDARY_IDENTITY']).sum()):,}"
+)
+
+
+display(
+    nena_profile.loc[
+        ~nena_profile[
+            "UNIQUE_BOUNDARY_IDENTITY"
+        ]
+    ]
+    .head(100)
+)
+
+
+# =====================================================================
+# 4. PREPARE GMLC ROUTED PSAP DATA
+# =====================================================================
+
+g = report.copy()
+
+
+g["GMLC_PSAP_ID_NORM"] = (
+    g["PSAP_ID"]
+    .map(key_norm)
+)
+
+
+g["GMLC_FCC_PSAP_ID_NORM"] = (
+    g["FCC_PSAP_ID"]
+    .map(key_norm)
+)
+
+
+# Use route name first.
+g["GMLC_ROUTED_NAME"] = (
+    g["ROUTE_PSAP_NAME"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+missing_route_name = (
+    g["GMLC_ROUTED_NAME"].eq("")
+)
+
+
+g.loc[
+    missing_route_name,
+    "GMLC_ROUTED_NAME"
+] = (
+
+    g.loc[
+        missing_route_name,
+        "PSAP_NAME"
+    ]
+
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+g["GMLC_ROUTED_NAME_NORM"] = (
+    g["GMLC_ROUTED_NAME"]
+    .map(name_norm)
+)
+
+
+# =====================================================================
+# 5. CREATE ONE ROW PER NENA_ID
+# =====================================================================
+
+nena_lookup = (
+
+    nena_profile.loc[
+        nena_profile[
+            "UNIQUE_BOUNDARY_IDENTITY"
+        ]
+    ]
+
+    [
+        [
+            "NENA_ID_NORM",
+            "AGENCIES",
+            "FCC_IDS",
+            "STATES",
+            "CITIES",
+            "COUNTIES"
+        ]
+    ]
+
+    .rename(
+        columns={
+
+            "AGENCIES":
+                "BOUNDARY_AGENCY",
+
+            "FCC_IDS":
+                "BOUNDARY_FCC_ID",
+
+            "STATES":
+                "BOUNDARY_STATE",
+
+            "CITIES":
+                "BOUNDARY_CITY",
+
+            "COUNTIES":
+                "BOUNDARY_COUNTY",
+        }
+    )
+)
+
+
+nena_lookup[
+    "BOUNDARY_AGENCY_NORM"
+] = (
+    nena_lookup[
+        "BOUNDARY_AGENCY"
+    ]
+    .map(name_norm)
+)
+
+
+# =====================================================================
+# 6. EXACT GMLC.PSAP_ID -> FINAL_JOIN.NENA_ID
+# =====================================================================
+
+check = g.merge(
+
+    nena_lookup,
+
+    left_on=
+        "GMLC_PSAP_ID_NORM",
+
+    right_on=
+        "NENA_ID_NORM",
+
+    how="left",
+
+    validate="many_to_one"
+)
+
+
+check[
+    "NENA_EXACT_MATCH"
+] = (
+    check[
+        "NENA_ID_NORM"
+    ]
+    .fillna("")
+    .ne("")
+)
+
+
+# Diagnostic only.
+check[
+    "ROUTED_NAME_EXACT_NORMALIZED_MATCH"
+] = (
+
+    check[
+        "GMLC_ROUTED_NAME_NORM"
+    ]
+    ==
+    check[
+        "BOUNDARY_AGENCY_NORM"
+    ]
+)
+
+
+# =====================================================================
+# 7. COVERAGE
+# =====================================================================
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "GMLC PSAP_ID -> Final_Join NENA_ID coverage"
+)
+
+print(
+    "============================================================"
+)
+
+
+total = len(
+    check
+)
+
+matched = int(
+    check[
+        "NENA_EXACT_MATCH"
+    ].sum()
+)
+
+
+print(
+    "Rows:",
+    f"{total:,}"
+)
+
+print(
+    "Exact unique NENA matches:",
+    f"{matched:,}"
+)
+
+print(
+    "Row coverage:",
+    f"{100 * matched / max(total,1):.2f}%"
+)
+
+
+matched_rows = (
+    check.loc[
+        check[
+            "NENA_EXACT_MATCH"
+        ]
+    ]
+)
+
+
+if len(
+    matched_rows
+):
+
+    exact_name_matches = int(
+
+        matched_rows[
+            "ROUTED_NAME_EXACT_NORMALIZED_MATCH"
+        ]
+        .sum()
+    )
+
+
+    print(
+        "Exact normalized route-name matches:",
+        f"{exact_name_matches:,}",
+        "/",
+        f"{len(matched_rows):,}"
+    )
+
+
+# =====================================================================
+# 8. SHOW EXACT NENA MATCHES
+# =====================================================================
+
+display_columns = [
+
+    "FILTER_UNIQ911_CID",
+
+    "STATE",
+    "COUNTY",
+
+    "GMLC_FCC_PSAP_ID_NORM",
+
+    "GMLC_PSAP_ID_NORM",
+
+    "GMLC_ROUTED_NAME",
+
+    "NENA_ID_NORM",
+
+    "BOUNDARY_FCC_ID",
+
+    "BOUNDARY_AGENCY",
+
+    "BOUNDARY_STATE",
+
+    "BOUNDARY_CITY",
+
+    "BOUNDARY_COUNTY",
+
+    "ROUTED_NAME_EXACT_NORMALIZED_MATCH",
+]
+
+
+display_columns = [
+    c
+    for c in display_columns
+    if c in check.columns
+]
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Exact PSAP_ID -> NENA_ID matches"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    check.loc[
+        check[
+            "NENA_EXACT_MATCH"
+        ],
+        display_columns
+    ]
+    .head(100)
+)
+
+
+# =====================================================================
+# 9. ALASKA EXAMPLES
+# =====================================================================
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Alaska PSAP_ID -> NENA_ID validation"
+)
+
+print(
+    "============================================================"
+)
+
+
+alaska = (
+    check.loc[
+        check[
+            "STATE"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .eq("AK")
+    ]
+)
+
+
+display(
+    alaska[
+        [
+            c
+            for c in [
+
+                "FILTER_UNIQ911_CID",
+
+                "GMLC_FCC_PSAP_ID_NORM",
+
+                "GMLC_PSAP_ID_NORM",
+
+                "GMLC_ROUTED_NAME",
+
+                "NENA_ID_NORM",
+
+                "BOUNDARY_FCC_ID",
+
+                "BOUNDARY_AGENCY",
+
+                "BOUNDARY_CITY",
+
+                "BOUNDARY_COUNTY",
+
+                "ROUTED_NAME_EXACT_NORMALIZED_MATCH",
+
+                "CALLER_LATITUDE",
+
+                "CALLER_LONGITUDE",
+
+                "CALLER_EXPECTED_PSAP_ID",
+
+                "CALLER_EXPECTED_PSAP_NAME",
+            ]
+
+            if c in alaska.columns
+        ]
+    ]
+    .head(100)
+)
+
+
+# =====================================================================
+# 10. SPECIFIC IDs FROM THE SCREENSHOTS
+# =====================================================================
+
+test_ids = [
+
+    "21980004",  # Ketchikan
+    "21980002",  # Soldotna rows seen earlier
+    "20900014",  # Fairbanks example
+    "20200005",  # Anchorage example
+]
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Specific Alaska GMLC PSAP_ID lookups"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    check.loc[
+        check[
+            "GMLC_PSAP_ID_NORM"
+        ]
+        .isin(
+            test_ids
+        ),
+        display_columns
+    ]
+    .drop_duplicates()
+)
+
+
+# =====================================================================
+# 11. UNMATCHED GMLC PSAP_ID VALUES
+# =====================================================================
+
+unmatched = (
+    check.loc[
+        ~check[
+            "NENA_EXACT_MATCH"
+        ]
+    ]
+)
+
+
+unmatched_profile = (
+
+    unmatched
+
+    .groupby(
+        [
+            "GMLC_PSAP_ID_NORM",
+            "GMLC_ROUTED_NAME"
+        ],
+        dropna=False
+    )
+
+    .agg(
+
+        ROWS=(
+            "GMLC_PSAP_ID_NORM",
+            "size"
+        ),
+
+        STATES=(
+            "STATE",
+            lambda x:
+                " | ".join(
+                    sorted(
+                        {
+                            str(v).strip()
+                            for v in x
+                            if str(v).strip()
+                        }
+                    )
+                )
+        ),
+    )
+
+    .reset_index()
+
+    .sort_values(
+        "ROWS",
+        ascending=False
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "Unmatched GMLC PSAP_ID values"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    unmatched_profile.head(100)
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # =====================================================================
 # DIAGNOSE ROUTED PSAP KEY MAPPING
 # =====================================================================
