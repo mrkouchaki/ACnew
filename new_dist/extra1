@@ -1,0 +1,66 @@
+
+
+
+
+
+
+
+
+# ============================================================
+# CHECK WHETHER Final_Join REALLY HAS DUPLICATE PSAP NAMES
+# ACROSS DIFFERENT NENA IDs
+# ============================================================
+
+audit = boundary_raw[
+    [
+        "_NENA_CANON",
+        "_FCC_CANON",
+        "_AGENCY"
+    ]
+].copy()
+
+audit["_AGENCY_EXACT_NORM"] = (
+    audit["_AGENCY"]
+    .fillna("")
+    .astype(str)
+    .str.upper()
+    .str.strip()
+    .str.replace(r"\s+", " ", regex=True)
+)
+
+duplicate_names = (
+    audit.loc[
+        audit["_AGENCY_EXACT_NORM"].ne("")
+    ]
+    .groupby("_AGENCY_EXACT_NORM")
+    .agg(
+        DISTINCT_NENA_IDS=("_NENA_CANON", "nunique"),
+        DISTINCT_FCC_IDS=("_FCC_CANON", "nunique"),
+        NENA_IDS=(
+            "_NENA_CANON",
+            lambda s: " | ".join(sorted(set(s)))
+        ),
+        FCC_IDS=(
+            "_FCC_CANON",
+            lambda s: " | ".join(sorted(set(s)))
+        ),
+    )
+    .reset_index()
+)
+
+duplicate_names = duplicate_names.loc[
+    duplicate_names["DISTINCT_NENA_IDS"] > 1
+].sort_values(
+    "DISTINCT_NENA_IDS",
+    ascending=False
+)
+
+print(
+    "Boundary agency names belonging to >1 NENA ID:",
+    len(duplicate_names)
+)
+
+display(
+    duplicate_names.head(100)
+)
+
