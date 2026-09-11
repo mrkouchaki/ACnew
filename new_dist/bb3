@@ -1,0 +1,768 @@
+# =====================================================================
+# FIX PSAP_ID <-> NENA_ID MATCHING FOR LEADING-ZERO DIFFERENCES
+# =====================================================================
+#
+# PURPOSE
+# -------
+# Re-test the strongest routed-PSAP mapping:
+#
+#       GMLC.PSAP_ID
+#            ↕
+#       Final_Join.NENA_ID
+#
+# after canonicalizing numeric IDs:
+#
+#       020200005 -> 20200005
+#       020900014 -> 20900014
+#       021700002 -> 21700002
+#
+# This is NOT fuzzy matching.
+# This is exact numeric-identity matching after formatting normalization.
+#
+# =====================================================================
+
+import re
+import pandas as pd
+import numpy as np
+
+
+# =====================================================================
+# 1. CANONICAL ID NORMALIZATION
+# =====================================================================
+
+def canonical_psap_id(value):
+    """
+    Normalize PSAP/NENA identifiers without corrupting nonnumeric IDs.
+
+    Examples:
+        020200005   -> 20200005
+        20200005    -> 20200005
+        021980004   -> 21980004
+        21980004    -> 21980004
+        720000015   -> 720000015
+    """
+
+    if value is None or pd.isna(value):
+        return ""
+
+    text = str(value).strip().strip('"')
+
+    if text.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "<NA>"
+    }:
+        return ""
+
+    # Remove Excel / pandas numeric artifact.
+    text = re.sub(
+        r"\.0$",
+        "",
+        text
+    )
+
+    # IMPORTANT:
+    # For digit-only IDs, remove leading zero padding by integer
+    # normalization.
+    if re.fullmatch(
+        r"\d+",
+        text
+    ):
+
+        try:
+            return str(
+                int(text)
+            )
+        except Exception:
+            pass
+
+    # Keep nonnumeric identifiers unchanged.
+    return text.upper()
+
+
+# =====================================================================
+# 2. PREPARE FINAL_JOIN AT UNIQUE NENA LEVEL
+# =====================================================================
+
+boundary_key_test = boundaries.copy()
+
+
+boundary_key_test[
+    "NENA_ID_RAW"
+] = (
+    boundary_key_test[
+        "NENA_ID"
+    ]
+    .astype("string")
+)
+
+
+boundary_key_test[
+    "NENA_ID_CANON"
+] = (
+    boundary_key_test[
+        "NENA_ID"
+    ]
+    .map(
+        canonical_psap_id
+    )
+)
+
+
+boundary_key_test[
+    "FCC_ID_CANON"
+] = (
+    boundary_key_test[
+        "FCC_ID"
+    ]
+    .map(
+        canonical_psap_id
+    )
+)
+
+
+boundary_key_test[
+    "AGENCY_CLEAN"
+] = (
+    boundary_key_test[
+        "AGENCY"
+    ]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+
+# =====================================================================
+# 3. CHECK WHETHER CANONICAL NENA ID REMAINS UNIQUE
+# =====================================================================
+
+canonical_nena_profile = (
+
+    boundary_key_test.loc[
+        boundary_key_test[
+            "NENA_ID_CANON"
+        ].ne("")
+    ]
+
+    .groupby(
+        "NENA_ID_CANON",
+        dropna=False
+    )
+
+    .agg(
+
+        RAW_NENA_COUNT=(
+            "NENA_ID_RAW",
+            "nunique"
+        ),
+
+        AGENCY_COUNT=(
+            "AGENCY_CLEAN",
+            "nunique"
+        ),
+
+        FCC_COUNT=(
+            "FCC_ID_CANON",
+            "nunique"
+        ),
+
+        RAW_NENA_IDS=(
+            "NENA_ID_RAW",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        {
+                            str(x)
+                            for x in s
+                            if pd.notna(x)
+                        }
+                    )
+                )
+        ),
+
+        AGENCIES=(
+            "AGENCY_CLEAN",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        {
+                            str(x).strip()
+                            for x in s
+                            if str(x).strip()
+                        }
+                    )
+                )[:1500]
+        ),
+
+        FCC_IDS=(
+            "FCC_ID_CANON",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        {
+                            str(x)
+                            for x in s
+                            if str(x)
+                        }
+                    )
+                )
+        ),
+    )
+
+    .reset_index()
+)
+
+
+canonical_nena_profile[
+    "SAFE_UNIQUE_IDENTITY"
+] = (
+
+    canonical_nena_profile[
+        "AGENCY_COUNT"
+    ].eq(1)
+
+    &
+
+    canonical_nena_profile[
+        "FCC_COUNT"
+    ].eq(1)
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "CANONICAL NENA ID UNIQUENESS"
+)
+
+print(
+    "============================================================"
+)
+
+
+print(
+    "Canonical NENA IDs:",
+    f"{len(canonical_nena_profile):,}"
+)
+
+
+print(
+    "Safe unique identities:",
+    f"{canonical_nena_profile['SAFE_UNIQUE_IDENTITY'].sum():,}"
+)
+
+
+print(
+    "Ambiguous after removing leading zeros:",
+    f"{(~canonical_nena_profile['SAFE_UNIQUE_IDENTITY']).sum():,}"
+)
+
+
+display(
+    canonical_nena_profile.loc[
+        ~canonical_nena_profile[
+            "SAFE_UNIQUE_IDENTITY"
+        ]
+    ]
+    .head(100)
+)
+
+
+# =====================================================================
+# 4. ONE UNIQUE BOUNDARY RECORD PER CANONICAL NENA ID
+# =====================================================================
+
+safe_keys = set(
+
+    canonical_nena_profile.loc[
+        canonical_nena_profile[
+            "SAFE_UNIQUE_IDENTITY"
+        ],
+        "NENA_ID_CANON"
+    ]
+)
+
+
+nena_reference = (
+
+    boundary_key_test.loc[
+        boundary_key_test[
+            "NENA_ID_CANON"
+        ].isin(
+            safe_keys
+        )
+    ]
+
+    .sort_values(
+        [
+            "NENA_ID_CANON",
+            "AGENCY_CLEAN"
+        ]
+    )
+
+    .drop_duplicates(
+        "NENA_ID_CANON"
+    )
+
+    .copy()
+)
+
+
+# =====================================================================
+# 5. PREPARE GMLC PSAP IDs
+# =====================================================================
+
+corrected = report.copy()
+
+
+corrected[
+    "GMLC_PSAP_ID_RAW"
+] = (
+    corrected[
+        "PSAP_ID"
+    ]
+)
+
+
+corrected[
+    "GMLC_PSAP_ID_CANON"
+] = (
+    corrected[
+        "PSAP_ID"
+    ]
+    .map(
+        canonical_psap_id
+    )
+)
+
+
+corrected[
+    "GMLC_FCC_PSAP_ID_CANON"
+] = (
+    corrected[
+        "FCC_PSAP_ID"
+    ]
+    .map(
+        canonical_psap_id
+    )
+)
+
+
+# =====================================================================
+# 6. ATTACH EXACT CANONICAL NENA MATCH
+# =====================================================================
+
+nena_join = (
+
+    nena_reference[
+        [
+            "NENA_ID_RAW",
+            "NENA_ID_CANON",
+            "FCC_ID_CANON",
+            "AGENCY_CLEAN",
+            "STATE",
+            "CITY",
+            "COUNTY",
+        ]
+    ]
+
+    .rename(
+        columns={
+
+            "NENA_ID_RAW":
+                "MATCHED_NENA_ID_RAW",
+
+            "NENA_ID_CANON":
+                "MATCHED_NENA_ID_CANON",
+
+            "FCC_ID_CANON":
+                "MATCHED_BOUNDARY_FCC_ID",
+
+            "AGENCY_CLEAN":
+                "MATCHED_BOUNDARY_AGENCY",
+
+            "STATE":
+                "MATCHED_BOUNDARY_STATE",
+
+            "CITY":
+                "MATCHED_BOUNDARY_CITY",
+
+            "COUNTY":
+                "MATCHED_BOUNDARY_COUNTY",
+        }
+    )
+)
+
+
+corrected = corrected.merge(
+
+    nena_join,
+
+    left_on=
+        "GMLC_PSAP_ID_CANON",
+
+    right_on=
+        "MATCHED_NENA_ID_CANON",
+
+    how="left",
+
+    validate="many_to_one"
+)
+
+
+corrected[
+    "EXACT_CANONICAL_PSAP_TO_NENA_MATCH"
+] = (
+
+    corrected[
+        "MATCHED_NENA_ID_CANON"
+    ]
+    .fillna("")
+    .ne("")
+)
+
+
+# =====================================================================
+# 7. COVERAGE
+# =====================================================================
+
+matched = int(
+
+    corrected[
+        "EXACT_CANONICAL_PSAP_TO_NENA_MATCH"
+    ]
+    .sum()
+)
+
+
+total = len(
+    corrected
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "CORRECTED PSAP_ID -> NENA_ID COVERAGE"
+)
+
+print(
+    "============================================================"
+)
+
+
+print(
+    "Rows:",
+    f"{total:,}"
+)
+
+print(
+    "Exact canonical matches:",
+    f"{matched:,}"
+)
+
+print(
+    "Coverage:",
+    f"{100 * matched / max(total,1):.2f}%"
+)
+
+
+# =====================================================================
+# 8. SHOW CASES THAT ONLY WORK BECAUSE OF LEADING-ZERO NORMALIZATION
+# =====================================================================
+
+corrected[
+    "MATCH_REQUIRED_ZERO_NORMALIZATION"
+] = (
+
+    corrected[
+        "EXACT_CANONICAL_PSAP_TO_NENA_MATCH"
+    ]
+
+    &
+
+    (
+        corrected[
+            "GMLC_PSAP_ID_RAW"
+        ]
+        .astype("string")
+        .str.strip()
+
+        !=
+
+        corrected[
+            "MATCHED_NENA_ID_RAW"
+        ]
+        .astype("string")
+        .str.strip()
+    )
+)
+
+
+print(
+    "\nRows rescued by zero-padding normalization:",
+    f"{corrected['MATCH_REQUIRED_ZERO_NORMALIZATION'].sum():,}"
+)
+
+
+display(
+    corrected.loc[
+        corrected[
+            "MATCH_REQUIRED_ZERO_NORMALIZATION"
+        ],
+        [
+            c
+            for c in [
+
+                "FILTER_UNIQ911_CID",
+
+                "STATE",
+                "COUNTY",
+
+                "FCC_PSAP_ID",
+
+                "PSAP_ID",
+
+                "GMLC_PSAP_ID_CANON",
+
+                "ROUTE_PSAP_NAME",
+
+                "MATCHED_NENA_ID_RAW",
+
+                "MATCHED_NENA_ID_CANON",
+
+                "MATCHED_BOUNDARY_FCC_ID",
+
+                "MATCHED_BOUNDARY_AGENCY",
+
+                "MATCHED_BOUNDARY_STATE",
+
+                "MATCHED_BOUNDARY_CITY",
+
+                "MATCHED_BOUNDARY_COUNTY",
+            ]
+
+            if c in corrected.columns
+        ]
+    ]
+    .head(150)
+)
+
+
+# =====================================================================
+# 9. ALASKA — THIS IS THE KEY TEST
+# =====================================================================
+
+alaska_corrected = (
+
+    corrected.loc[
+
+        corrected[
+            "STATE"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .eq("AK")
+
+    ]
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "ALASKA AFTER CANONICAL PSAP_ID / NENA_ID MATCH"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    alaska_corrected[
+        [
+            c
+            for c in [
+
+                "FILTER_UNIQ911_CID",
+
+                "COUNTY",
+
+                "FCC_PSAP_ID",
+
+                "PSAP_ID",
+
+                "GMLC_PSAP_ID_CANON",
+
+                "ROUTE_PSAP_NAME",
+
+                "MATCHED_NENA_ID_RAW",
+
+                "MATCHED_NENA_ID_CANON",
+
+                "MATCHED_BOUNDARY_FCC_ID",
+
+                "MATCHED_BOUNDARY_AGENCY",
+
+                "EXACT_CANONICAL_PSAP_TO_NENA_MATCH",
+            ]
+
+            if c in alaska_corrected.columns
+        ]
+    ]
+    .head(150)
+)
+
+
+# =====================================================================
+# 10. KETCHIKAN SPECIFIC
+# =====================================================================
+
+ketchikan_corrected = (
+
+    corrected.loc[
+
+        corrected[
+            "ROUTE_PSAP_NAME"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .str.contains(
+            "KETCHIKAN",
+            regex=False
+        )
+
+    ]
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "KETCHIKAN CORRECTED KEY"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    ketchikan_corrected[
+        [
+            c
+            for c in [
+
+                "FILTER_UNIQ911_CID",
+
+                "FCC_PSAP_ID",
+
+                "PSAP_ID",
+
+                "GMLC_PSAP_ID_CANON",
+
+                "ROUTE_PSAP_NAME",
+
+                "MATCHED_NENA_ID_RAW",
+
+                "MATCHED_NENA_ID_CANON",
+
+                "MATCHED_BOUNDARY_FCC_ID",
+
+                "MATCHED_BOUNDARY_AGENCY",
+
+                "EXACT_CANONICAL_PSAP_TO_NENA_MATCH",
+            ]
+
+            if c in ketchikan_corrected.columns
+        ]
+    ]
+)
+
+
+# =====================================================================
+# 11. STILL UNMATCHED AFTER CORRECT CANONICALIZATION
+# =====================================================================
+
+still_unmatched = (
+
+    corrected.loc[
+        ~corrected[
+            "EXACT_CANONICAL_PSAP_TO_NENA_MATCH"
+        ]
+    ]
+)
+
+
+unmatched_profile = (
+
+    still_unmatched
+
+    .groupby(
+        [
+            "GMLC_PSAP_ID_CANON",
+            "ROUTE_PSAP_NAME"
+        ],
+        dropna=False
+    )
+
+    .agg(
+
+        ROWS=(
+            "FILTER_UNIQ911_CID",
+            "size"
+        ),
+
+        FCC_IDS=(
+            "FCC_PSAP_ID",
+            lambda s:
+                " | ".join(
+                    sorted(
+                        {
+                            str(x)
+                            for x in s
+                            if pd.notna(x)
+                        }
+                    )
+                )
+        ),
+    )
+
+    .reset_index()
+
+    .sort_values(
+        "ROWS",
+        ascending=False
+    )
+)
+
+
+print(
+    "\n============================================================"
+)
+
+print(
+    "STILL UNMATCHED AFTER ZERO-PADDING FIX"
+)
+
+print(
+    "============================================================"
+)
+
+
+display(
+    unmatched_profile.head(100)
+)
