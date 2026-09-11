@@ -1,71 +1,105 @@
 # =====================================================================
-# CLEAN FULL-GMLC PSAP ABNORMAL ROUTING REPORT v2
+# CLEAN FULL-GMLC PSAP ROUTING / GEOGRAPHIC CROSSCHECK v3
 # =====================================================================
+#
+# PURPOSE
+# -------
+# Find geographically abnormal PSAP routing across the ENTIRE:
+#
+#     e911_lte_master_gmlc.csv
+#
+#
+# ACTUAL ID MODEL
+# ---------------
+#
+# GMLC:
+#     PSAP_ID
+#     FCC_PSAP_ID
+#
+# Final_Join.tab:
+#     NENA_ID
+#     FCC_ID
+#
+#
+# PRIMARY ROUTED-BOUNDARY MATCH:
+#
+#     canonical(GMLC.PSAP_ID)
+#             ==
+#     canonical(Boundary.NENA_ID)
+#
+# CONFIRMATION:
+#
+#     canonical(GMLC.FCC_PSAP_ID)
+#             ==
+#     canonical(Boundary.FCC_ID)
+#
+#
+# Example:
+#
+#     GMLC.PSAP_ID       21980004
+#     Boundary.NENA_ID   021980004
+#
+# canonical form:
+#
+#     21980004 == 21980004
+#
 #
 # IMPORTANT
 # ---------
-# GMLC.NENA_ID IS NOT USED.
-#
-# ROUTED PSAP is resolved from:
-#
-#   GMLC.PSAP_ID
-#       vs
-#   Boundary.PSAP_ID
-#   Boundary.NENA_ID (canonical zero-padding comparison)
-#
-# AND cross-checked with:
-#
-#   GMLC.FCC_PSAP_ID
-#       vs
-#   Boundary.FCC_PSAP_ID / FCC_ID
+# - GMLC.NENA_ID is NOT used. It does not exist.
+# - Boundary.PSAP_ID is NOT required.
+# - Names NEVER choose a polygon.
+# - Names are QA/reporting only.
+# - CSSNG_DATA_ADDITION is NOT used.
 #
 #
-# NAMES DO NOT SELECT THE BOUNDARY.
-#
-# Names are attached afterward for QA:
-#
-#   Boundary.PSAP_NAME
-#   Boundary.PSAP_NAME_ESRK
-#   Boundary.AGENCY
-#
-#
-# EXPECTED PSAP:
-#
-#   Caller coordinate
+# EXPECTED PSAP
+# -------------
+# Caller coordinate
 #       -> GeoPandas spatial join
-#       -> expected NENA_ID
-#       -> expected PSAP_ID
-#       -> expected FCC_PSAP_ID
-#       -> expected names from multiple boundary sources
+#       -> Boundary NENA_ID / FCC_ID / names
 #
-# Same for CELL.
-#
-#
-# CLEAN OUTPUT:
-#
-#   CALL
-#   ROUTED IDs + names
-#
-#   CALLER:
-#       lat/lon
-#       inside/outside routed
-#       distance to routed boundary
-#       expected IDs
-#       expected names + name sources
-#       expected vs routed ID/name status
-#
-#   CELL:
-#       same
-#
-#   CALLER <-> CELL distance
+# Cell coordinate
+#       -> GeoPandas spatial join
+#       -> Boundary NENA_ID / FCC_ID / names
 #
 #
-# DISTANCES ARE METERS.
+# OUTPUT DISTANCES
+# ----------------
+# All distances are METERS:
+#
+#     Caller -> routed PSAP boundary
+#     Caller -> expected PSAP boundary
+#
+#     Cell -> routed PSAP boundary
+#     Cell -> expected PSAP boundary
+#
+#     Caller <-> Cell
+#
+#
+# FILTERS
+# -------
+# Example:
+#
+#     MIN_CALLER_OUTSIDE_ROUTED_M = 19000
+#
+# means:
+#
+#     Caller must be at least 19 km OUTSIDE the routed PSAP.
+#
+# Set Caller/Cell min/max values to None to disable that filter.
+#
+#
+# CLEAN MAIN OUTPUT
+# -----------------
+# psap_clean_full_gmlc_routing_v3.csv
 #
 # =====================================================================
 
+
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
+
 import re
 import math
 
@@ -76,23 +110,24 @@ import shapely
 
 from shapely.geometry import Point
 from shapely.ops import nearest_points
-from pyproj import Geod
 
-from IPython.display import display, Markdown
+from pyproj import Geod
 
 
 # =====================================================================
-# 0. SETTINGS
+# 0. CONFIGURATION
 # =====================================================================
 
 DATA_DIR = Path(
     r"C:\temp\gmlc_v2"
 )
 
+
 OUTPUT_DIR = (
     DATA_DIR
     / "outputs_psap_rca_v5"
 )
+
 
 OUTPUT_DIR.mkdir(
     parents=True,
@@ -115,7 +150,13 @@ BOUNDARY_PATH = (
 
 OUTPUT_CSV = (
     OUTPUT_DIR
-    / "psap_clean_abnormal_routing_report_v2.csv"
+    / "psap_clean_full_gmlc_routing_v3.csv"
+)
+
+
+SUMMARY_CSV = (
+    OUTPUT_DIR
+    / "psap_clean_full_gmlc_routing_summary_v3.csv"
 )
 
 
@@ -126,20 +167,27 @@ CSV_CHUNK_ROWS = 100_000
 # FILTERS
 # =====================================================================
 #
-# IMPORTANT:
+# Filter only OUTSIDE distance.
 #
-# Filter means distance OUTSIDE routed PSAP.
+# Examples:
 #
-# Example:
+# Caller >= 19 km outside:
 #
-#   19000 = caller must be at least 19 km OUTSIDE routed PSAP.
+#     MIN_CALLER_OUTSIDE_ROUTED_M = 19000
+#     MAX_CALLER_OUTSIDE_ROUTED_M = None
 #
-# None = disabled.
+# No Caller filter:
+#
+#     MIN_CALLER_OUTSIDE_ROUTED_M = None
+#     MAX_CALLER_OUTSIDE_ROUTED_M = None
+#
+# Cell filter works exactly the same way.
 #
 # =====================================================================
 
 MIN_CALLER_OUTSIDE_ROUTED_M = 19_000.0
 MAX_CALLER_OUTSIDE_ROUTED_M = None
+
 
 MIN_CELL_OUTSIDE_ROUTED_M = None
 MAX_CELL_OUTSIDE_ROUTED_M = None
@@ -147,20 +195,32 @@ MAX_CELL_OUTSIDE_ROUTED_M = None
 
 # If both Caller and Cell filters are enabled:
 #
-# "OR"  = either one qualifies
-# "AND" = both must qualify
+# "OR"  -> Caller OR Cell qualifies
+# "AND" -> Caller AND Cell qualify
 
 FILTER_MODE = "OR"
 
 
-# If True, after expected-PSAP lookup only retain rows where
-# Caller expected NENA differs from routed NENA.
+# After expected-PSAP calculation, optionally retain only
+# Caller Expected != Routed.
+#
+# False recommended initially.
 
-ONLY_EXPECTED_DIFFERENT = False
+ONLY_CALLER_EXPECTED_DIFFERENT = False
+
+
+# Precision-first behavior:
+#
+# If PSAP_ID cannot resolve to NENA_ID, should a unique FCC_ID alone
+# be allowed to choose a routed polygon?
+#
+# False is safer.
+
+ALLOW_FCC_ONLY_FALLBACK = False
 
 
 # =====================================================================
-# 1. HELPERS
+# 1. BASIC HELPERS
 # =====================================================================
 
 GEOD = Geod(
@@ -173,71 +233,80 @@ def clean_text(value):
     if value is None or pd.isna(value):
         return ""
 
-    value = str(value).strip()
+    text = str(
+        value
+    ).strip()
 
-    if value.upper() in {
+
+    if text.upper() in {
         "",
         "NAN",
         "NONE",
         "<NA>"
     }:
+
         return ""
 
-    return value
+
+    return text
 
 
-def norm_id(value):
+def raw_id(value):
     """
-    String ID normalization.
-    Keeps leading zero.
+    Preserve leading zeros for reporting.
     """
 
-    value = clean_text(
+    text = clean_text(
         value
     )
 
-    if not value:
+    if not text:
         return ""
 
     return re.sub(
         r"\.0$",
         "",
-        value
+        text
     )
 
 
 def canonical_id(value):
     """
-    Used only for ID COMPARISON.
+    Numeric identity comparison.
 
-    Example:
-        040500006 -> 40500006
-        40500006  -> 40500006
+    040500006 -> 40500006
+    40500006  -> 40500006
 
-    Therefore PSAP_ID can be compared safely with zero-padded NENA_ID.
+    Therefore GMLC.PSAP_ID can be safely compared against
+    Boundary.NENA_ID despite zero padding.
     """
 
-    value = norm_id(
+    text = raw_id(
         value
     )
 
-    if not value:
+
+    if not text:
         return ""
+
 
     if re.fullmatch(
         r"\d+",
-        value
+        text
     ):
 
         try:
+
             return str(
-                int(value)
+                int(text)
             )
 
         except Exception:
+
             pass
 
-    return value.upper()
+
+    return text.upper()
 
 
 def numeric(value):
@@ -247,17 +316,26 @@ def numeric(value):
         errors="coerce"
     )
 
+
     try:
-        value = float(value)
+
+        value = float(
+            value
+        )
 
     except Exception:
+
         return np.nan
 
-    return (
+
+    if not math.isfinite(
         value
-        if math.isfinite(value)
-        else np.nan
-    )
+    ):
+
+        return np.nan
+
+
+    return value
 
 
 def valid_coordinate(
@@ -265,74 +343,103 @@ def valid_coordinate(
     lon
 ):
 
-    lat = numeric(lat)
-    lon = numeric(lon)
+    lat = numeric(
+        lat
+    )
+
+    lon = numeric(
+        lon
+    )
+
 
     if (
         not np.isfinite(lat)
         or
         not np.isfinite(lon)
     ):
+
         return False
+
 
     if not (
         -90 <= lat <= 90
         and
         -180 <= lon <= 180
     ):
+
         return False
+
 
     if (
         abs(lat) < 1e-10
         and
         abs(lon) < 1e-10
     ):
+
         return False
+
 
     return True
 
 
-def repair_geometry(g):
+def repair_geometry(
+    geometry
+):
 
     if (
-        g is None
+        geometry is None
         or
-        g.is_empty
+        geometry.is_empty
     ):
+
         return None
+
 
     try:
 
-        if not g.is_valid:
-            g = g.buffer(0)
+        if not geometry.is_valid:
+
+            geometry = (
+                geometry.buffer(0)
+            )
+
 
         if (
-            g is None
+            geometry is None
             or
-            g.is_empty
+            geometry.is_empty
             or
-            not g.is_valid
+            not geometry.is_valid
         ):
+
             return None
 
-        return g
+
+        return geometry
+
 
     except Exception:
 
         return None
 
 
-def first_existing(
+def find_column(
     columns,
     candidates,
     required=False
 ):
 
     lookup = {
-        str(c).strip().upper():
-            c
-        for c in columns
+
+        str(column)
+        .strip()
+        .upper():
+            column
+
+        for column
+        in columns
     }
+
 
     for candidate in candidates:
 
@@ -342,154 +449,244 @@ def first_existing(
                 candidate.upper()
             ]
 
+
     if required:
 
         raise RuntimeError(
             "Missing required column. Tried: "
-            + ", ".join(candidates)
+            + ", ".join(
+                candidates
+            )
         )
+
 
     return None
 
 
 # =====================================================================
-# 2. NAME NORMALIZATION — QA ONLY
+# 2. NAME QA HELPERS
+#
+# NAMES DO NOT SELECT GEOMETRY.
 # =====================================================================
 
 def normalize_name(value):
 
-    value = clean_text(
+    text = clean_text(
         value
     ).upper()
 
-    if not value:
+
+    if not text:
+
         return ""
 
-    value = re.sub(
+
+    # 9-1-1 / 9 1 1 -> 911
+    text = re.sub(
         r"\b9[\s\-]*1[\s\-]*1\b",
         "911",
-        value
+        text
     )
 
-    value = value.replace(
+
+    text = text.replace(
         "&",
         " AND "
     )
 
-    value = re.sub(
+
+    text = re.sub(
         r"[^A-Z0-9]+",
         " ",
-        value
+        text
     )
 
-    value = re.sub(
+
+    text = re.sub(
         r"\s+",
         " ",
-        value
+        text
     ).strip()
 
-    # Remove terminal operational/site code only.
-    value = re.sub(
+
+    # Remove terminal operational/site number only.
+    #
+    # Example:
+    # Alaska State Troopers - Ketchikan Gateway - 9775
+
+    text = re.sub(
         r"\s+\d{3,6}$",
         "",
-        value
+        text
     ).strip()
 
-    return value
+
+    return text
 
 
-def names_same(
-    a,
-    b
-):
+def first_nonempty(series):
 
-    a = normalize_name(a)
-    b = normalize_name(b)
+    for value in series:
 
-    return (
-        bool(a)
-        and
-        bool(b)
-        and
-        a == b
+        value = clean_text(
+            value
+        )
+
+        if value:
+
+            return value
+
+
+    return ""
+
+
+def join_unique_names(series):
+
+    values = []
+
+
+    for value in series:
+
+        value = clean_text(
+            value
+        )
+
+
+        if (
+            value
+            and
+            value not in values
+        ):
+
+            values.append(
+                value
+            )
+
+
+    return " | ".join(
+        values
     )
 
 
-def boundary_name_agreement(
-    name_psap,
-    name_esrk,
-    agency
+def name_source_agreement(
+    values
 ):
+    """
+    values = dict:
+        {
+          "BOUNDARY.AGENCY": "...",
+          "BOUNDARY.PSAP_NAME": "...",
+          ...
+        }
+    """
 
-    available = [
-        clean_text(x)
-        for x in [
-            name_psap,
-            name_esrk,
-            agency
-        ]
-        if clean_text(x)
-    ]
+    present = {
 
+        source:
+            clean_text(
+                value
+            )
 
-    if len(available) == 0:
+        for source, value
+        in values.items()
 
-        return "NO_NAME"
-
-
-    if len(available) == 1:
-
-        return "ONE_SOURCE_ONLY"
-
-
-    normalized = {
-        normalize_name(x)
-        for x in available
-        if normalize_name(x)
+        if clean_text(
+            value
+        )
     }
 
 
-    if len(normalized) == 1:
+    if not present:
 
-        return "ALL_AVAILABLE_SOURCES_AGREE"
-
-
-    return "SOURCE_CONFLICT"
+        return "NO_NAME_SOURCE"
 
 
-def choose_boundary_name(
-    name_psap,
-    name_esrk,
-    agency
+    if len(
+        present
+    ) == 1:
+
+        return "ONE_NAME_SOURCE"
+
+
+    normalized = {
+
+        normalize_name(
+            value
+        )
+
+        for value
+        in present.values()
+
+        if normalize_name(
+            value
+        )
+    }
+
+
+    if len(
+        normalized
+    ) == 1:
+
+        return (
+            "ALL_AVAILABLE_NAME_SOURCES_AGREE"
+        )
+
+
+    return (
+        "NAME_SOURCE_CONFLICT"
+    )
+
+
+def primary_boundary_name(
+    metadata
 ):
     """
-    Selection is ONLY for presentation.
+    Reporting only.
 
-    Geometry was already identified by IDs.
+    Prefer AGENCY because Final_Join visibly contains AGENCY.
     """
 
-    if clean_text(name_psap):
+    candidates = [
 
-        return (
-            clean_text(name_psap),
-            "BOUNDARY.PSAP_NAME"
+        (
+            "BOUNDARY.AGENCY",
+            metadata.get(
+                "AGENCY",
+                ""
+            )
+        ),
+
+        (
+            "BOUNDARY.PSAP_NAME",
+            metadata.get(
+                "PSAP_NAME",
+                ""
+            )
+        ),
+
+        (
+            "BOUNDARY.PSAP_NAME_ESRK",
+            metadata.get(
+                "PSAP_NAME_ESRK",
+                ""
+            )
+        ),
+    ]
+
+
+    for source, value in candidates:
+
+        value = clean_text(
+            value
         )
 
 
-    if clean_text(agency):
+        if value:
 
-        return (
-            clean_text(agency),
-            "BOUNDARY.AGENCY"
-        )
-
-
-    if clean_text(name_esrk):
-
-        return (
-            clean_text(name_esrk),
-            "BOUNDARY.PSAP_NAME_ESRK"
-        )
+            return (
+                value,
+                source
+            )
 
 
     return (
@@ -498,8 +695,204 @@ def choose_boundary_name(
     )
 
 
+def name_sources_string(
+    metadata
+):
+
+    pieces = []
+
+
+    for source, key in [
+
+        (
+            "AGENCY",
+            "AGENCY"
+        ),
+
+        (
+            "PSAP_NAME",
+            "PSAP_NAME"
+        ),
+
+        (
+            "PSAP_NAME_ESRK",
+            "PSAP_NAME_ESRK"
+        ),
+    ]:
+
+        value = clean_text(
+            metadata.get(
+                key,
+                ""
+            )
+        )
+
+
+        if value:
+
+            pieces.append(
+                f"{source}={value}"
+            )
+
+
+    return " | ".join(
+        pieces
+    )
+
+
+def gmlc_name_dictionary(
+    row
+):
+
+    output = {}
+
+
+    for column in [
+
+        "ROUTE_PSAP_NAME",
+        "PSAP_NAME",
+        "PSAP_NAME_ESRK",
+    ]:
+
+        if column in row.index:
+
+            value = clean_text(
+                row[
+                    column
+                ]
+            )
+
+
+            if value:
+
+                output[
+                    f"GMLC.{column}"
+                ] = value
+
+
+    return output
+
+
+def boundary_name_dictionary(
+    metadata
+):
+
+    output = {}
+
+
+    for source, key in [
+
+        (
+            "BOUNDARY.AGENCY",
+            "AGENCY"
+        ),
+
+        (
+            "BOUNDARY.PSAP_NAME",
+            "PSAP_NAME"
+        ),
+
+        (
+            "BOUNDARY.PSAP_NAME_ESRK",
+            "PSAP_NAME_ESRK"
+        ),
+    ]:
+
+        value = clean_text(
+            metadata.get(
+                key,
+                ""
+            )
+        )
+
+
+        if value:
+
+            output[
+                source
+            ] = value
+
+
+    return output
+
+
+def compare_name_sets(
+    left_names,
+    right_names
+):
+    """
+    Returns:
+        status
+        matched source description
+    """
+
+    if not left_names:
+
+        return (
+            "LEFT_NAME_MISSING",
+            ""
+        )
+
+
+    if not right_names:
+
+        return (
+            "RIGHT_NAME_MISSING",
+            ""
+        )
+
+
+    for left_source, left_value in left_names.items():
+
+        left_normalized = (
+            normalize_name(
+                left_value
+            )
+        )
+
+
+        if not left_normalized:
+
+            continue
+
+
+        for right_source, right_value in right_names.items():
+
+            right_normalized = (
+                normalize_name(
+                    right_value
+                )
+            )
+
+
+            if (
+                right_normalized
+                and
+                left_normalized
+                ==
+                right_normalized
+            ):
+
+                return (
+
+                    "SAME",
+
+                    (
+                        f"{left_source} "
+                        f"<-> "
+                        f"{right_source}"
+                    )
+                )
+
+
+    return (
+        "DIFFERENT",
+        ""
+    )
+
+
 # =====================================================================
-# 3. LOAD BOUNDARY FILE
+# 3. LOAD PSAP BOUNDARY DATA
 # =====================================================================
 
 try:
@@ -508,6 +901,7 @@ try:
         BOUNDARY_PATH,
         engine="pyogrio"
     )
+
 
 except Exception:
 
@@ -519,14 +913,14 @@ except Exception:
 if boundary_raw.empty:
 
     raise RuntimeError(
-        "Boundary file is empty."
+        "Final_Join.tab is empty."
     )
 
 
 if boundary_raw.crs is None:
 
     raise RuntimeError(
-        "Boundary CRS missing."
+        "Final_Join.tab has no CRS."
     )
 
 
@@ -538,10 +932,10 @@ if boundary_raw.crs.to_epsg() != 4326:
 
 
 # =====================================================================
-# 4. FIND BOUNDARY COLUMNS
+# 4. FIND ACTUAL BOUNDARY COLUMNS
 # =====================================================================
 
-B_NENA = first_existing(
+BOUNDARY_NENA_COL = find_column(
 
     boundary_raw.columns,
 
@@ -553,52 +947,22 @@ B_NENA = first_existing(
 )
 
 
-B_PSAP = first_existing(
+BOUNDARY_FCC_COL = find_column(
 
     boundary_raw.columns,
 
     [
-        "PSAP_ID"
+        "FCC_ID",
+        "FCC_PSAP_ID"
     ],
 
     required=True
 )
 
 
-B_FCC = first_existing(
+# Optional name sources
 
-    boundary_raw.columns,
-
-    [
-        "FCC_PSAP_ID",
-        "FCC_ID"
-    ],
-
-    required=True
-)
-
-
-B_NAME = first_existing(
-
-    boundary_raw.columns,
-
-    [
-        "PSAP_NAME"
-    ]
-)
-
-
-B_NAME_ESRK = first_existing(
-
-    boundary_raw.columns,
-
-    [
-        "PSAP_NAME_ESRK"
-    ]
-)
-
-
-B_AGENCY = first_existing(
+BOUNDARY_AGENCY_COL = find_column(
 
     boundary_raw.columns,
 
@@ -609,15 +973,87 @@ B_AGENCY = first_existing(
 )
 
 
+BOUNDARY_PSAP_NAME_COL = find_column(
+
+    boundary_raw.columns,
+
+    [
+        "PSAP_NAME"
+    ]
+)
+
+
+BOUNDARY_PSAP_NAME_ESRK_COL = find_column(
+
+    boundary_raw.columns,
+
+    [
+        "PSAP_NAME_ESRK"
+    ]
+)
+
+
+print(
+    "\nBoundary identity:"
+)
+
+
+print(
+    " NENA column:",
+    BOUNDARY_NENA_COL
+)
+
+
+print(
+    " FCC column :",
+    BOUNDARY_FCC_COL
+)
+
+
+print(
+    "\nBoundary name sources:"
+)
+
+
+print(
+    " AGENCY        :",
+    BOUNDARY_AGENCY_COL
+)
+
+
+print(
+    " PSAP_NAME     :",
+    BOUNDARY_PSAP_NAME_COL
+)
+
+
+print(
+    " PSAP_NAME_ESRK:",
+    BOUNDARY_PSAP_NAME_ESRK_COL
+)
+
+
 # =====================================================================
-# 5. NORMALIZE BOUNDARY IDS
+# 5. NORMALIZE BOUNDARY DATA
 # =====================================================================
 
 boundary_raw[
-    "_NENA"
+    "_NENA_RAW"
 ] = (
     boundary_raw[
-        B_NENA
+        BOUNDARY_NENA_COL
+    ]
+    .map(
+        raw_id
+    )
+)
+
+
+boundary_raw[
+    "_NENA_CANON"
+] = (
+    boundary_raw[
+        BOUNDARY_NENA_COL
     ]
     .map(
         canonical_id
@@ -626,10 +1062,10 @@ boundary_raw[
 
 
 boundary_raw[
-    "_PSAP"
+    "_FCC_CANON"
 ] = (
     boundary_raw[
-        B_PSAP
+        BOUNDARY_FCC_COL
     ]
     .map(
         canonical_id
@@ -638,14 +1074,19 @@ boundary_raw[
 
 
 boundary_raw[
-    "_FCC"
+    "_NAME_AGENCY"
 ] = (
+
     boundary_raw[
-        B_FCC
+        BOUNDARY_AGENCY_COL
     ]
-    .map(
-        canonical_id
-    )
+    .fillna("")
+    .astype(str)
+    .str.strip()
+
+    if BOUNDARY_AGENCY_COL
+
+    else ""
 )
 
 
@@ -654,13 +1095,13 @@ boundary_raw[
 ] = (
 
     boundary_raw[
-        B_NAME
+        BOUNDARY_PSAP_NAME_COL
     ]
     .fillna("")
     .astype(str)
     .str.strip()
 
-    if B_NAME
+    if BOUNDARY_PSAP_NAME_COL
 
     else ""
 )
@@ -671,30 +1112,13 @@ boundary_raw[
 ] = (
 
     boundary_raw[
-        B_NAME_ESRK
+        BOUNDARY_PSAP_NAME_ESRK_COL
     ]
     .fillna("")
     .astype(str)
     .str.strip()
 
-    if B_NAME_ESRK
-
-    else ""
-)
-
-
-boundary_raw[
-    "_NAME_AGENCY"
-] = (
-
-    boundary_raw[
-        B_AGENCY
-    ]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-
-    if B_AGENCY
+    if BOUNDARY_PSAP_NAME_ESRK_COL
 
     else ""
 )
@@ -716,7 +1140,7 @@ boundary_raw = (
 
     boundary_raw.loc[
         boundary_raw[
-            "_NENA"
+            "_NENA_CANON"
         ].ne("")
         &
         boundary_raw[
@@ -728,75 +1152,71 @@ boundary_raw = (
 
 
 # =====================================================================
-# 6. BUILD ID CROSS-CHECK INDEXES
+# 6. VALIDATE NENA -> FCC RELATION
 # =====================================================================
 
-nena_ids = set(
-    boundary_raw[
-        "_NENA"
-    ]
-)
+nena_check = (
 
+    boundary_raw
 
-psap_to_nena = defaultdict(
-    set
-)
-
-
-fcc_to_nena = defaultdict(
-    set
-)
-
-
-for nena, psap_id, fcc_id in (
-
-    boundary_raw[
-        [
-            "_NENA",
-            "_PSAP",
-            "_FCC"
-        ]
-    ]
-
-    .itertuples(
-        index=False,
-        name=None
+    .groupby(
+        "_NENA_CANON"
     )
-):
 
-    if psap_id:
+    .agg(
 
-        psap_to_nena[
-            psap_id
-        ].add(
-            nena
+        FCC_COUNT=(
+            "_FCC_CANON",
+            "nunique"
+        ),
+
+        RAW_NENA_COUNT=(
+            "_NENA_RAW",
+            "nunique"
         )
+    )
+
+    .reset_index()
+)
 
 
-    if fcc_id:
+ambiguous_nena = (
 
-        fcc_to_nena[
-            fcc_id
-        ].add(
-            nena
-        )
+    nena_check.loc[
+        nena_check[
+            "FCC_COUNT"
+        ] > 1
+    ]
+)
+
+
+print(
+    "\nCanonical NENA IDs:",
+    f"{len(nena_check):,}"
+)
+
+
+print(
+    "NENA IDs with multiple FCC IDs:",
+    f"{len(ambiguous_nena):,}"
+)
 
 
 # =====================================================================
-# 7. DISSOLVE GEOMETRY BY NENA
+# 7. DISSOLVE POLYGONS BY NENA
 # =====================================================================
 
 boundary_geo = (
 
     boundary_raw[
         [
-            "_NENA",
+            "_NENA_CANON",
             "geometry"
         ]
     ]
 
     .dissolve(
-        by="_NENA",
+        by="_NENA_CANON",
         as_index=False
     )
 )
@@ -825,6 +1245,10 @@ boundary_geo = (
 )
 
 
+# IMPORTANT:
+# Use plain tuples because underscore-prefixed DataFrame columns
+# are unsafe as namedtuple attributes.
+
 boundary_by_nena = {
 
     nena:
@@ -833,7 +1257,7 @@ boundary_by_nena = {
     for nena, geometry
     in boundary_geo[
         [
-            "_NENA",
+            "_NENA_CANON",
             "geometry"
         ]
     ]
@@ -845,60 +1269,54 @@ boundary_by_nena = {
 
 
 # =====================================================================
-# 8. BOUNDARY METADATA BY NENA
+# 8. BUILD NENA METADATA
 # =====================================================================
 
-def first_nonempty(series):
-
-    for value in series:
-
-        value = clean_text(
-            value
-        )
-
-        if value:
-            return value
-
-    return ""
-
-
-meta = (
+boundary_meta = (
 
     boundary_raw
 
     .groupby(
-        "_NENA",
+        "_NENA_CANON",
         as_index=False
     )
 
     .agg(
-        {
 
-            "_PSAP":
-                first_nonempty,
+        NENA_ID_RAW=(
+            "_NENA_RAW",
+            first_nonempty
+        ),
 
-            "_FCC":
-                first_nonempty,
+        FCC_ID=(
+            "_FCC_CANON",
+            first_nonempty
+        ),
 
-            "_NAME_PSAP":
-                first_nonempty,
+        AGENCY=(
+            "_NAME_AGENCY",
+            first_nonempty
+        ),
 
-            "_NAME_ESRK":
-                first_nonempty,
+        PSAP_NAME=(
+            "_NAME_PSAP",
+            first_nonempty
+        ),
 
-            "_NAME_AGENCY":
-                first_nonempty,
-        }
+        PSAP_NAME_ESRK=(
+            "_NAME_ESRK",
+            first_nonempty
+        )
     )
 )
 
 
 meta_by_nena = (
 
-    meta
+    boundary_meta
 
     .set_index(
-        "_NENA"
+        "_NENA_CANON"
     )
 
     .to_dict(
@@ -907,14 +1325,54 @@ meta_by_nena = (
 )
 
 
+# =====================================================================
+# 9. BUILD FCC -> NENA INDEX
+# =====================================================================
+
+fcc_to_nena = defaultdict(
+    set
+)
+
+
+for nena, fcc in (
+
+    boundary_raw[
+        [
+            "_NENA_CANON",
+            "_FCC_CANON"
+        ]
+    ]
+
+    .drop_duplicates()
+
+    .itertuples(
+        index=False,
+        name=None
+    )
+):
+
+    if fcc:
+
+        fcc_to_nena[
+            fcc
+        ].add(
+            nena
+        )
+
+
 print(
-    "Usable PSAP polygons:",
+    "Usable routed polygons:",
     f"{len(boundary_by_nena):,}"
 )
 
 
 # =====================================================================
-# 9. ROUTED PSAP RESOLUTION — IDS ONLY
+# 10. ROUTED PSAP RESOLUTION
+#
+# GMLC.PSAP_ID -> Boundary.NENA_ID
+# GMLC.FCC_PSAP_ID -> Boundary.FCC_ID
+#
+# NO NAME MATCHING.
 # =====================================================================
 
 route_cache = {}
@@ -922,133 +1380,96 @@ route_cache = {}
 
 def resolve_routed_psap(
     gmlc_psap_id,
-    gmlc_fcc_id
+    gmlc_fcc_psap_id
 ):
 
-    psap = canonical_id(
+    psap_id = canonical_id(
         gmlc_psap_id
     )
 
 
-    fcc = canonical_id(
-        gmlc_fcc_id
+    fcc_id = canonical_id(
+        gmlc_fcc_psap_id
     )
 
 
-    key = (
-        psap,
-        fcc
+    cache_key = (
+        psap_id,
+        fcc_id
     )
 
 
-    if key in route_cache:
+    if cache_key in route_cache:
 
         return route_cache[
-            key
+            cache_key
         ]
 
 
+    chosen_nena = ""
+
+    status = (
+        "UNRESOLVED"
+    )
+
+    confidence = (
+        "UNRESOLVED"
+    )
+
+
     # -------------------------------------------------------------
-    # Signal 1:
-    # GMLC PSAP_ID == canonical Boundary NENA_ID
+    # PRIMARY:
+    #
+    # PSAP_ID canonical must exist as Boundary NENA_ID canonical.
     # -------------------------------------------------------------
 
-    nena_direct = (
+    psap_nena_match = (
 
-        {
-            psap
-        }
+        psap_id
 
         if (
-            psap
+            psap_id
             and
-            psap
-            in nena_ids
+            psap_id
+            in boundary_by_nena
         )
 
-        else set()
+        else ""
     )
 
-
-    # -------------------------------------------------------------
-    # Signal 2:
-    # GMLC PSAP_ID == Boundary.PSAP_ID
-    # -------------------------------------------------------------
-
-    psap_candidates = set(
-
-        psap_to_nena.get(
-            psap,
-            set()
-        )
-    )
-
-
-    # -------------------------------------------------------------
-    # Signal 3:
-    # GMLC FCC_PSAP_ID == Boundary FCC ID
-    # -------------------------------------------------------------
 
     fcc_candidates = set(
 
         fcc_to_nena.get(
-            fcc,
+            fcc_id,
             set()
         )
     )
 
 
-    # Combine the two PSAP-derived identity signals.
-    psap_identity_candidates = (
-
-        nena_direct
-
-        |
-
-        psap_candidates
-    )
-
-
-    chosen = ""
-
-    status = "UNRESOLVED"
-
-    confidence = "UNRESOLVED"
-
-
     # =============================================================
-    # Strongest:
-    # PSAP-derived identity + FCC all point to same NENA.
+    # PSAP_ID -> NENA works
     # =============================================================
 
-    if (
-        psap_identity_candidates
-        and
-        fcc_candidates
-    ):
+    if psap_nena_match:
 
-        both = (
+        # ---------------------------------------------------------
+        # FCC supplied and confirms same polygon
+        # ---------------------------------------------------------
 
-            psap_identity_candidates
+        if (
+            fcc_id
+            and
+            psap_nena_match
+            in fcc_candidates
+        ):
 
-            &
-
-            fcc_candidates
-        )
-
-
-        if len(
-            both
-        ) == 1:
-
-            chosen = next(
-                iter(
-                    both
-                )
+            chosen_nena = (
+                psap_nena_match
             )
 
             status = (
-                "PSAP_AND_FCC_CONFIRMED"
+                "PSAP_NENA_AND_FCC_CONFIRMED"
             )
 
             confidence = (
@@ -1056,161 +1477,198 @@ def resolve_routed_psap(
             )
 
 
+        # ---------------------------------------------------------
+        # FCC value provided but does not exist in boundary
+        #
+        # Keep exact PSAP->NENA match but flag FCC missing.
+        # ---------------------------------------------------------
+
+        elif (
+            fcc_id
+            and
+            not fcc_candidates
+        ):
+
+            chosen_nena = (
+                psap_nena_match
+            )
+
+            status = (
+                "PSAP_NENA_MATCH_FCC_NOT_FOUND"
+            )
+
+            confidence = (
+                "MEDIUM"
+            )
+
+
+        # ---------------------------------------------------------
+        # No GMLC FCC ID
+        # ---------------------------------------------------------
+
+        elif not fcc_id:
+
+            chosen_nena = (
+                psap_nena_match
+            )
+
+            status = (
+                "PSAP_NENA_MATCH_NO_FCC"
+            )
+
+            confidence = (
+                "MEDIUM"
+            )
+
+
+        # ---------------------------------------------------------
+        # FCC points somewhere ELSE.
+        #
+        # Do not choose the polygon.
+        # ---------------------------------------------------------
+
+        else:
+
+            chosen_nena = ""
+
+            status = (
+                "PSAP_NENA_VS_FCC_CONFLICT"
+            )
+
+            confidence = (
+                "UNRESOLVED"
+            )
+
+
+    # =============================================================
+    # PSAP_ID does NOT resolve to NENA
+    # =============================================================
+
+    else:
+
+        if (
+            ALLOW_FCC_ONLY_FALLBACK
+            and
+            len(
+                fcc_candidates
+            ) == 1
+        ):
+
+            chosen_nena = next(
+                iter(
+                    fcc_candidates
+                )
+            )
+
+            status = (
+                "FCC_UNIQUE_FALLBACK"
+            )
+
+            confidence = (
+                "LOWER"
+            )
+
+
         elif len(
-            both
+            fcc_candidates
         ) > 1:
 
             status = (
-                "MULTIPLE_ID_MATCHES"
+                "PSAP_NENA_NOT_FOUND_FCC_AMBIGUOUS"
+            )
+
+
+        elif len(
+            fcc_candidates
+        ) == 1:
+
+            status = (
+                "PSAP_NENA_NOT_FOUND_FCC_AVAILABLE_NOT_USED"
             )
 
 
         else:
 
             status = (
-                "PSAP_FCC_CONFLICT"
+                "PSAP_NENA_NOT_FOUND"
             )
-
-
-    # =============================================================
-    # No FCC match available, but both PSAP representations agree.
-    # =============================================================
-
-    elif len(
-        psap_identity_candidates
-    ) == 1:
-
-        chosen = next(
-            iter(
-                psap_identity_candidates
-            )
-        )
-
-        status = (
-            "PSAP_ID_ONLY_UNIQUE"
-        )
-
-        confidence = (
-            "MEDIUM"
-        )
-
-
-    # =============================================================
-    # FCC fallback only when it maps to one NENA.
-    # =============================================================
-
-    elif len(
-        fcc_candidates
-    ) == 1:
-
-        chosen = next(
-            iter(
-                fcc_candidates
-            )
-        )
-
-        status = (
-            "FCC_ONLY_UNIQUE"
-        )
-
-        confidence = (
-            "LOWER"
-        )
 
 
     metadata = (
 
         meta_by_nena.get(
-            chosen,
+            chosen_nena,
             {}
         )
 
-        if chosen
+        if chosen_nena
 
         else {}
     )
 
 
-    selected_name, selected_source = (
-        choose_boundary_name(
-
-            metadata.get(
-                "_NAME_PSAP",
-                ""
-            ),
-
-            metadata.get(
-                "_NAME_ESRK",
-                ""
-            ),
-
-            metadata.get(
-                "_NAME_AGENCY",
-                ""
-            )
+    routed_name, routed_name_source = (
+        primary_boundary_name(
+            metadata
         )
+    )
+
+
+    name_check = name_source_agreement(
+        {
+
+            "BOUNDARY.AGENCY":
+                metadata.get(
+                    "AGENCY",
+                    ""
+                ),
+
+            "BOUNDARY.PSAP_NAME":
+                metadata.get(
+                    "PSAP_NAME",
+                    ""
+                ),
+
+            "BOUNDARY.PSAP_NAME_ESRK":
+                metadata.get(
+                    "PSAP_NAME_ESRK",
+                    ""
+                ),
+        }
     )
 
 
     result = {
 
-        "ROUTED_NENA_ID":
-            chosen,
-
-        "ROUTED_BOUNDARY_PSAP_ID":
+        "ROUTED_NENA_ID_RAW":
             metadata.get(
-                "_PSAP",
+                "NENA_ID_RAW",
                 ""
             ),
 
-        "ROUTED_BOUNDARY_FCC_PSAP_ID":
+        # This is the boundary identity comparable to GMLC.PSAP_ID.
+        "ROUTED_PSAP_ID_DERIVED":
+            chosen_nena,
+
+        "ROUTED_FCC_ID":
             metadata.get(
-                "_FCC",
+                "FCC_ID",
                 ""
             ),
 
         "ROUTED_BOUNDARY_NAME":
-            selected_name,
+            routed_name,
 
         "ROUTED_BOUNDARY_NAME_SOURCE":
-            selected_source,
+            routed_name_source,
 
-        "ROUTED_BOUNDARY_NAME_PSAP_NAME":
-            metadata.get(
-                "_NAME_PSAP",
-                ""
-            ),
-
-        "ROUTED_BOUNDARY_NAME_PSAP_NAME_ESRK":
-            metadata.get(
-                "_NAME_ESRK",
-                ""
-            ),
-
-        "ROUTED_BOUNDARY_NAME_AGENCY":
-            metadata.get(
-                "_NAME_AGENCY",
-                ""
+        "ROUTED_BOUNDARY_NAME_SOURCES":
+            name_sources_string(
+                metadata
             ),
 
         "ROUTED_BOUNDARY_NAME_SOURCE_CHECK":
-            boundary_name_agreement(
-
-                metadata.get(
-                    "_NAME_PSAP",
-                    ""
-                ),
-
-                metadata.get(
-                    "_NAME_ESRK",
-                    ""
-                ),
-
-                metadata.get(
-                    "_NAME_AGENCY",
-                    ""
-                )
-            ),
+            name_check,
 
         "ROUTED_ID_STATUS":
             status,
@@ -1221,7 +1679,7 @@ def resolve_routed_psap(
 
 
     route_cache[
-        key
+        cache_key
     ] = result
 
 
@@ -1229,7 +1687,7 @@ def resolve_routed_psap(
 
 
 # =====================================================================
-# 10. SPATIAL JOIN -> EXPECTED PSAP
+# 11. EXPECTED PSAP FROM COORDINATE
 # =====================================================================
 
 def assign_expected_psap(
@@ -1249,63 +1707,49 @@ def assign_expected_psap(
     )
 
 
-    expected_nena = np.full(
+    nena_raw = np.full(
         n,
         "",
         dtype=object
     )
 
 
-    expected_psap = np.full(
+    psap_derived = np.full(
         n,
         "",
         dtype=object
     )
 
 
-    expected_fcc = np.full(
+    fcc_id = np.full(
         n,
         "",
         dtype=object
     )
 
 
-    selected_name = np.full(
+    primary_name = np.full(
         n,
         "",
         dtype=object
     )
 
 
-    selected_source = np.full(
+    primary_source = np.full(
         n,
         "",
         dtype=object
     )
 
 
-    name_psap = np.full(
+    all_name_sources = np.full(
         n,
         "",
         dtype=object
     )
 
 
-    name_esrk = np.full(
-        n,
-        "",
-        dtype=object
-    )
-
-
-    name_agency = np.full(
-        n,
-        "",
-        dtype=object
-    )
-
-
-    name_check = np.full(
+    source_check = np.full(
         n,
         "",
         dtype=object
@@ -1341,15 +1785,9 @@ def assign_expected_psap(
 
     valid = (
 
-        np.isfinite(
-            lat
-        )
-
+        np.isfinite(lat)
         &
-
-        np.isfinite(
-            lon
-        )
+        np.isfinite(lon)
 
         &
 
@@ -1388,36 +1826,55 @@ def assign_expected_psap(
         positions
     ) > 0:
 
-        point_df = pd.DataFrame(
-            {
+        # ---------------------------------------------------------
+        # Deduplicate coordinates before spatial join.
+        # ---------------------------------------------------------
 
-                "_POS":
-                    positions,
+        unique = (
 
-                "_LAT":
-                    lat[
-                        positions
-                    ],
+            pd.DataFrame(
+                {
 
-                "_LON":
-                    lon[
-                        positions
-                    ],
-            }
+                    "_LAT":
+                        lat[
+                            positions
+                        ],
+
+                    "_LON":
+                        lon[
+                            positions
+                        ],
+                }
+            )
+
+            .drop_duplicates()
+
+            .reset_index(
+                drop=True
+            )
+        )
+
+
+        unique[
+            "_POINT_ID"
+        ] = np.arange(
+            len(
+                unique
+            )
         )
 
 
         points = gpd.GeoDataFrame(
 
-            point_df,
+            unique,
 
             geometry=gpd.points_from_xy(
 
-                point_df[
+                unique[
                     "_LON"
                 ],
 
-                point_df[
+                unique[
                     "_LAT"
                 ]
             ),
@@ -1432,7 +1889,7 @@ def assign_expected_psap(
 
             boundary_geo[
                 [
-                    "_NENA",
+                    "_NENA_CANON",
                     "geometry"
                 ]
             ],
@@ -1443,23 +1900,53 @@ def assign_expected_psap(
         )
 
 
-        for pos, group in joined.groupby(
-            "_POS",
+        point_lookup = {}
+
+
+        for point_id, group in joined.groupby(
+            "_POINT_ID",
             sort=False
         ):
 
             ids = sorted(
                 {
 
-                    clean_text(x)
+                    clean_text(
+                        value
+                    )
 
-                    for x
+                    for value
                     in group[
-                        "_NENA"
+                        "_NENA_CANON"
                     ]
 
-                    if clean_text(x)
+                    if clean_text(
+                        value
+                    )
                 }
+            )
+
+
+            point_row = unique.loc[
+                int(
+                    point_id
+                )
+            ]
+
+
+            point_key = (
+
+                float(
+                    point_row[
+                        "_LAT"
+                    ]
+                ),
+
+                float(
+                    point_row[
+                        "_LON"
+                    ]
+                )
             )
 
 
@@ -1469,6 +1956,7 @@ def assign_expected_psap(
 
                 nena = ids[0]
 
+
                 metadata = (
                     meta_by_nena.get(
                         nena,
@@ -1477,179 +1965,257 @@ def assign_expected_psap(
                 )
 
 
-                selected, source = (
-                    choose_boundary_name(
-
-                        metadata.get(
-                            "_NAME_PSAP",
-                            ""
-                        ),
-
-                        metadata.get(
-                            "_NAME_ESRK",
-                            ""
-                        ),
-
-                        metadata.get(
-                            "_NAME_AGENCY",
-                            ""
-                        )
+                name, name_source = (
+                    primary_boundary_name(
+                        metadata
                     )
                 )
 
 
-                expected_nena[
-                    pos
-                ] = nena
+                point_lookup[
+                    point_key
+                ] = {
 
+                    "NENA_RAW":
+                        metadata.get(
+                            "NENA_ID_RAW",
+                            ""
+                        ),
 
-                expected_psap[
-                    pos
-                ] = metadata.get(
-                    "_PSAP",
-                    ""
-                )
+                    "PSAP":
+                        nena,
 
+                    "FCC":
+                        metadata.get(
+                            "FCC_ID",
+                            ""
+                        ),
 
-                expected_fcc[
-                    pos
-                ] = metadata.get(
-                    "_FCC",
-                    ""
-                )
+                    "NAME":
+                        name,
 
+                    "NAME_SOURCE":
+                        name_source,
 
-                selected_name[
-                    pos
-                ] = selected
+                    "NAME_SOURCES":
+                        name_sources_string(
+                            metadata
+                        ),
 
+                    "SOURCE_CHECK":
+                        name_source_agreement(
+                            {
 
-                selected_source[
-                    pos
-                ] = source
+                                "BOUNDARY.AGENCY":
+                                    metadata.get(
+                                        "AGENCY",
+                                        ""
+                                    ),
 
+                                "BOUNDARY.PSAP_NAME":
+                                    metadata.get(
+                                        "PSAP_NAME",
+                                        ""
+                                    ),
 
-                name_psap[
-                    pos
-                ] = metadata.get(
-                    "_NAME_PSAP",
-                    ""
-                )
+                                "BOUNDARY.PSAP_NAME_ESRK":
+                                    metadata.get(
+                                        "PSAP_NAME_ESRK",
+                                        ""
+                                    ),
+                            }
+                        ),
 
-
-                name_esrk[
-                    pos
-                ] = metadata.get(
-                    "_NAME_ESRK",
-                    ""
-                )
-
-
-                name_agency[
-                    pos
-                ] = metadata.get(
-                    "_NAME_AGENCY",
-                    ""
-                )
-
-
-                name_check[
-                    pos
-                ] = boundary_name_agreement(
-
-                    metadata.get(
-                        "_NAME_PSAP",
-                        ""
-                    ),
-
-                    metadata.get(
-                        "_NAME_ESRK",
-                        ""
-                    ),
-
-                    metadata.get(
-                        "_NAME_AGENCY",
-                        ""
-                    )
-                )
-
-
-                spatial_status[
-                    pos
-                ] = (
-                    "UNIQUE_PSAP"
-                )
+                    "STATUS":
+                        "UNIQUE_PSAP",
+                }
 
 
             elif len(
                 ids
             ) == 0:
 
-                spatial_status[
-                    pos
-                ] = (
-                    "NO_CONTAINING_PSAP"
-                )
+                point_lookup[
+                    point_key
+                ] = {
+
+                    "NENA_RAW":
+                        "",
+
+                    "PSAP":
+                        "",
+
+                    "FCC":
+                        "",
+
+                    "NAME":
+                        "",
+
+                    "NAME_SOURCE":
+                        "",
+
+                    "NAME_SOURCES":
+                        "",
+
+                    "SOURCE_CHECK":
+                        "NO_NAME_SOURCE",
+
+                    "STATUS":
+                        "NO_CONTAINING_PSAP",
+                }
 
 
             else:
 
-                expected_nena[
-                    pos
-                ] = "|".join(
-                    ids
-                )
+                point_lookup[
+                    point_key
+                ] = {
 
-                spatial_status[
-                    pos
-                ] = (
-                    "MULTIPLE_PSAP"
+                    "NENA_RAW":
+                        "",
+
+                    "PSAP":
+                        "|".join(
+                            ids
+                        ),
+
+                    "FCC":
+                        "",
+
+                    "NAME":
+                        "",
+
+                    "NAME_SOURCE":
+                        "",
+
+                    "NAME_SOURCES":
+                        "",
+
+                    "SOURCE_CHECK":
+                        "AMBIGUOUS",
+
+                    "STATUS":
+                        "MULTIPLE_PSAP",
+                }
+
+
+        # ---------------------------------------------------------
+        # Map result back
+        # ---------------------------------------------------------
+
+        for position in positions:
+
+            result = point_lookup.get(
+                (
+                    float(
+                        lat[
+                            position
+                        ]
+                    ),
+
+                    float(
+                        lon[
+                            position
+                        ]
+                    )
                 )
+            )
+
+
+            if result is None:
+
+                continue
+
+
+            nena_raw[
+                position
+            ] = result[
+                "NENA_RAW"
+            ]
+
+
+            psap_derived[
+                position
+            ] = result[
+                "PSAP"
+            ]
+
+
+            fcc_id[
+                position
+            ] = result[
+                "FCC"
+            ]
+
+
+            primary_name[
+                position
+            ] = result[
+                "NAME"
+            ]
+
+
+            primary_source[
+                position
+            ] = result[
+                "NAME_SOURCE"
+            ]
+
+
+            all_name_sources[
+                position
+            ] = result[
+                "NAME_SOURCES"
+            ]
+
+
+            source_check[
+                position
+            ] = result[
+                "SOURCE_CHECK"
+            ]
+
+
+            spatial_status[
+                position
+            ] = result[
+                "STATUS"
+            ]
 
 
     frame[
-        f"{prefix}_EXPECTED_NENA_ID"
-    ] = expected_nena
+        f"{prefix}_EXPECTED_NENA_ID_RAW"
+    ] = nena_raw
 
 
     frame[
         f"{prefix}_EXPECTED_PSAP_ID"
-    ] = expected_psap
+    ] = psap_derived
 
 
     frame[
-        f"{prefix}_EXPECTED_FCC_PSAP_ID"
-    ] = expected_fcc
+        f"{prefix}_EXPECTED_FCC_ID"
+    ] = fcc_id
 
 
     frame[
         f"{prefix}_EXPECTED_NAME"
-    ] = selected_name
+    ] = primary_name
 
 
     frame[
         f"{prefix}_EXPECTED_NAME_SOURCE"
-    ] = selected_source
+    ] = primary_source
 
 
     frame[
-        f"{prefix}_EXPECTED_NAME_FROM_PSAP_NAME"
-    ] = name_psap
-
-
-    frame[
-        f"{prefix}_EXPECTED_NAME_FROM_PSAP_NAME_ESRK"
-    ] = name_esrk
-
-
-    frame[
-        f"{prefix}_EXPECTED_NAME_FROM_AGENCY"
-    ] = name_agency
+        f"{prefix}_EXPECTED_NAME_SOURCES"
+    ] = all_name_sources
 
 
     frame[
         f"{prefix}_EXPECTED_NAME_SOURCE_CHECK"
-    ] = name_check
+    ] = source_check
 
 
     frame[
@@ -1661,17 +2227,19 @@ def assign_expected_psap(
 
 
 # =====================================================================
-# 11. BOUNDARY DISTANCE
+# 12. DISTANCE TO BOUNDARY
+#
+# METERS
 # =====================================================================
 
 HAS_VECTOR_SHAPELY = all(
 
     hasattr(
         shapely,
-        x
+        item
     )
 
-    for x in [
+    for item in [
 
         "points",
         "shortest_line",
@@ -1683,12 +2251,19 @@ HAS_VECTOR_SHAPELY = all(
 )
 
 
+print(
+    "Vectorized Shapely:",
+    HAS_VECTOR_SHAPELY
+)
+
+
 def add_boundary_distance(
     frame,
     lat_col,
     lon_col,
-    nena_col,
-    output_prefix
+    psap_id_col,
+    distance_col,
+    relation_col
 ):
 
     frame = frame.reset_index(
@@ -1723,7 +2298,7 @@ def add_boundary_distance(
 
     ids = (
         frame[
-            nena_col
+            psap_id_col
         ]
         .fillna("")
         .astype(str)
@@ -1761,36 +2336,55 @@ def add_boundary_distance(
         (lon >= -180)
         &
         (lon <= 180)
+
+        &
+
+        ~(
+            np.isclose(
+                lat,
+                0
+            )
+            &
+            np.isclose(
+                lon,
+                0
+            )
+        )
     )
 
 
     relation[
         valid
-    ] = "UNRESOLVED_BOUNDARY"
+    ] = (
+        "UNRESOLVED_BOUNDARY"
+    )
 
 
-    for nena in pd.unique(
+    unique_ids = pd.unique(
         ids[
             valid
             &
             (ids != "")
         ]
-    ):
+    )
 
-        if "|" in nena:
+
+    for psap_id in unique_ids:
+
+        if "|" in psap_id:
+
             continue
 
 
-        geometry = (
-            boundary_by_nena.get(
-                canonical_id(
-                    nena
-                )
+        geometry = boundary_by_nena.get(
+            canonical_id(
+                psap_id
             )
         )
 
 
         if geometry is None:
+
             continue
 
 
@@ -1803,7 +2397,7 @@ def add_boundary_distance(
             (
                 ids
                 ==
-                nena
+                psap_id
             )
         )
 
@@ -1811,6 +2405,7 @@ def add_boundary_distance(
         if len(
             idx
         ) == 0:
+
             continue
 
 
@@ -1836,23 +2431,23 @@ def add_boundary_distance(
             )
 
 
-            near = shapely.get_point(
+            nearest = shapely.get_point(
                 lines,
                 1
             )
 
 
-            near_lon = np.asarray(
+            nearest_lon = np.asarray(
                 shapely.get_x(
-                    near
+                    nearest
                 ),
                 dtype=float
             )
 
 
-            near_lat = np.asarray(
+            nearest_lat = np.asarray(
                 shapely.get_y(
-                    near
+                    nearest
                 ),
                 dtype=float
             )
@@ -1868,9 +2463,9 @@ def add_boundary_distance(
                     idx
                 ],
 
-                near_lon,
+                nearest_lon,
 
-                near_lat
+                nearest_lat
             )
 
 
@@ -1883,10 +2478,12 @@ def add_boundary_distance(
 
 
             inside = np.asarray(
+
                 shapely.covers(
                     geometry,
                     points
                 ),
+
                 dtype=bool
             )
 
@@ -1896,11 +2493,18 @@ def add_boundary_distance(
             ] = meters
 
 
+            boundary_mask = (
+                meters
+                <=
+                0.01
+            )
+
+
             relation[
                 idx
             ] = np.where(
 
-                meters <= 0.01,
+                boundary_mask,
 
                 "BOUNDARY",
 
@@ -1917,29 +2521,43 @@ def add_boundary_distance(
 
         else:
 
-            for pos in idx:
+            for position in idx:
 
                 point = Point(
-                    lon[pos],
-                    lat[pos]
+
+                    lon[
+                        position
+                    ],
+
+                    lat[
+                        position
+                    ]
                 )
 
 
                 try:
 
-                    _, near = nearest_points(
+                    _, nearest = nearest_points(
+
                         point,
+
                         geometry.boundary
                     )
 
 
                     _, _, meters = GEOD.inv(
 
-                        lon[pos],
-                        lat[pos],
+                        lon[
+                            position
+                        ],
 
-                        near.x,
-                        near.y
+                        lat[
+                            position
+                        ],
+
+                        nearest.x,
+
+                        nearest.y
                     )
 
 
@@ -1951,14 +2569,14 @@ def add_boundary_distance(
 
 
                     distance[
-                        pos
+                        position
                     ] = meters
 
 
                     if meters <= 0.01:
 
                         relation[
-                            pos
+                            position
                         ] = "BOUNDARY"
 
 
@@ -1967,33 +2585,33 @@ def add_boundary_distance(
                     ):
 
                         relation[
-                            pos
+                            position
                         ] = "INSIDE"
 
 
                     else:
 
                         relation[
-                            pos
+                            position
                         ] = "OUTSIDE"
 
 
                 except Exception:
 
                     relation[
-                        pos
+                        position
                     ] = (
                         "DISTANCE_ERROR"
                     )
 
 
     frame[
-        f"{output_prefix}_M"
+        distance_col
     ] = distance
 
 
     frame[
-        f"{output_prefix}_RELATION"
+        relation_col
     ] = relation
 
 
@@ -2001,7 +2619,9 @@ def add_boundary_distance(
 
 
 # =====================================================================
-# 12. CALLER <-> CELL DISTANCE
+# 13. CALLER <-> CELL DISTANCE
+#
+# METERS
 # =====================================================================
 
 def add_caller_cell_distance(
@@ -2085,7 +2705,9 @@ def add_caller_cell_distance(
 
 
     output = np.full(
-        len(frame),
+        len(
+            frame
+        ),
         np.nan
     )
 
@@ -2131,394 +2753,119 @@ def add_caller_cell_distance(
 
 
 # =====================================================================
-# 13. EXPECTED VS ROUTED COMPARISON
-# =====================================================================
-
-def add_comparison(
-    frame,
-    prefix
-):
-
-    routed_ids = (
-        frame[
-            "ROUTED_NENA_ID"
-        ]
-        .fillna("")
-        .astype(str)
-    )
-
-
-    expected_ids = (
-        frame[
-            f"{prefix}_EXPECTED_NENA_ID"
-        ]
-        .fillna("")
-        .astype(str)
-    )
-
-
-    id_status = np.where(
-
-        (
-            routed_ids.ne("")
-            &
-            expected_ids.ne("")
-            &
-            ~expected_ids.str.contains(
-                r"\|",
-                regex=True
-            )
-        ),
-
-        np.where(
-
-            routed_ids.map(
-                canonical_id
-            )
-            ==
-            expected_ids.map(
-                canonical_id
-            ),
-
-            "SAME",
-
-            "DIFFERENT"
-        ),
-
-        "UNRESOLVED"
-    )
-
-
-    frame[
-        f"{prefix}_EXPECTED_VS_ROUTED_ID"
-    ] = id_status
-
-
-    # -------------------------------------------------------------
-    # Expected NAME vs GMLC routed NAME
-    # -------------------------------------------------------------
-
-    name_status = []
-
-    matched_source = []
-
-
-    for _, row in frame.iterrows():
-
-        expected_name = clean_text(
-
-            row[
-                f"{prefix}_EXPECTED_NAME"
-            ]
-        )
-
-
-        gmlc_sources = [
-
-            (
-                "GMLC.ROUTE_PSAP_NAME",
-
-                clean_text(
-                    row.get(
-                        "ROUTE_PSAP_NAME",
-                        ""
-                    )
-                )
-            ),
-
-            (
-                "GMLC.PSAP_NAME",
-
-                clean_text(
-                    row.get(
-                        "PSAP_NAME",
-                        ""
-                    )
-                )
-            ),
-
-            (
-                "GMLC.PSAP_NAME_ESRK",
-
-                clean_text(
-                    row.get(
-                        "PSAP_NAME_ESRK",
-                        ""
-                    )
-                )
-            ),
-        ]
-
-
-        same_source = ""
-
-
-        for source, value in gmlc_sources:
-
-            if names_same(
-                expected_name,
-                value
-            ):
-
-                same_source = source
-
-                break
-
-
-        if not expected_name:
-
-            name_status.append(
-                "EXPECTED_NAME_MISSING"
-            )
-
-            matched_source.append(
-                ""
-            )
-
-
-        elif same_source:
-
-            name_status.append(
-                "SAME"
-            )
-
-            matched_source.append(
-                same_source
-            )
-
-
-        elif any(
-            value
-            for _, value
-            in gmlc_sources
-        ):
-
-            name_status.append(
-                "DIFFERENT"
-            )
-
-            matched_source.append(
-                ""
-            )
-
-
-        else:
-
-            name_status.append(
-                "GMLC_ROUTED_NAME_MISSING"
-            )
-
-            matched_source.append(
-                ""
-            )
-
-
-    frame[
-        f"{prefix}_EXPECTED_VS_ROUTED_NAME"
-    ] = name_status
-
-
-    frame[
-        f"{prefix}_ROUTED_NAME_MATCHED_SOURCE"
-    ] = matched_source
-
-
-    # -------------------------------------------------------------
-    # Combined useful status
-    # -------------------------------------------------------------
-
-    combined = []
-
-
-    for id_value, name_value in zip(
-
-        frame[
-            f"{prefix}_EXPECTED_VS_ROUTED_ID"
-        ],
-
-        frame[
-            f"{prefix}_EXPECTED_VS_ROUTED_NAME"
-        ]
-    ):
-
-        if (
-            id_value == "SAME"
-            and
-            name_value == "SAME"
-        ):
-
-            combined.append(
-                "SAME_ID_SAME_NAME"
-            )
-
-
-        elif (
-            id_value == "SAME"
-            and
-            name_value == "DIFFERENT"
-        ):
-
-            combined.append(
-                "SAME_ID_NAME_CONFLICT"
-            )
-
-
-        elif (
-            id_value == "DIFFERENT"
-            and
-            name_value == "SAME"
-        ):
-
-            combined.append(
-                "DIFFERENT_ID_SAME_NAME"
-            )
-
-
-        elif (
-            id_value == "DIFFERENT"
-            and
-            name_value == "DIFFERENT"
-        ):
-
-            combined.append(
-                "DIFFERENT_ID_DIFFERENT_NAME"
-            )
-
-
-        else:
-
-            combined.append(
-                "UNRESOLVED"
-            )
-
-
-    frame[
-        f"{prefix}_EXPECTED_VS_ROUTED_STATUS"
-    ] = combined
-
-
-    return frame
-
-
-# =====================================================================
 # 14. FILTER
 # =====================================================================
 
-def distance_filter(
+def make_distance_mask(
+    distance,
+    relation,
+    minimum,
+    maximum
+):
+
+    if (
+        minimum is None
+        and
+        maximum is None
+    ):
+
+        return None
+
+
+    distance = pd.to_numeric(
+        distance,
+        errors="coerce"
+    )
+
+
+    mask = (
+
+        distance.notna()
+
+        &
+
+        relation.eq(
+            "OUTSIDE"
+        )
+    )
+
+
+    if minimum is not None:
+
+        mask &= (
+            distance
+            >=
+            float(
+                minimum
+            )
+        )
+
+
+    if maximum is not None:
+
+        mask &= (
+            distance
+            <=
+            float(
+                maximum
+            )
+        )
+
+
+    return mask
+
+
+def apply_distance_filter(
     frame
 ):
 
-    masks = []
+    caller_mask = make_distance_mask(
+
+        frame[
+            "CALLER_TO_ROUTED_BOUNDARY_M"
+        ],
+
+        frame[
+            "CALLER_ROUTED_RELATION"
+        ],
+
+        MIN_CALLER_OUTSIDE_ROUTED_M,
+
+        MAX_CALLER_OUTSIDE_ROUTED_M
+    )
 
 
-    # CALLER
-    if (
-        MIN_CALLER_OUTSIDE_ROUTED_M is not None
-        or
-        MAX_CALLER_OUTSIDE_ROUTED_M is not None
-    ):
+    cell_mask = make_distance_mask(
 
-        values = pd.to_numeric(
+        frame[
+            "CELL_TO_ROUTED_BOUNDARY_M"
+        ],
 
-            frame[
-                "CALLER_TO_ROUTED_BOUNDARY_M"
-            ],
+        frame[
+            "CELL_ROUTED_RELATION"
+        ],
 
-            errors="coerce"
-        )
+        MIN_CELL_OUTSIDE_ROUTED_M,
 
-
-        mask = (
-
-            values.notna()
-
-            &
-
-            frame[
-                "CALLER_TO_ROUTED_RELATION"
-            ].eq(
-                "OUTSIDE"
-            )
-        )
+        MAX_CELL_OUTSIDE_ROUTED_M
+    )
 
 
-        if MIN_CALLER_OUTSIDE_ROUTED_M is not None:
+    masks = [
 
-            mask &= (
-                values
-                >=
-                MIN_CALLER_OUTSIDE_ROUTED_M
-            )
+        mask
 
+        for mask
+        in [
+            caller_mask,
+            cell_mask
+        ]
 
-        if MAX_CALLER_OUTSIDE_ROUTED_M is not None:
-
-            mask &= (
-                values
-                <=
-                MAX_CALLER_OUTSIDE_ROUTED_M
-            )
+        if mask is not None
+    ]
 
 
-        masks.append(
-            mask
-        )
-
-
-    # CELL
-    if (
-        MIN_CELL_OUTSIDE_ROUTED_M is not None
-        or
-        MAX_CELL_OUTSIDE_ROUTED_M is not None
-    ):
-
-        values = pd.to_numeric(
-
-            frame[
-                "CELL_TO_ROUTED_BOUNDARY_M"
-            ],
-
-            errors="coerce"
-        )
-
-
-        mask = (
-
-            values.notna()
-
-            &
-
-            frame[
-                "CELL_TO_ROUTED_RELATION"
-            ].eq(
-                "OUTSIDE"
-            )
-        )
-
-
-        if MIN_CELL_OUTSIDE_ROUTED_M is not None:
-
-            mask &= (
-                values
-                >=
-                MIN_CELL_OUTSIDE_ROUTED_M
-            )
-
-
-        if MAX_CELL_OUTSIDE_ROUTED_M is not None:
-
-            mask &= (
-                values
-                <=
-                MAX_CELL_OUTSIDE_ROUTED_M
-            )
-
-
-        masks.append(
-            mask
-        )
-
-
+    # Both disabled = no filtering.
     if not masks:
 
         return pd.Series(
@@ -2543,15 +2890,399 @@ def distance_filter(
         )
 
 
-    return (
-        masks[0]
-        |
-        masks[1]
+    if FILTER_MODE.upper() == "OR":
+
+        return (
+            masks[0]
+            |
+            masks[1]
+        )
+
+
+    raise ValueError(
+        "FILTER_MODE must be OR or AND."
     )
 
 
 # =====================================================================
-# 15. GMLC COLUMN CONTRACT
+# 15. EXPECTED VS ROUTED
+# =====================================================================
+
+def add_expected_comparison(
+    frame,
+    prefix
+):
+
+    # -------------------------------------------------------------
+    # ID comparison
+    # -------------------------------------------------------------
+
+    routed = (
+        frame[
+            "ROUTED_PSAP_ID_DERIVED"
+        ]
+        .fillna("")
+        .astype(str)
+        .map(
+            canonical_id
+        )
+    )
+
+
+    expected = (
+        frame[
+            f"{prefix}_EXPECTED_PSAP_ID"
+        ]
+        .fillna("")
+        .astype(str)
+    )
+
+
+    expected_canon = expected.map(
+        lambda x:
+
+            canonical_id(
+                x
+            )
+
+            if "|" not in x
+
+            else ""
+    )
+
+
+    frame[
+        f"{prefix}_EXPECTED_VS_ROUTED_ID"
+    ] = np.where(
+
+        (
+            routed.ne("")
+            &
+            expected_canon.ne("")
+        ),
+
+        np.where(
+
+            routed
+            ==
+            expected_canon,
+
+            "SAME",
+
+            "DIFFERENT"
+        ),
+
+        "UNRESOLVED"
+    )
+
+
+    # -------------------------------------------------------------
+    # Expected boundary metadata
+    # -------------------------------------------------------------
+
+    expected_boundary_names = []
+
+
+    for expected_id in expected:
+
+        expected_id = clean_text(
+            expected_id
+        )
+
+
+        if (
+            not expected_id
+            or
+            "|" in expected_id
+        ):
+
+            expected_boundary_names.append(
+                {}
+            )
+
+            continue
+
+
+        metadata = meta_by_nena.get(
+            canonical_id(
+                expected_id
+            ),
+            {}
+        )
+
+
+        expected_boundary_names.append(
+
+            boundary_name_dictionary(
+                metadata
+            )
+        )
+
+
+    # -------------------------------------------------------------
+    # Routed boundary names and GMLC routed names
+    # -------------------------------------------------------------
+
+    expected_vs_boundary = []
+
+    expected_vs_gmlc = []
+
+    match_sources = []
+
+
+    for row_position, (
+        _,
+        row
+    ) in enumerate(
+        frame.iterrows()
+    ):
+
+        expected_names = (
+            expected_boundary_names[
+                row_position
+            ]
+        )
+
+
+        routed_id = canonical_id(
+            row[
+                "ROUTED_PSAP_ID_DERIVED"
+            ]
+        )
+
+
+        routed_metadata = (
+            meta_by_nena.get(
+                routed_id,
+                {}
+            )
+        )
+
+
+        routed_boundary_names = (
+            boundary_name_dictionary(
+                routed_metadata
+            )
+        )
+
+
+        gmlc_names = (
+            gmlc_name_dictionary(
+                row
+            )
+        )
+
+
+        (
+            boundary_status,
+            boundary_match_source
+        ) = compare_name_sets(
+
+            expected_names,
+
+            routed_boundary_names
+        )
+
+
+        (
+            gmlc_status,
+            gmlc_match_source
+        ) = compare_name_sets(
+
+            expected_names,
+
+            gmlc_names
+        )
+
+
+        expected_vs_boundary.append(
+            boundary_status
+        )
+
+
+        expected_vs_gmlc.append(
+            gmlc_status
+        )
+
+
+        if gmlc_match_source:
+
+            match_sources.append(
+                gmlc_match_source
+            )
+
+        elif boundary_match_source:
+
+            match_sources.append(
+                boundary_match_source
+            )
+
+        else:
+
+            match_sources.append(
+                ""
+            )
+
+
+    frame[
+        f"{prefix}_EXPECTED_VS_ROUTED_BOUNDARY_NAME"
+    ] = expected_vs_boundary
+
+
+    frame[
+        f"{prefix}_EXPECTED_VS_GMLC_ROUTED_NAME"
+    ] = expected_vs_gmlc
+
+
+    frame[
+        f"{prefix}_NAME_MATCH_SOURCE"
+    ] = match_sources
+
+
+    # -------------------------------------------------------------
+    # Combined NAME status
+    #
+    # SAME if either:
+    #   expected boundary name == GMLC routed name
+    #
+    # or
+    #   expected boundary name == resolved routed boundary name
+    # -------------------------------------------------------------
+
+    combined_name_status = []
+
+
+    for boundary_status, gmlc_status in zip(
+
+        expected_vs_boundary,
+
+        expected_vs_gmlc
+    ):
+
+        if (
+            boundary_status == "SAME"
+            or
+            gmlc_status == "SAME"
+        ):
+
+            combined_name_status.append(
+                "SAME"
+            )
+
+
+        elif (
+            boundary_status == "DIFFERENT"
+            or
+            gmlc_status == "DIFFERENT"
+        ):
+
+            combined_name_status.append(
+                "DIFFERENT"
+            )
+
+
+        else:
+
+            combined_name_status.append(
+                "UNRESOLVED"
+            )
+
+
+    frame[
+        f"{prefix}_EXPECTED_VS_ROUTED_NAME"
+    ] = combined_name_status
+
+
+    # -------------------------------------------------------------
+    # FINAL status
+    # -------------------------------------------------------------
+
+    final_status = []
+
+
+    for id_status, name_status in zip(
+
+        frame[
+            f"{prefix}_EXPECTED_VS_ROUTED_ID"
+        ],
+
+        frame[
+            f"{prefix}_EXPECTED_VS_ROUTED_NAME"
+        ]
+    ):
+
+        if (
+            id_status == "SAME"
+            and
+            name_status == "SAME"
+        ):
+
+            final_status.append(
+                "SAME_ID_SAME_NAME"
+            )
+
+
+        elif (
+            id_status == "SAME"
+            and
+            name_status == "DIFFERENT"
+        ):
+
+            final_status.append(
+                "SAME_ID_NAME_CONFLICT"
+            )
+
+
+        elif (
+            id_status == "DIFFERENT"
+            and
+            name_status == "SAME"
+        ):
+
+            final_status.append(
+                "DIFFERENT_ID_SAME_NAME"
+            )
+
+
+        elif (
+            id_status == "DIFFERENT"
+            and
+            name_status == "DIFFERENT"
+        ):
+
+            final_status.append(
+                "DIFFERENT_ID_DIFFERENT_NAME"
+            )
+
+
+        elif (
+            id_status == "DIFFERENT"
+        ):
+
+            final_status.append(
+                "DIFFERENT_ID_NAME_UNRESOLVED"
+            )
+
+
+        else:
+
+            final_status.append(
+                "UNRESOLVED"
+            )
+
+
+    frame[
+        f"{prefix}_EXPECTED_VS_ROUTED_STATUS"
+    ] = final_status
+
+
+    return frame
+
+
+# =====================================================================
+# 16. READ GMLC HEADER
+#
+# NENA_ID IS INTENTIONALLY NOT REQUESTED.
 # =====================================================================
 
 gmlc_header = list(
@@ -2562,7 +3293,7 @@ gmlc_header = list(
 )
 
 
-G_PSAP = first_existing(
+GMLC_PSAP_COL = find_column(
 
     gmlc_header,
 
@@ -2574,7 +3305,7 @@ G_PSAP = first_existing(
 )
 
 
-G_FCC = first_existing(
+GMLC_FCC_COL = find_column(
 
     gmlc_header,
 
@@ -2586,7 +3317,7 @@ G_FCC = first_existing(
 )
 
 
-G_CALLER_LAT = first_existing(
+GMLC_CALLER_LAT = find_column(
 
     gmlc_header,
 
@@ -2598,7 +3329,7 @@ G_CALLER_LAT = first_existing(
 )
 
 
-G_CALLER_LON = first_existing(
+GMLC_CALLER_LON = find_column(
 
     gmlc_header,
 
@@ -2610,7 +3341,7 @@ G_CALLER_LON = first_existing(
 )
 
 
-G_CELL_LAT = first_existing(
+GMLC_CELL_LAT = find_column(
 
     gmlc_header,
 
@@ -2622,7 +3353,7 @@ G_CELL_LAT = first_existing(
 )
 
 
-G_CELL_LON = first_existing(
+GMLC_CELL_LON = find_column(
 
     gmlc_header,
 
@@ -2634,21 +3365,30 @@ G_CELL_LON = first_existing(
 )
 
 
-wanted = [
+# ---------------------------------------------------------------------
+# Useful GMLC columns only.
+# ---------------------------------------------------------------------
+
+wanted_columns = [
 
     "UNIQ911_CID",
 
     "CALL_BEGIN_TIME_UTC",
+
+    "CALL_DURATION_SEC",
 
     "MARKET",
     "STATE",
     "COUNTY",
 
     "PSAP_ID",
+
     "FCC_PSAP_ID",
 
     "ROUTE_PSAP_NAME",
+
     "PSAP_NAME",
+
     "PSAP_NAME_ESRK",
 
     "LATITUDE",
@@ -2659,41 +3399,64 @@ wanted = [
 ]
 
 
-gmlc_lookup = {
-    str(c).strip().upper():
-        c
-    for c in gmlc_header
+header_lookup = {
+
+    str(column)
+    .strip()
+    .upper():
+        column
+
+    for column
+    in gmlc_header
 }
 
 
 usecols = [
 
-    gmlc_lookup[
-        c
+    header_lookup[
+        column
     ]
 
-    for c in wanted
+    for column
+    in wanted_columns
 
-    if c in gmlc_lookup
+    if column in header_lookup
 ]
 
 
 # =====================================================================
-# 16. RUN FULL GMLC
+# 17. PREPARE OUTPUT
 # =====================================================================
 
 if OUTPUT_CSV.exists():
 
-    OUTPUT_CSV.unlink()
+    try:
+
+        OUTPUT_CSV.unlink()
+
+    except PermissionError:
+
+        raise PermissionError(
+            f"\nClose this file in Excel first:\n{OUTPUT_CSV}"
+        )
 
 
 header_written = False
 
-processed = 0
-saved = 0
+
+processed_rows = 0
+
+saved_rows = 0
 
 
-for chunk_no, chunk in enumerate(
+status_counter = Counter()
+
+
+# =====================================================================
+# 18. PROCESS WHOLE GMLC
+# =====================================================================
+
+for chunk_number, chunk in enumerate(
 
     pd.read_csv(
 
@@ -2714,18 +3477,32 @@ for chunk_no, chunk in enumerate(
 ):
 
     chunk.columns = [
-        str(c).strip().upper()
-        for c in chunk.columns
+
+        str(column)
+        .strip()
+        .upper()
+
+        for column
+        in chunk.columns
     ]
 
+
+    chunk = chunk.reset_index(
+        drop=True
+    )
+
+
+    # -------------------------------------------------------------
+    # Source row
+    # -------------------------------------------------------------
 
     chunk[
         "SOURCE_GMLC_ROW_ID"
     ] = np.arange(
 
-        processed + 1,
+        processed_rows + 1,
 
-        processed
+        processed_rows
         + len(chunk)
         + 1,
 
@@ -2733,17 +3510,17 @@ for chunk_no, chunk in enumerate(
     )
 
 
-    processed += len(
+    processed_rows += len(
         chunk
     )
 
 
     # =============================================================
-    # GMLC routed values
+    # GMLC IDs
     # =============================================================
 
     chunk[
-        "ROUTED_GMLC_PSAP_ID"
+        "GMLC_PSAP_ID"
     ] = (
         chunk[
             "PSAP_ID"
@@ -2755,7 +3532,7 @@ for chunk_no, chunk in enumerate(
 
 
     chunk[
-        "ROUTED_GMLC_FCC_PSAP_ID"
+        "GMLC_FCC_PSAP_ID"
     ] = (
         chunk[
             "FCC_PSAP_ID"
@@ -2766,15 +3543,19 @@ for chunk_no, chunk in enumerate(
     )
 
 
+    # =============================================================
+    # GMLC routed name
+    # =============================================================
+
     chunk[
-        "ROUTED_GMLC_PSAP_NAME"
+        "GMLC_ROUTED_NAME"
     ] = ""
 
 
     if "ROUTE_PSAP_NAME" in chunk.columns:
 
         chunk[
-            "ROUTED_GMLC_PSAP_NAME"
+            "GMLC_ROUTED_NAME"
         ] = (
             chunk[
                 "ROUTE_PSAP_NAME"
@@ -2789,19 +3570,21 @@ for chunk_no, chunk in enumerate(
 
         missing = (
             chunk[
-                "ROUTED_GMLC_PSAP_NAME"
+                "GMLC_ROUTED_NAME"
             ].eq("")
         )
 
 
         chunk.loc[
             missing,
-            "ROUTED_GMLC_PSAP_NAME"
+            "GMLC_ROUTED_NAME"
         ] = (
+
             chunk.loc[
                 missing,
                 "PSAP_NAME"
             ]
+
             .fillna("")
             .astype(str)
             .str.strip()
@@ -2809,24 +3592,10 @@ for chunk_no, chunk in enumerate(
 
 
     # =============================================================
-    # Resolve routed polygon BY IDS ONLY
+    # Resolve routed polygon BY IDs ONLY
     # =============================================================
 
-    route_keys = list(
-        zip(
-
-            chunk[
-                "PSAP_ID"
-            ],
-
-            chunk[
-                "FCC_PSAP_ID"
-            ]
-        )
-    )
-
-
-    resolved = [
+    route_results = [
 
         resolve_routed_psap(
             psap_id,
@@ -2834,12 +3603,21 @@ for chunk_no, chunk in enumerate(
         )
 
         for psap_id, fcc_id
-        in route_keys
+        in zip(
+
+            chunk[
+                "GMLC_PSAP_ID"
+            ],
+
+            chunk[
+                "GMLC_FCC_PSAP_ID"
+            ]
+        )
     ]
 
 
-    resolved_df = pd.DataFrame(
-        resolved,
+    route_df = pd.DataFrame(
+        route_results,
         index=chunk.index
     )
 
@@ -2847,65 +3625,96 @@ for chunk_no, chunk in enumerate(
     chunk = pd.concat(
         [
             chunk,
-            resolved_df
+            route_df
         ],
         axis=1
     )
 
 
     # =============================================================
-    # Routed NAME QA only
+    # Routed GMLC name vs resolved boundary names
+    #
+    # QA ONLY.
     # =============================================================
 
-    chunk[
-        "ROUTED_GMLC_NAME_VS_BOUNDARY_NAME"
-    ] = [
+    routed_gmlc_vs_boundary = []
 
-        (
-            "SAME"
+    routed_name_match_source = []
 
-            if names_same(
-                gmlc_name,
-                boundary_name
-            )
 
-            else (
-                "DIFFERENT"
+    for _, row in chunk.iterrows():
 
-                if (
-                    clean_text(gmlc_name)
-                    and
-                    clean_text(boundary_name)
-                )
-
-                else "NAME_MISSING"
+        gmlc_names = (
+            gmlc_name_dictionary(
+                row
             )
         )
 
-        for gmlc_name, boundary_name
-        in zip(
 
-            chunk[
-                "ROUTED_GMLC_PSAP_NAME"
-            ],
-
-            chunk[
-                "ROUTED_BOUNDARY_NAME"
+        routed_psap = canonical_id(
+            row[
+                "ROUTED_PSAP_ID_DERIVED"
             ]
         )
-    ]
+
+
+        metadata = meta_by_nena.get(
+            routed_psap,
+            {}
+        )
+
+
+        boundary_names = (
+            boundary_name_dictionary(
+                metadata
+            )
+        )
+
+
+        status, source = compare_name_sets(
+
+            boundary_names,
+
+            gmlc_names
+        )
+
+
+        routed_gmlc_vs_boundary.append(
+            status
+        )
+
+
+        routed_name_match_source.append(
+            source
+        )
+
+
+    chunk[
+        "ROUTED_GMLC_VS_BOUNDARY_NAME"
+    ] = (
+        routed_gmlc_vs_boundary
+    )
+
+
+    chunk[
+        "ROUTED_NAME_MATCH_SOURCE"
+    ] = (
+        routed_name_match_source
+    )
 
 
     # =============================================================
-    # Caller / Cell coordinates
+    # Coordinates
     # =============================================================
 
     chunk[
         "CALLER_LATITUDE"
     ] = pd.to_numeric(
+
         chunk[
             "LATITUDE"
         ],
+
         errors="coerce"
     )
 
@@ -2913,9 +3722,11 @@ for chunk_no, chunk in enumerate(
     chunk[
         "CALLER_LONGITUDE"
     ] = pd.to_numeric(
+
         chunk[
             "LONGITUDE"
         ],
+
         errors="coerce"
     )
 
@@ -2923,9 +3734,11 @@ for chunk_no, chunk in enumerate(
     chunk[
         "CELL_LATITUDE_USED"
     ] = pd.to_numeric(
+
         chunk[
             "CELL_LATITUDE"
         ],
+
         errors="coerce"
     )
 
@@ -2933,15 +3746,17 @@ for chunk_no, chunk in enumerate(
     chunk[
         "CELL_LONGITUDE_USED"
     ] = pd.to_numeric(
+
         chunk[
             "CELL_LONGITUDE"
         ],
+
         errors="coerce"
     )
 
 
     # =============================================================
-    # Distance Caller -> Routed
+    # Caller -> routed
     # =============================================================
 
     chunk = add_boundary_distance(
@@ -2952,14 +3767,16 @@ for chunk_no, chunk in enumerate(
 
         "CALLER_LONGITUDE",
 
-        "ROUTED_NENA_ID",
+        "ROUTED_PSAP_ID_DERIVED",
 
-        "CALLER_TO_ROUTED_BOUNDARY"
+        "CALLER_TO_ROUTED_BOUNDARY_M",
+
+        "CALLER_ROUTED_RELATION"
     )
 
 
     # =============================================================
-    # Distance Cell -> Routed
+    # Cell -> routed
     # =============================================================
 
     chunk = add_boundary_distance(
@@ -2970,9 +3787,11 @@ for chunk_no, chunk in enumerate(
 
         "CELL_LONGITUDE_USED",
 
-        "ROUTED_NENA_ID",
+        "ROUTED_PSAP_ID_DERIVED",
 
-        "CELL_TO_ROUTED_BOUNDARY"
+        "CELL_TO_ROUTED_BOUNDARY_M",
+
+        "CELL_ROUTED_RELATION"
     )
 
 
@@ -2989,16 +3808,19 @@ for chunk_no, chunk in enumerate(
     # EARLY FILTER
     # =============================================================
 
-    keep = distance_filter(
+    keep = apply_distance_filter(
         chunk
     )
 
 
     candidate = (
+
         chunk.loc[
             keep
         ]
+
         .copy()
+
         .reset_index(
             drop=True
         )
@@ -3008,16 +3830,16 @@ for chunk_no, chunk in enumerate(
     if candidate.empty:
 
         print(
-            f"Chunk {chunk_no:03d} | "
-            f"processed {processed:,} | "
-            "saved 0"
+            f"Chunk {chunk_number:03d} | "
+            f"processed {processed_rows:,} | "
+            f"saved {saved_rows:,}"
         )
 
         continue
 
 
     # =============================================================
-    # Expected PSAP — Caller
+    # CALLER EXPECTED PSAP
     # =============================================================
 
     candidate = assign_expected_psap(
@@ -3033,7 +3855,7 @@ for chunk_no, chunk in enumerate(
 
 
     # =============================================================
-    # Expected PSAP — Cell
+    # CELL EXPECTED PSAP
     # =============================================================
 
     candidate = assign_expected_psap(
@@ -3049,7 +3871,7 @@ for chunk_no, chunk in enumerate(
 
 
     # =============================================================
-    # Distances to expected PSAP
+    # Caller -> expected boundary
     # =============================================================
 
     candidate = add_boundary_distance(
@@ -3060,11 +3882,17 @@ for chunk_no, chunk in enumerate(
 
         "CALLER_LONGITUDE",
 
-        "CALLER_EXPECTED_NENA_ID",
+        "CALLER_EXPECTED_PSAP_ID",
 
-        "CALLER_TO_EXPECTED_BOUNDARY"
+        "CALLER_TO_EXPECTED_BOUNDARY_M",
+
+        "CALLER_EXPECTED_RELATION"
     )
 
+
+    # =============================================================
+    # Cell -> expected boundary
+    # =============================================================
 
     candidate = add_boundary_distance(
 
@@ -3074,17 +3902,19 @@ for chunk_no, chunk in enumerate(
 
         "CELL_LONGITUDE_USED",
 
-        "CELL_EXPECTED_NENA_ID",
+        "CELL_EXPECTED_PSAP_ID",
 
-        "CELL_TO_EXPECTED_BOUNDARY"
+        "CELL_TO_EXPECTED_BOUNDARY_M",
+
+        "CELL_EXPECTED_RELATION"
     )
 
 
     # =============================================================
-    # Expected vs Routed comparison
+    # Caller expected vs routed
     # =============================================================
 
-    candidate = add_comparison(
+    candidate = add_expected_comparison(
 
         candidate,
 
@@ -3092,7 +3922,11 @@ for chunk_no, chunk in enumerate(
     )
 
 
-    candidate = add_comparison(
+    # =============================================================
+    # Cell expected vs routed
+    # =============================================================
+
+    candidate = add_expected_comparison(
 
         candidate,
 
@@ -3100,7 +3934,11 @@ for chunk_no, chunk in enumerate(
     )
 
 
-    if ONLY_EXPECTED_DIFFERENT:
+    # =============================================================
+    # Optional final expected-ID filter
+    # =============================================================
+
+    if ONLY_CALLER_EXPECTED_DIFFERENT:
 
         candidate = candidate.loc[
             candidate[
@@ -3113,17 +3951,18 @@ for chunk_no, chunk in enumerate(
 
 
     if candidate.empty:
+
         continue
 
 
     # =================================================================
-    # CLEAN REPORT ONLY
+    # CLEAN REPORT
     # =================================================================
 
     clean_columns = [
 
         # ---------------------------------------------------------
-        # Call
+        # CALL
         # ---------------------------------------------------------
 
         "SOURCE_GMLC_ROW_ID",
@@ -3132,36 +3971,34 @@ for chunk_no, chunk in enumerate(
 
         "CALL_BEGIN_TIME_UTC",
 
+        "CALL_DURATION_SEC",
+
         "MARKET",
         "STATE",
         "COUNTY",
 
 
         # ---------------------------------------------------------
-        # ROUTED PSAP
+        # ROUTED
         # ---------------------------------------------------------
 
-        "ROUTED_GMLC_PSAP_ID",
+        "GMLC_PSAP_ID",
 
-        "ROUTED_GMLC_FCC_PSAP_ID",
+        "GMLC_FCC_PSAP_ID",
 
-        "ROUTED_GMLC_PSAP_NAME",
+        "GMLC_ROUTED_NAME",
 
-        "ROUTED_NENA_ID",
+        "ROUTED_NENA_ID_RAW",
 
-        "ROUTED_BOUNDARY_PSAP_ID",
+        "ROUTED_PSAP_ID_DERIVED",
 
-        "ROUTED_BOUNDARY_FCC_PSAP_ID",
+        "ROUTED_FCC_ID",
 
         "ROUTED_BOUNDARY_NAME",
 
         "ROUTED_BOUNDARY_NAME_SOURCE",
 
-        "ROUTED_BOUNDARY_NAME_PSAP_NAME",
-
-        "ROUTED_BOUNDARY_NAME_PSAP_NAME_ESRK",
-
-        "ROUTED_BOUNDARY_NAME_AGENCY",
+        "ROUTED_BOUNDARY_NAME_SOURCES",
 
         "ROUTED_BOUNDARY_NAME_SOURCE_CHECK",
 
@@ -3169,7 +4006,9 @@ for chunk_no, chunk in enumerate(
 
         "ROUTED_ID_CONFIDENCE",
 
-        "ROUTED_GMLC_NAME_VS_BOUNDARY_NAME",
+        "ROUTED_GMLC_VS_BOUNDARY_NAME",
+
+        "ROUTED_NAME_MATCH_SOURCE",
 
 
         # ---------------------------------------------------------
@@ -3180,37 +4019,43 @@ for chunk_no, chunk in enumerate(
 
         "CALLER_LONGITUDE",
 
-        "CALLER_TO_ROUTED_BOUNDARY_RELATION",
+        "CALLER_ROUTED_RELATION",
 
         "CALLER_TO_ROUTED_BOUNDARY_M",
 
 
-        # Caller expected PSAP
-        "CALLER_EXPECTED_NENA_ID",
+        # Caller expected
+        "CALLER_EXPECTED_NENA_ID_RAW",
 
         "CALLER_EXPECTED_PSAP_ID",
 
-        "CALLER_EXPECTED_FCC_PSAP_ID",
+        "CALLER_EXPECTED_FCC_ID",
 
         "CALLER_EXPECTED_NAME",
 
         "CALLER_EXPECTED_NAME_SOURCE",
 
-        "CALLER_EXPECTED_NAME_FROM_PSAP_NAME",
-
-        "CALLER_EXPECTED_NAME_FROM_PSAP_NAME_ESRK",
-
-        "CALLER_EXPECTED_NAME_FROM_AGENCY",
+        "CALLER_EXPECTED_NAME_SOURCES",
 
         "CALLER_EXPECTED_NAME_SOURCE_CHECK",
 
+        "CALLER_EXPECTED_SPATIAL_STATUS",
+
+        "CALLER_TO_EXPECTED_BOUNDARY_M",
+
+        "CALLER_EXPECTED_RELATION",
+
         "CALLER_EXPECTED_VS_ROUTED_ID",
+
+        "CALLER_EXPECTED_VS_ROUTED_BOUNDARY_NAME",
+
+        "CALLER_EXPECTED_VS_GMLC_ROUTED_NAME",
 
         "CALLER_EXPECTED_VS_ROUTED_NAME",
 
-        "CALLER_EXPECTED_VS_ROUTED_STATUS",
+        "CALLER_NAME_MATCH_SOURCE",
 
-        "CALLER_TO_EXPECTED_BOUNDARY_M",
+        "CALLER_EXPECTED_VS_ROUTED_STATUS",
 
 
         # ---------------------------------------------------------
@@ -3221,37 +4066,43 @@ for chunk_no, chunk in enumerate(
 
         "CELL_LONGITUDE_USED",
 
-        "CELL_TO_ROUTED_BOUNDARY_RELATION",
+        "CELL_ROUTED_RELATION",
 
         "CELL_TO_ROUTED_BOUNDARY_M",
 
 
-        # Cell expected PSAP
-        "CELL_EXPECTED_NENA_ID",
+        # Cell expected
+        "CELL_EXPECTED_NENA_ID_RAW",
 
         "CELL_EXPECTED_PSAP_ID",
 
-        "CELL_EXPECTED_FCC_PSAP_ID",
+        "CELL_EXPECTED_FCC_ID",
 
         "CELL_EXPECTED_NAME",
 
         "CELL_EXPECTED_NAME_SOURCE",
 
-        "CELL_EXPECTED_NAME_FROM_PSAP_NAME",
-
-        "CELL_EXPECTED_NAME_FROM_PSAP_NAME_ESRK",
-
-        "CELL_EXPECTED_NAME_FROM_AGENCY",
+        "CELL_EXPECTED_NAME_SOURCES",
 
         "CELL_EXPECTED_NAME_SOURCE_CHECK",
 
+        "CELL_EXPECTED_SPATIAL_STATUS",
+
+        "CELL_TO_EXPECTED_BOUNDARY_M",
+
+        "CELL_EXPECTED_RELATION",
+
         "CELL_EXPECTED_VS_ROUTED_ID",
+
+        "CELL_EXPECTED_VS_ROUTED_BOUNDARY_NAME",
+
+        "CELL_EXPECTED_VS_GMLC_ROUTED_NAME",
 
         "CELL_EXPECTED_VS_ROUTED_NAME",
 
-        "CELL_EXPECTED_VS_ROUTED_STATUS",
+        "CELL_NAME_MATCH_SOURCE",
 
-        "CELL_TO_EXPECTED_BOUNDARY_M",
+        "CELL_EXPECTED_VS_ROUTED_STATUS",
 
 
         # ---------------------------------------------------------
@@ -3263,9 +4114,14 @@ for chunk_no, chunk in enumerate(
 
 
     clean_columns = [
-        c
-        for c in clean_columns
-        if c in candidate.columns
+
+        column
+
+        for column
+        in clean_columns
+
+        if column
+        in candidate.columns
     ]
 
 
@@ -3277,7 +4133,10 @@ for chunk_no, chunk in enumerate(
     )
 
 
-    # Numeric fields exported as actual numbers.
+    # =============================================================
+    # Numeric dtypes
+    # =============================================================
+
     for column in output.columns:
 
         if (
@@ -3304,6 +4163,28 @@ for chunk_no, chunk in enumerate(
             )
 
 
+    # =============================================================
+    # Summary count
+    # =============================================================
+
+    status_counter.update(
+
+        output[
+            "CALLER_EXPECTED_VS_ROUTED_STATUS"
+        ]
+
+        .value_counts(
+            dropna=False
+        )
+
+        .to_dict()
+    )
+
+
+    # =============================================================
+    # SAVE
+    # =============================================================
+
     output.to_csv(
 
         OUTPUT_CSV,
@@ -3326,24 +4207,79 @@ for chunk_no, chunk in enumerate(
 
     header_written = True
 
-    saved += len(
+
+    saved_rows += len(
         output
     )
 
 
     print(
-        f"Chunk {chunk_no:03d} | "
-        f"processed {processed:,} | "
-        f"total saved {saved:,}"
+        f"Chunk {chunk_number:03d} | "
+        f"processed {processed_rows:,} | "
+        f"saved {saved_rows:,}"
     )
 
 
 # =====================================================================
-# 17. FINISH
+# 19. SMALL SUMMARY
+# =====================================================================
+
+summary = pd.DataFrame(
+
+    [
+
+        {
+
+            "CALLER_EXPECTED_VS_ROUTED_STATUS":
+                status,
+
+            "CALLS":
+                count
+        }
+
+        for status, count
+        in status_counter.items()
+    ]
+)
+
+
+if not summary.empty:
+
+    summary[
+        "PCT"
+    ] = (
+
+        100.0
+
+        * summary[
+            "CALLS"
+        ]
+
+        / max(
+            saved_rows,
+            1
+        )
+    )
+
+
+    summary = summary.sort_values(
+        "CALLS",
+        ascending=False
+    )
+
+
+summary.to_csv(
+    SUMMARY_CSV,
+    index=False
+)
+
+
+# =====================================================================
+# 20. FINAL OUTPUT
 # =====================================================================
 
 print(
-    "\n=============================================="
+    "\n============================================================"
 )
 
 print(
@@ -3351,24 +4287,24 @@ print(
 )
 
 print(
-    "=============================================="
+    "============================================================"
 )
 
 
 print(
-    "Rows processed:",
-    f"{processed:,}"
+    "Full GMLC rows processed:",
+    f"{processed_rows:,}"
 )
 
 
 print(
-    "Rows in clean report:",
-    f"{saved:,}"
+    "Rows saved in clean report:",
+    f"{saved_rows:,}"
 )
 
 
 print(
-    "\nSaved:"
+    "\nMain clean report:"
 )
 
 print(
@@ -3377,15 +4313,62 @@ print(
 
 
 print(
-    "\nGMLC NENA_ID was NOT used."
+    "\nSummary:"
+)
+
+print(
+    SUMMARY_CSV
 )
 
 
 print(
-    "Boundary selection used PSAP_ID + FCC_PSAP_ID / FCC_ID cross-check."
+    "\nCaller filter:"
+)
+
+print(
+    MIN_CALLER_OUTSIDE_ROUTED_M,
+    "to",
+    MAX_CALLER_OUTSIDE_ROUTED_M,
+    "meters OUTSIDE"
 )
 
 
 print(
-    "Boundary names were used only for QA/reporting."
+    "\nCell filter:"
+)
+
+print(
+    MIN_CELL_OUTSIDE_ROUTED_M,
+    "to",
+    MAX_CELL_OUTSIDE_ROUTED_M,
+    "meters OUTSIDE"
+)
+
+
+print(
+    "\nIMPORTANT:"
+)
+
+print(
+    " - GMLC NENA_ID was NOT requested or used."
+)
+
+print(
+    " - Boundary PSAP_ID was NOT requested or used."
+)
+
+print(
+    " - GMLC.PSAP_ID is compared with Boundary.NENA_ID."
+)
+
+print(
+    " - GMLC.FCC_PSAP_ID confirms against Boundary.FCC_ID."
+)
+
+print(
+    " - Names never select a polygon."
+)
+
+print(
+    " - Expected names are checked across all available boundary name sources."
 )
