@@ -1,0 +1,520 @@
+# =====================================================================
+# GMLC PSAP-NAME + DISTANCE SEMANTICS AUDIT v1
+# =====================================================================
+# Answers:
+# 1) Does ROUTE_PSAP_NAME behave like ROUTED or EXPECTED PSAP?
+# 2) Does PSAP_NAME behave like ROUTED or EXPECTED PSAP?
+# 3) Same analysis for Caller and Cell expected PSAPs.
+# 4) Do GMLC distance fields correspond to our geographic measurements?
+#
+# IMPORTANT:
+# Names are used here ONLY to understand GMLC field semantics.
+# Misroute truth remains ID + polygon based.
+# =====================================================================
+
+from pathlib import Path
+from difflib import SequenceMatcher
+import re
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+DATA_DIR = Path(r"C:\temp\gmlc_v2")
+OUT_DIR = DATA_DIR / "outputs_psap_rca_v5"
+
+INPUT_CSV = OUT_DIR / "psap_three_location_crosscheck_v9.csv"
+
+ROW_OUTPUT = OUT_DIR / "gmlc_psap_name_semantics_rows_v1.csv"
+SUMMARY_OUTPUT = OUT_DIR / "gmlc_psap_name_semantics_summary_v1.csv"
+DIST_OUTPUT = OUT_DIR / "gmlc_distance_semantics_summary_v1.csv"
+
+SIMILAR_THRESHOLD = 0.85
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def norm_name(x):
+    if x is None or pd.isna(x):
+        return ""
+    x = str(x).upper().strip()
+    x = re.sub(r"[^A-Z0-9 ]+", " ", x)
+    return re.sub(r"\s+", " ", x).strip()
+
+def similarity(a, b):
+    a, b = norm_name(a), norm_name(b)
+    if not a or not b:
+        return np.nan
+    return SequenceMatcher(None, a, b).ratio()
+
+def compare_name(a, b):
+    score = similarity(a, b)
+    if pd.isna(score):
+        return "UNRESOLVED"
+    if score == 1:
+        return "SAME"
+    if score >= SIMILAR_THRESHOLD:
+        return "SIMILAR"
+    return "DIFFERENT"
+
+def matched(status):
+    return status in {"SAME", "SIMILAR"}
+
+def pick_existing(df, choices):
+    for c in choices:
+        if c in df.columns:
+            return c
+    return None
+
+def num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+# =====================================================================
+# 2. READ V9 OUTPUT
+# =====================================================================
+
+df = pd.read_csv(INPUT_CSV, dtype="string", low_memory=False)
+
+route_name_col = pick_existing(df, [
+    "ROUTE_PSAP_NAME",
+    "ROUTED_NAME_GMLC_ROUTE_PSAP_NAME",
+    "ROUTED_NAME_GMLC",
+])
+
+psap_name_col = pick_existing(df, [
+    "PSAP_NAME",
+    "ROUTED_NAME_GMLC_PSAP_NAME",
+])
+
+if route_name_col is None:
+    raise RuntimeError("ROUTE_PSAP_NAME not found in v9 output.")
+
+if psap_name_col is None:
+    raise RuntimeError("PSAP_NAME not found in v9 output.")
+
+df["GMLC_ROUTE_PSAP_NAME"] = df[route_name_col]
+df["GMLC_PSAP_NAME"] = df[psap_name_col]
+
+print("ROUTE_PSAP_NAME source:", route_name_col)
+print("PSAP_NAME source      :", psap_name_col)
+print("Rows                  :", f"{len(df):,}")
+
+
+# =====================================================================
+# 3. NAME COMPARISONS
+# =====================================================================
+
+targets = {
+    "ROUTED": "ROUTED_AGENCY_BOUNDARY",
+    "CALLER_EXPECTED": "CALLER_EXPECTED_AGENCY_BOUNDARY",
+    "CELL_EXPECTED": "CELL_EXPECTED_AGENCY_BOUNDARY",
+}
+
+sources = {
+    "ROUTE_PSAP_NAME": "GMLC_ROUTE_PSAP_NAME",
+    "PSAP_NAME": "GMLC_PSAP_NAME",
+}
+
+for source_label, source_col in sources.items():
+    for target_label, target_col in targets.items():
+        if target_col not in df.columns:
+            df[target_col] = pd.NA
+
+        status_col = f"{source_label}_VS_{target_label}_NAME"
+        score_col = f"{source_label}_VS_{target_label}_SCORE"
+
+        df[score_col] = [
+            similarity(a, b)
+            for a, b in zip(df[source_col], df[target_col])
+        ]
+
+        df[status_col] = [
+            compare_name(a, b)
+            for a, b in zip(df[source_col], df[target_col])
+        ]
+
+
+# =====================================================================
+# 4. DISCRIMINATING CASES
+#
+# If routed agency name == expected agency name, a GMLC name matching
+# both tells us nothing about which concept that field represents.
+# =====================================================================
+
+df["ROUTED_VS_CALLER_EXPECTED_NAME"] = [
+    compare_name(a, b)
+    for a, b in zip(
+        df["ROUTED_AGENCY_BOUNDARY"],
+        df["CALLER_EXPECTED_AGENCY_BOUNDARY"]
+    )
+]
+
+df["ROUTED_VS_CELL_EXPECTED_NAME"] = [
+    compare_name(a, b)
+    for a, b in zip(
+        df["ROUTED_AGENCY_BOUNDARY"],
+        df["CELL_EXPECTED_AGENCY_BOUNDARY"]
+    )
+]
+
+df["CALLER_NAME_DISCRIMINATING"] = (
+    df["ROUTED_VS_CALLER_EXPECTED_NAME"].eq("DIFFERENT")
+)
+
+df["CELL_NAME_DISCRIMINATING"] = (
+    df["ROUTED_VS_CELL_EXPECTED_NAME"].eq("DIFFERENT")
+)
+
+
+# =====================================================================
+# 5. CLASSIFY EACH GMLC NAME AS ROUTED-LIKE / EXPECTED-LIKE
+# =====================================================================
+
+def alignment(route_status, expected_status):
+    route_match = matched(route_status)
+    exp_match = matched(expected_status)
+
+    if route_match and not exp_match:
+        return "ROUTED_LIKE"
+    if exp_match and not route_match:
+        return "EXPECTED_LIKE"
+    if route_match and exp_match:
+        return "MATCHES_BOTH"
+    if route_status == "UNRESOLVED" or expected_status == "UNRESOLVED":
+        return "UNRESOLVED"
+    return "MATCHES_NEITHER"
+
+
+for source in ["ROUTE_PSAP_NAME", "PSAP_NAME"]:
+
+    df[f"{source}_CALLER_ALIGNMENT"] = [
+        alignment(r, e)
+        for r, e in zip(
+            df[f"{source}_VS_ROUTED_NAME"],
+            df[f"{source}_VS_CALLER_EXPECTED_NAME"]
+        )
+    ]
+
+    df[f"{source}_CELL_ALIGNMENT"] = [
+        alignment(r, e)
+        for r, e in zip(
+            df[f"{source}_VS_ROUTED_NAME"],
+            df[f"{source}_VS_CELL_EXPECTED_NAME"]
+        )
+    ]
+
+
+# =====================================================================
+# 6. SUMMARY — MOST IMPORTANT OUTPUT
+# =====================================================================
+
+summary_rows = []
+
+for source in ["ROUTE_PSAP_NAME", "PSAP_NAME"]:
+
+    for location, discriminator in [
+        ("CALLER", "CALLER_NAME_DISCRIMINATING"),
+        ("CELL", "CELL_NAME_DISCRIMINATING"),
+    ]:
+
+        # Focus on geographic DIFFERENT cases.
+        geo_status = f"{location}_EXPECTED_VS_ROUTED"
+
+        subset = df.loc[
+            df[discriminator]
+            & df[geo_status].eq("DIFFERENT")
+        ].copy()
+
+        alignment_col = f"{source}_{location}_ALIGNMENT"
+        counts = subset[alignment_col].value_counts()
+
+        total = len(subset)
+
+        summary_rows.append({
+            "GMLC_NAME_FIELD": source,
+            "EXPECTED_SOURCE": location,
+            "DISCRIMINATING_MISROUTE_ROWS": total,
+
+            "ROUTED_LIKE_ROWS": int(counts.get("ROUTED_LIKE", 0)),
+            "ROUTED_LIKE_PCT": (
+                100 * counts.get("ROUTED_LIKE", 0) / total if total else np.nan
+            ),
+
+            "EXPECTED_LIKE_ROWS": int(counts.get("EXPECTED_LIKE", 0)),
+            "EXPECTED_LIKE_PCT": (
+                100 * counts.get("EXPECTED_LIKE", 0) / total if total else np.nan
+            ),
+
+            "MATCHES_BOTH_ROWS": int(counts.get("MATCHES_BOTH", 0)),
+            "MATCHES_NEITHER_ROWS": int(counts.get("MATCHES_NEITHER", 0)),
+            "UNRESOLVED_ROWS": int(counts.get("UNRESOLVED", 0)),
+        })
+
+summary = pd.DataFrame(summary_rows)
+summary.to_csv(SUMMARY_OUTPUT, index=False)
+
+print("\n==============================================================")
+print("NAME FIELD SEMANTICS — DISCRIMINATING MISROUTE CASES")
+print("==============================================================")
+display(summary)
+
+
+# =====================================================================
+# 7. SIMPLE MATCH-RATE TABLE
+# =====================================================================
+
+match_rows = []
+
+for source in ["ROUTE_PSAP_NAME", "PSAP_NAME"]:
+    for target in ["ROUTED", "CALLER_EXPECTED", "CELL_EXPECTED"]:
+
+        col = f"{source}_VS_{target}_NAME"
+        valid = df[col].ne("UNRESOLVED")
+        n = int(valid.sum())
+
+        same = int(df.loc[valid, col].eq("SAME").sum())
+        similar = int(df.loc[valid, col].eq("SIMILAR").sum())
+        different = int(df.loc[valid, col].eq("DIFFERENT").sum())
+
+        match_rows.append({
+            "GMLC_FIELD": source,
+            "COMPARED_TO": target,
+            "VALID_ROWS": n,
+            "SAME_ROWS": same,
+            "SIMILAR_ROWS": similar,
+            "SAME_OR_SIMILAR_PCT": (
+                100 * (same + similar) / n if n else np.nan
+            ),
+            "DIFFERENT_ROWS": different,
+            "DIFFERENT_PCT": (
+                100 * different / n if n else np.nan
+            ),
+        })
+
+match_summary = pd.DataFrame(match_rows)
+
+print("\n==============================================================")
+print("OVERALL NAME MATCH RATES")
+print("==============================================================")
+display(match_summary)
+
+
+# =====================================================================
+# 8. DISTANCE AUDIT
+# =====================================================================
+#
+# Strong direct test:
+#   GMLC DISTCELL2XY_M vs our CALLER_TO_CELL_M
+#
+# Other distance comparisons are diagnostic only because PSAPXY may
+# represent a configured PSAP point, while our *_TO_ROUTED_BOUNDARY_M
+# measures nearest polygon-boundary distance.
+# =====================================================================
+
+distance_pairs = [
+    ("DISTCELL2XY_M", "CALLER_TO_CELL_M", "DIRECT: CELL ↔ caller/XY"),
+    ("DISTXY2PSAPXY_M", "CALLER_TO_ROUTED_BOUNDARY_M",
+     "DIAGNOSTIC: XY→PSAPXY vs caller→routed polygon boundary"),
+    ("DISTCELL2PSAPXY_M", "CELL_TO_ROUTED_BOUNDARY_M",
+     "DIAGNOSTIC: cell→PSAPXY vs cell→routed polygon boundary"),
+]
+
+distance_rows = []
+
+for gmlc_col, ours_col, meaning in distance_pairs:
+
+    if gmlc_col not in df.columns or ours_col not in df.columns:
+        continue
+
+    x = num(df[gmlc_col])
+    y = num(df[ours_col])
+
+    valid = x.notna() & y.notna()
+    xv, yv = x[valid], y[valid]
+
+    if len(xv) == 0:
+        continue
+
+    diff = (xv - yv).abs()
+
+    distance_rows.append({
+        "GMLC_DISTANCE": gmlc_col,
+        "OUR_DISTANCE": ours_col,
+        "INTERPRETATION": meaning,
+        "ROWS": len(xv),
+        "PEARSON_R": xv.corr(yv, method="pearson"),
+        "SPEARMAN_R": xv.corr(yv, method="spearman"),
+        "MEDIAN_GMLC_M": xv.median(),
+        "MEDIAN_OURS_M": yv.median(),
+        "MEDIAN_ABS_DIFF_M": diff.median(),
+        "P90_ABS_DIFF_M": diff.quantile(0.90),
+        "P95_ABS_DIFF_M": diff.quantile(0.95),
+    })
+
+distance_summary = pd.DataFrame(distance_rows)
+distance_summary.to_csv(DIST_OUTPUT, index=False)
+
+print("\n==============================================================")
+print("DISTANCE FIELD AUDIT")
+print("==============================================================")
+display(distance_summary)
+
+
+# =====================================================================
+# 9. DISTANCE DISTRIBUTION BY GEOGRAPHIC ROUTING RESULT
+# =====================================================================
+
+group_cols = [
+    c for c in [
+        "DISTCELL2XY_M",
+        "DISTCELL2PSAPXY_M",
+        "DISTXY2PSAPXY_M",
+        "CALLER_TO_ROUTED_BOUNDARY_M",
+        "CELL_TO_ROUTED_BOUNDARY_M",
+    ]
+    if c in df.columns
+]
+
+for c in group_cols:
+    df[c] = num(df[c])
+
+if "CALLER_EXPECTED_VS_ROUTED" in df.columns:
+    grouped = (
+        df.groupby("CALLER_EXPECTED_VS_ROUTED")[group_cols]
+        .agg(["count", "median", "mean", "max"])
+        .round(2)
+    )
+
+    print("\n==============================================================")
+    print("DISTANCES BY CALLER EXPECTED-VS-ROUTED STATUS")
+    print("==============================================================")
+    display(grouped)
+
+
+# =====================================================================
+# 10. ROW-LEVEL AUDIT CSV
+# =====================================================================
+
+wanted = [
+    "SOURCE_GMLC_ROW_ID", "UNIQ911_CID",
+    "MARKET", "CLUSTER", "ENODEB_ID", "USID",
+
+    # GMLC names
+    "GMLC_ROUTE_PSAP_NAME",
+    "GMLC_PSAP_NAME",
+
+    # Routed identity/name
+    "ROUTED_PSAP_ID_GMLC",
+    "ROUTED_FCC_PSAP_ID_GMLC",
+    "ROUTED_NENA_ID_BOUNDARY",
+    "ROUTED_FCC_ID_BOUNDARY",
+    "ROUTED_AGENCY_BOUNDARY",
+
+    # Caller expected
+    "CALLER_EXPECTED_NENA_ID_BOUNDARY",
+    "CALLER_EXPECTED_FCC_ID_BOUNDARY",
+    "CALLER_EXPECTED_AGENCY_BOUNDARY",
+
+    # Cell expected
+    "CELL_EXPECTED_NENA_ID_BOUNDARY",
+    "CELL_EXPECTED_FCC_ID_BOUNDARY",
+    "CELL_EXPECTED_AGENCY_BOUNDARY",
+
+    # Name interpretation
+    "ROUTE_PSAP_NAME_VS_ROUTED_NAME",
+    "ROUTE_PSAP_NAME_VS_CALLER_EXPECTED_NAME",
+    "ROUTE_PSAP_NAME_CALLER_ALIGNMENT",
+
+    "PSAP_NAME_VS_ROUTED_NAME",
+    "PSAP_NAME_VS_CALLER_EXPECTED_NAME",
+    "PSAP_NAME_CALLER_ALIGNMENT",
+
+    "ROUTE_PSAP_NAME_VS_CELL_EXPECTED_NAME",
+    "ROUTE_PSAP_NAME_CELL_ALIGNMENT",
+    "PSAP_NAME_VS_CELL_EXPECTED_NAME",
+    "PSAP_NAME_CELL_ALIGNMENT",
+
+    "CALLER_NAME_DISCRIMINATING",
+    "CELL_NAME_DISCRIMINATING",
+
+    # Geographic truth
+    "CALLER_EXPECTED_VS_ROUTED",
+    "CALLER_ROUTED_RELATION",
+    "CALLER_EXPECTED_SPATIAL_STATUS",
+
+    "CELL_EXPECTED_VS_ROUTED",
+    "CELL_ROUTED_RELATION",
+    "CELL_EXPECTED_SPATIAL_STATUS",
+
+    # Coordinates
+    "CALLER_LATITUDE", "CALLER_LONGITUDE",
+    "CELL_LATITUDE_USED", "CELL_LONGITUDE_USED",
+    "ESPOSREQ_LATITUDE", "ESPOSREQ_LONGITUDE",
+
+    # Our distances
+    "CALLER_TO_ROUTED_BOUNDARY_M",
+    "CELL_TO_ROUTED_BOUNDARY_M",
+    "ESPOSREQ_TO_ROUTED_BOUNDARY_M",
+    "CALLER_TO_CELL_M",
+
+    # GMLC distances
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+
+    # Context
+    "UNCERT_METERS",
+    "CALL_DURATION_SEC",
+]
+
+for c in wanted:
+    if c not in df.columns:
+        df[c] = pd.NA
+
+row_audit = df[wanted].copy()
+row_audit.to_csv(ROW_OUTPUT, index=False)
+
+print("\nSaved:")
+print("Row audit :", ROW_OUTPUT)
+print("Summary   :", SUMMARY_OUTPUT)
+print("Distances :", DIST_OUTPUT)
+
+
+# =====================================================================
+# 11. MOST USEFUL EXAMPLES
+# =====================================================================
+
+print("\n==============================================================")
+print("EXAMPLES WHERE ROUTE_PSAP_NAME LOOKS EXPECTED-LIKE")
+print("==============================================================")
+
+display(
+    row_audit.loc[
+        row_audit["ROUTE_PSAP_NAME_CALLER_ALIGNMENT"].eq("EXPECTED_LIKE")
+        & row_audit["CALLER_EXPECTED_VS_ROUTED"].eq("DIFFERENT")
+    ].head(50)
+)
+
+print("\n==============================================================")
+print("EXAMPLES WHERE ROUTE_PSAP_NAME LOOKS ROUTED-LIKE")
+print("==============================================================")
+
+display(
+    row_audit.loc[
+        row_audit["ROUTE_PSAP_NAME_CALLER_ALIGNMENT"].eq("ROUTED_LIKE")
+        & row_audit["CALLER_EXPECTED_VS_ROUTED"].eq("DIFFERENT")
+    ].head(50)
+)
+
+print("\n==============================================================")
+print("EXAMPLES WHERE PSAP_NAME LOOKS EXPECTED-LIKE")
+print("==============================================================")
+
+display(
+    row_audit.loc[
+        row_audit["PSAP_NAME_CALLER_ALIGNMENT"].eq("EXPECTED_LIKE")
+        & row_audit["CALLER_EXPECTED_VS_ROUTED"].eq("DIFFERENT")
+    ].head(50)
+)
