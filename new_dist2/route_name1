@@ -1,0 +1,178 @@
+# =====================================================================
+# AUDIT: GMLC ROUTE_PSAP_NAME vs CALLER/CELL EXPECTED PSAP NAME
+# Reads existing v9 output only
+# =====================================================================
+
+from pathlib import Path
+from difflib import SequenceMatcher
+import re
+import pandas as pd
+import numpy as np
+from IPython.display import display
+
+DATA_DIR = Path(r"C:\temp\gmlc_v2")
+INPUT_CSV = DATA_DIR / "outputs_psap_rca_v5" / "psap_three_location_crosscheck_v9.csv"
+OUTPUT_CSV = DATA_DIR / "outputs_psap_rca_v5" / "psap_name_location_audit_v1.csv"
+
+# Name similarity threshold; descriptive QA only.
+SIMILARITY_THRESHOLD = 0.85
+
+
+def norm_name(x):
+    if x is None or pd.isna(x):
+        return ""
+    x = str(x).upper().strip()
+    x = re.sub(r"[^A-Z0-9 ]+", " ", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+def name_compare(a, b):
+    a, b = norm_name(a), norm_name(b)
+
+    if not a or not b:
+        return "UNRESOLVED"
+
+    if a == b:
+        return "SAME"
+
+    score = SequenceMatcher(None, a, b).ratio()
+
+    if score >= SIMILARITY_THRESHOLD:
+        return "SIMILAR"
+
+    return "DIFFERENT"
+
+
+# ---------------------------------------------------------------------
+# READ OUTPUT
+# ---------------------------------------------------------------------
+
+df = pd.read_csv(INPUT_CSV, dtype="string", low_memory=False)
+
+# Current v9 code may contain the raw name under either of these.
+if "ROUTED_NAME_GMLC_ROUTE_PSAP_NAME" in df.columns:
+    df["ROUTE_PSAP_NAME_GMLC"] = df["ROUTED_NAME_GMLC_ROUTE_PSAP_NAME"]
+elif "ROUTE_PSAP_NAME" in df.columns:
+    df["ROUTE_PSAP_NAME_GMLC"] = df["ROUTE_PSAP_NAME"]
+else:
+    df["ROUTE_PSAP_NAME_GMLC"] = pd.NA
+
+
+# ---------------------------------------------------------------------
+# NAME QA
+# Expected names come from Final_Join.AGENCY spatially matched
+# to CALLER and CELL coordinates.
+# ---------------------------------------------------------------------
+
+df["CALLER_EXPECTED_NAME_SIMILAR_TO_ROUTE_NAME"] = [
+    name_compare(a, b)
+    for a, b in zip(
+        df["ROUTE_PSAP_NAME_GMLC"],
+        df["CALLER_EXPECTED_AGENCY_BOUNDARY"]
+    )
+]
+
+df["CELL_EXPECTED_NAME_SIMILAR_TO_ROUTE_NAME"] = [
+    name_compare(a, b)
+    for a, b in zip(
+        df["ROUTE_PSAP_NAME_GMLC"],
+        df["CELL_EXPECTED_AGENCY_BOUNDARY"]
+    )
+]
+
+
+# ---------------------------------------------------------------------
+# DESIRED AUDIT COLUMNS
+# Missing fields are created as blank so the cell does not fail.
+# ---------------------------------------------------------------------
+
+wanted = [
+    # Call identification/context
+    "SOURCE_GMLC_ROW_ID",
+    "UNIQ911_CID",
+    "MARKET",
+    "CLUSTER",
+    "ENODEB_ID",
+    "USID",
+
+    # Routed PSAP name directly from GMLC
+    "ROUTE_PSAP_NAME_GMLC",
+
+    # Expected names from boundary AGENCY
+    "CALLER_EXPECTED_AGENCY_BOUNDARY",
+    "CALLER_EXPECTED_NAME_SIMILAR_TO_ROUTE_NAME",
+
+    "CELL_EXPECTED_AGENCY_BOUNDARY",
+    "CELL_EXPECTED_NAME_SIMILAR_TO_ROUTE_NAME",
+
+    # Main geographic result
+    "CALLER_EXPECTED_VS_ROUTED",
+    "CALLER_ROUTED_RELATION",
+    "CALLER_EXPECTED_SPATIAL_STATUS",
+
+    "CELL_EXPECTED_VS_ROUTED",
+    "CELL_ROUTED_RELATION",
+    "CELL_EXPECTED_SPATIAL_STATUS",
+
+    # Caller coordinates
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+
+    # Cell coordinates
+    "CELL_LATITUDE_USED",
+    "CELL_LONGITUDE_USED",
+
+    # Useful distance calculated by our geographic analysis
+    "CALLER_TO_ROUTED_BOUNDARY_M",
+    "CELL_TO_ROUTED_BOUNDARY_M",
+    "CALLER_TO_CELL_M",
+
+    # Existing GMLC location/distance fields
+    "UNCERT_METERS",
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+
+    # Call duration
+    "CALL_DURATION_SEC",
+]
+
+
+missing = [c for c in wanted if c not in df.columns]
+
+for c in missing:
+    df[c] = pd.NA
+
+audit = df[wanted].copy()
+
+
+# ---------------------------------------------------------------------
+# SAVE + SUMMARY
+# ---------------------------------------------------------------------
+
+audit.to_csv(OUTPUT_CSV, index=False)
+
+print("Rows:", f"{len(audit):,}")
+print("Saved:", OUTPUT_CSV)
+
+print("\nFields requested but NOT currently present in v9 output:")
+print(missing if missing else "None")
+
+print("\nCaller name comparison:")
+display(
+    audit["CALLER_EXPECTED_NAME_SIMILAR_TO_ROUTE_NAME"]
+    .value_counts(dropna=False)
+    .rename_axis("STATUS")
+    .reset_index(name="ROWS")
+)
+
+print("\nCell name comparison:")
+display(
+    audit["CELL_EXPECTED_NAME_SIMILAR_TO_ROUTE_NAME"]
+    .value_counts(dropna=False)
+    .rename_axis("STATUS")
+    .reset_index(name="ROWS")
+)
+
+display(audit.head(100))
