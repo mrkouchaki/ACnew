@@ -1,0 +1,1097 @@
+# =====================================================================
+# FULL GMLC PSAP FIELD-SEMANTICS AUDIT v2
+# =====================================================================
+# Goal:
+#   Determine empirically what these GMLC fields represent:
+#
+#       PSAP_ID + FCC_PSAP_ID
+#       PSAP_NAME
+#       ROUTE_PSAP_NAME
+#
+# Against independent geography:
+#       CALLER LAT/LON -> expected PSAP polygon
+#       CELL LAT/LON   -> expected PSAP polygon
+#
+# NO large row-level output.
+# Only analytical summary CSVs + top 50 long-distance examples.
+# =====================================================================
+
+from pathlib import Path
+from collections import Counter, defaultdict
+from difflib import SequenceMatcher
+import re
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import shapely
+from shapely.ops import transform as shapely_transform
+from pyproj import Geod, CRS, Transformer
+from IPython.display import display
+
+# =====================================================================
+# 0. CONFIG
+# =====================================================================
+
+DATA_DIR = Path(r"C:\temp\gmlc_v2")
+OUT_DIR = DATA_DIR / "outputs_psap_rca_v5"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+GMLC_PATH = DATA_DIR / "e911_lte_master_gmlc.csv"
+BOUNDARY_PATH = DATA_DIR / "psap" / "Final_Join.tab"
+
+CHUNK_ROWS = 100_000
+NAME_SIMILARITY = 0.85
+DIST_SAMPLE_PER_CHUNK = 3000
+TOP_LONG_DISTANCE_CASES = 50
+
+GEOD = Geod(ellps="WGS84")
+
+# Small summary outputs only.
+OUT_ID = OUT_DIR / "gmlc_full_id_resolution_summary_v2.csv"
+OUT_NAME_ID = OUT_DIR / "gmlc_full_name_id_consistency_v2.csv"
+OUT_MATCH = OUT_DIR / "gmlc_full_name_match_summary_v2.csv"
+OUT_ROLE = OUT_DIR / "gmlc_full_name_role_summary_v2.csv"
+OUT_EXPECTED = OUT_DIR / "gmlc_full_expected_vs_routed_summary_v2.csv"
+OUT_BANDS = OUT_DIR / "gmlc_full_caller_distance_band_name_roles_v2.csv"
+OUT_DISTANCE = OUT_DIR / "gmlc_full_distance_field_audit_v2.csv"
+OUT_TOP = OUT_DIR / "gmlc_full_top50_long_distance_cases_v2.csv"
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def txt(x):
+    if x is None or pd.isna(x):
+        return ""
+    x = str(x).strip()
+    return "" if x.upper() in {"", "NAN", "NONE", "<NA>"} else x
+
+def raw_id(x):
+    return re.sub(r"\.0$", "", txt(x))
+
+def canon_id(x):
+    x = raw_id(x)
+    if not x:
+        return ""
+    if re.fullmatch(r"\d+", x):
+        return str(int(x))
+    return x.upper()
+
+def norm_name_series(s):
+    return (
+        s.fillna("").astype(str).str.upper().str.strip()
+        .str.replace(r"[^A-Z0-9 ]+", " ", regex=True)
+        .str.replace(r"\s+", " ", regex=True).str.strip()
+    )
+
+def repair_geom(g):
+    if g is None or g.is_empty:
+        return None
+    try:
+        if not g.is_valid:
+            g = g.buffer(0)
+        return None if g is None or g.is_empty or not g.is_valid else g
+    except Exception:
+        return None
+
+def first_nonempty(s):
+    for x in s:
+        x = txt(x)
+        if x:
+            return x
+    return ""
+
+def numeric(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def valid_xy(lat, lon):
+    return (
+        lat.notna() & lon.notna() &
+        lat.between(-90, 90) & lon.between(-180, 180) &
+        ~(lat.abs().lt(1e-10) & lon.abs().lt(1e-10))
+    )
+
+def geod_distance(lat1, lon1, lat2, lon2):
+    a, b = numeric(lat1).to_numpy(float), numeric(lon1).to_numpy(float)
+    c, d = numeric(lat2).to_numpy(float), numeric(lon2).to_numpy(float)
+
+    ok = (
+        np.isfinite(a) & np.isfinite(b) & np.isfinite(c) & np.isfinite(d) &
+        (a >= -90) & (a <= 90) & (c >= -90) & (c <= 90) &
+        (b >= -180) & (b <= 180) & (d >= -180) & (d <= 180)
+    )
+
+    out = np.full(len(a), np.nan)
+    if ok.any():
+        _, _, dist = GEOD.inv(b[ok], a[ok], d[ok], c[ok])
+        out[ok] = np.abs(np.asarray(dist, float))
+    return out
+
+
+# =====================================================================
+# 2. BOUNDARY REFERENCE
+# =====================================================================
+
+try:
+    b = gpd.read_file(BOUNDARY_PATH, engine="pyogrio")
+except Exception:
+    b = gpd.read_file(BOUNDARY_PATH)
+
+if b.crs is None:
+    raise RuntimeError("Boundary file has no CRS.")
+if b.crs.to_epsg() != 4326:
+    b = b.to_crs(4326)
+
+cols = {str(c).upper(): c for c in b.columns}
+B_NENA = cols["NENA_ID"]
+B_FCC = cols.get("FCC_ID", cols.get("FCC_PSAP_ID"))
+B_AGENCY = cols.get("AGENCY", cols.get("AGENCY_NAME"))
+
+if B_FCC is None:
+    raise RuntimeError("Boundary FCC_ID not found.")
+
+b["_NENA"] = b[B_NENA].map(canon_id)
+b["_NENA_RAW"] = b[B_NENA].map(raw_id)
+b["_FCC"] = b[B_FCC].map(canon_id)
+b["_AGENCY"] = b[B_AGENCY].fillna("").astype(str).str.strip() if B_AGENCY else ""
+b["geometry"] = b.geometry.apply(repair_geom)
+
+b = b.loc[b["_NENA"].ne("") & b.geometry.notna()].copy()
+
+# One PSAP geometry per NENA.
+psap_geo = b[["_NENA", "geometry"]].dissolve(by="_NENA", as_index=False)
+psap_geo["geometry"] = psap_geo.geometry.apply(repair_geom)
+psap_geo = psap_geo.loc[psap_geo.geometry.notna()].copy()
+
+rep = psap_geo.geometry.representative_point()
+psap_geo["_CENTER_LAT"] = rep.y
+psap_geo["_CENTER_LON"] = rep.x
+
+geom_by_nena = dict(zip(psap_geo["_NENA"], psap_geo.geometry))
+center_by_nena = dict(zip(
+    psap_geo["_NENA"],
+    zip(psap_geo["_CENTER_LAT"], psap_geo["_CENTER_LON"])
+))
+
+fcc_by_nena = defaultdict(set)
+for nena, fcc in b[["_NENA", "_FCC"]].drop_duplicates().itertuples(index=False, name=None):
+    if fcc:
+        fcc_by_nena[nena].add(fcc)
+
+agency_by_nena = (
+    b.groupby("_NENA")["_AGENCY"]
+    .agg(first_nonempty)
+    .to_dict()
+)
+
+print("Boundary PSAP identities:", f"{len(geom_by_nena):,}")
+
+
+# =====================================================================
+# 3. SPATIAL EXPECTED PSAP
+# =====================================================================
+
+def expected_psap(lat, lon):
+    lat, lon = numeric(lat), numeric(lon)
+    ok = valid_xy(lat, lon)
+
+    n = len(lat)
+    expected = np.full(n, "", dtype=object)
+    status = np.full(n, "INVALID_COORD", dtype=object)
+
+    pos = np.flatnonzero(ok.to_numpy())
+    if not len(pos):
+        return expected, status
+
+    pg = gpd.GeoDataFrame(
+        {"_ROW": pos},
+        geometry=gpd.points_from_xy(
+            lon.iloc[pos].to_numpy(float),
+            lat.iloc[pos].to_numpy(float)
+        ),
+        crs="EPSG:4326"
+    )
+
+    joined = gpd.sjoin(
+        pg,
+        psap_geo[["_NENA", "geometry"]],
+        how="left",
+        predicate="intersects"
+    )
+
+    matches = joined.loc[joined["_NENA"].notna(), ["_ROW", "_NENA"]]
+
+    status[pos] = "NO_CONTAINING_PSAP"
+
+    if matches.empty:
+        return expected, status
+
+    counts = matches.groupby("_ROW")["_NENA"].nunique()
+    first = matches.drop_duplicates("_ROW").set_index("_ROW")["_NENA"]
+
+    unique_rows = counts[counts == 1].index.to_numpy(int)
+    multi_rows = counts[counts > 1].index.to_numpy(int)
+
+    expected[unique_rows] = first.loc[unique_rows].astype(str).to_numpy()
+    status[unique_rows] = "UNIQUE_PSAP"
+    status[multi_rows] = "MULTIPLE_PSAP"
+
+    return expected, status
+
+
+# =====================================================================
+# 4. PRECISE OUTSIDE DISTANCE TO ROUTED PSAP
+# =====================================================================
+
+metric_cache = {}
+
+def metric_model(nena):
+    nena = canon_id(nena)
+
+    if nena in metric_cache:
+        return metric_cache[nena]
+
+    geom = geom_by_nena.get(nena)
+    center = center_by_nena.get(nena)
+
+    if geom is None or center is None:
+        metric_cache[nena] = None
+        return None
+
+    lat0, lon0 = center
+
+    crs = CRS.from_proj4(
+        f"+proj=aeqd +lat_0={lat0} +lon_0={lon0} "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+
+    fwd = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    inv = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+
+    geom_m = repair_geom(shapely_transform(fwd.transform, geom))
+
+    metric_cache[nena] = (geom, geom_m, fwd, inv)
+    return metric_cache[nena]
+
+
+def outside_distance(lat, lon, routed_nena, mask):
+    lat = numeric(lat).to_numpy(float)
+    lon = numeric(lon).to_numpy(float)
+    routed_nena = np.asarray(routed_nena, dtype=object)
+
+    out = np.full(len(lat), np.nan)
+
+    active = (
+        np.asarray(mask, bool) &
+        np.isfinite(lat) & np.isfinite(lon) &
+        (routed_nena != "")
+    )
+
+    for nena in pd.unique(routed_nena[active]):
+        model = metric_model(nena)
+        if model is None:
+            continue
+
+        _, geom_m, fwd, inv = model
+        idx = np.flatnonzero(active & (routed_nena == nena))
+
+        x, y = fwd.transform(lon[idx], lat[idx])
+        pts_m = shapely.points(np.asarray(x), np.asarray(y))
+
+        lines = shapely.shortest_line(pts_m, geom_m.boundary)
+        near = shapely.get_point(lines, 1)
+
+        nx = np.asarray(shapely.get_x(near), float)
+        ny = np.asarray(shapely.get_y(near), float)
+        nlon, nlat = inv.transform(nx, ny)
+
+        _, _, d = GEOD.inv(
+            lon[idx], lat[idx],
+            np.asarray(nlon, float),
+            np.asarray(nlat, float)
+        )
+
+        out[idx] = np.abs(np.asarray(d, float))
+
+    return out
+
+
+def distance_band(status, distance):
+    band = np.full(len(status), "UNRESOLVED", dtype=object)
+    status = np.asarray(status, dtype=object)
+    distance = np.asarray(distance, float)
+
+    band[status == "SAME"] = "EXPECTED=SAME"
+
+    diff = (status == "DIFFERENT") & np.isfinite(distance)
+
+    band[diff & (distance < 1_000)] = "OUTSIDE <1 km"
+    band[diff & (distance >= 1_000) & (distance < 10_000)] = "OUTSIDE 1-10 km"
+    band[diff & (distance >= 10_000) & (distance < 19_000)] = "OUTSIDE 10-19 km"
+    band[diff & (distance >= 19_000) & (distance < 50_000)] = "OUTSIDE 19-50 km"
+    band[diff & (distance >= 50_000) & (distance < 100_000)] = "OUTSIDE 50-100 km"
+    band[diff & (distance >= 100_000) & (distance < 500_000)] = "OUTSIDE 100-500 km"
+    band[diff & (distance >= 500_000)] = "OUTSIDE >=500 km"
+
+    return band
+
+
+# =====================================================================
+# 5. NAME COMPARISON — SCORING UNIQUE PAIRS ONLY
+# =====================================================================
+
+name_compare_cache = {}
+
+def compare_norm(a, b):
+    if not a or not b:
+        return "UNRESOLVED"
+
+    key = (a, b)
+    if key in name_compare_cache:
+        return name_compare_cache[key]
+
+    if a == b:
+        result = "SAME"
+    else:
+        score = SequenceMatcher(None, a, b).ratio()
+        result = "SIMILAR" if score >= NAME_SIMILARITY else "DIFFERENT"
+
+    name_compare_cache[key] = result
+    return result
+
+def is_match(x):
+    return x in {"SAME", "SIMILAR"}
+
+def role(source, routed, expected):
+    r = compare_norm(source, routed)
+    e = compare_norm(source, expected)
+
+    if is_match(r) and not is_match(e):
+        return "ROUTED_LIKE"
+    if is_match(e) and not is_match(r):
+        return "EXPECTED_LIKE"
+    if is_match(r) and is_match(e):
+        return "MATCHES_BOTH"
+    if "UNRESOLVED" in {r, e}:
+        return "UNRESOLVED"
+    return "MATCHES_NEITHER"
+
+
+# =====================================================================
+# 6. ACCUMULATORS — SMALL AGGREGATES ONLY
+# =====================================================================
+
+total_rows = 0
+
+route_resolution = Counter()
+
+expected_status_counts = {
+    "CALLER": Counter(),
+    "CELL": Counter()
+}
+
+nonempty_name_counts = Counter()
+both_names_nonempty = 0
+same_psap_route_name = 0
+
+# (normalized name, routed ID-pair) -> rows
+name_id_counts = {
+    "PSAP_NAME": Counter(),
+    "ROUTE_PSAP_NAME": Counter()
+}
+
+# Name match against each target.
+pair_counts = defaultdict(Counter)
+
+# Misroute role analysis:
+# (field, CALLER/CELL, ALL or distance band)
+role_counts = defaultdict(Counter)
+
+distance_samples = defaultdict(list)
+top_cases = pd.DataFrame()
+
+
+# =====================================================================
+# 7. FULL GMLC READ
+# =====================================================================
+
+header = list(pd.read_csv(GMLC_PATH, nrows=0).columns)
+h = {str(c).strip().upper(): c for c in header}
+
+required = [
+    "PSAP_ID", "FCC_PSAP_ID",
+    "PSAP_NAME", "ROUTE_PSAP_NAME",
+    "LATITUDE", "LONGITUDE",
+    "CELL_LATITUDE", "CELL_LONGITUDE"
+]
+
+for c in required:
+    if c not in h:
+        raise RuntimeError(f"GMLC missing required column: {c}")
+
+wanted = [
+    "UNIQ911_CID", "MARKET",
+    "PSAP_ID", "FCC_PSAP_ID",
+    "PSAP_NAME", "ROUTE_PSAP_NAME",
+    "LATITUDE", "LONGITUDE",
+    "CELL_LATITUDE", "CELL_LONGITUDE",
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+    "CALL_DURATION_SEC"
+]
+
+usecols = [h[c] for c in wanted if c in h]
+
+reader = pd.read_csv(
+    GMLC_PATH,
+    usecols=usecols,
+    dtype="string",
+    chunksize=CHUNK_ROWS,
+    low_memory=False,
+    encoding_errors="replace"
+)
+
+
+# =====================================================================
+# 8. PROCESS FULL FILE
+# =====================================================================
+
+for chunk_no, df in enumerate(reader, start=1):
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    df = df.reset_index(drop=True)
+
+    n = len(df)
+    total_rows += n
+
+    psap_id = df["PSAP_ID"].map(canon_id)
+    fcc_id = df["FCC_PSAP_ID"].map(canon_id)
+
+    # -----------------------------------------------------------------
+    # Resolve what PSAP_ID/FCC_PSAP_ID point to in boundary reference.
+    # -----------------------------------------------------------------
+    routed_nena = np.full(n, "", dtype=object)
+    routed_status = np.full(n, "PSAP_NOT_FOUND", dtype=object)
+
+    for i, (p, f) in enumerate(zip(psap_id, fcc_id)):
+        if not p:
+            routed_status[i] = "MISSING_PSAP_ID"
+            continue
+
+        if p not in geom_by_nena:
+            routed_status[i] = "PSAP_ID_NOT_IN_BOUNDARY"
+            continue
+
+        fccs = fcc_by_nena.get(p, set())
+
+        if f and f in fccs:
+            routed_nena[i] = p
+            routed_status[i] = "PSAP_AND_FCC_CONFIRMED"
+        elif not f:
+            routed_nena[i] = p
+            routed_status[i] = "PSAP_CONFIRMED_FCC_MISSING"
+        elif not fccs:
+            routed_nena[i] = p
+            routed_status[i] = "PSAP_CONFIRMED_BOUNDARY_FCC_MISSING"
+        else:
+            routed_status[i] = "PSAP_FCC_CONFLICT"
+
+    route_resolution.update(routed_status)
+
+    routed_agency = pd.Series(routed_nena).map(agency_by_nena).fillna("")
+
+    # -----------------------------------------------------------------
+    # Expected PSAP from CALLER and CELL coordinates.
+    # -----------------------------------------------------------------
+    caller_expected, caller_spatial = expected_psap(
+        df["LATITUDE"], df["LONGITUDE"]
+    )
+
+    cell_expected, cell_spatial = expected_psap(
+        df["CELL_LATITUDE"], df["CELL_LONGITUDE"]
+    )
+
+    caller_agency = pd.Series(caller_expected).map(agency_by_nena).fillna("")
+    cell_agency = pd.Series(cell_expected).map(agency_by_nena).fillna("")
+
+    # -----------------------------------------------------------------
+    # Expected vs routed ID comparison.
+    # -----------------------------------------------------------------
+    caller_status = np.full(n, "UNRESOLVED", dtype=object)
+    cell_status = np.full(n, "UNRESOLVED", dtype=object)
+
+    route_ok = (routed_nena != "")
+
+    caller_ok = route_ok & (caller_expected != "")
+    cell_ok = route_ok & (cell_expected != "")
+
+    caller_status[caller_ok] = np.where(
+        routed_nena[caller_ok] == caller_expected[caller_ok],
+        "SAME", "DIFFERENT"
+    )
+
+    cell_status[cell_ok] = np.where(
+        routed_nena[cell_ok] == cell_expected[cell_ok],
+        "SAME", "DIFFERENT"
+    )
+
+    expected_status_counts["CALLER"].update(caller_status)
+    expected_status_counts["CELL"].update(cell_status)
+
+    # -----------------------------------------------------------------
+    # Precise Caller outside distance only where IDs differ.
+    # -----------------------------------------------------------------
+    caller_diff = caller_status == "DIFFERENT"
+
+    caller_outside_m = outside_distance(
+        df["LATITUDE"],
+        df["LONGITUDE"],
+        routed_nena,
+        caller_diff
+    )
+
+    caller_band = distance_band(
+        caller_status,
+        caller_outside_m
+    )
+
+    # -----------------------------------------------------------------
+    # Normalize the two GMLC name fields.
+    # -----------------------------------------------------------------
+    psap_name_n = norm_name_series(df["PSAP_NAME"])
+    route_name_n = norm_name_series(df["ROUTE_PSAP_NAME"])
+
+    routed_agency_n = norm_name_series(routed_agency)
+    caller_agency_n = norm_name_series(caller_agency)
+    cell_agency_n = norm_name_series(cell_agency)
+
+    nonempty_name_counts["PSAP_NAME"] += int(psap_name_n.ne("").sum())
+    nonempty_name_counts["ROUTE_PSAP_NAME"] += int(route_name_n.ne("").sum())
+
+    both = psap_name_n.ne("") & route_name_n.ne("")
+    both_names_nonempty += int(both.sum())
+    same_psap_route_name += int((both & psap_name_n.eq(route_name_n)).sum())
+
+    # -----------------------------------------------------------------
+    # Name -> GMLC ID-pair consistency.
+    # Only rows where PSAP+FCC resolve cleanly.
+    # -----------------------------------------------------------------
+    confirmed = routed_status == "PSAP_AND_FCC_CONFIRMED"
+
+    pair_id = (
+        pd.Series(routed_nena).astype(str)
+        + "|"
+        + fcc_id.astype(str)
+    )
+
+    for field, names in [
+        ("PSAP_NAME", psap_name_n),
+        ("ROUTE_PSAP_NAME", route_name_n),
+    ]:
+        temp = pd.DataFrame({
+            "NAME": names,
+            "PAIR": pair_id,
+            "OK": confirmed
+        })
+
+        temp = temp.loc[
+            temp["OK"] & temp["NAME"].ne("")
+        ]
+
+        vc = temp[["NAME", "PAIR"]].value_counts()
+
+        for (name, pair), count in vc.items():
+            name_id_counts[field][(name, pair)] += int(count)
+
+    # -----------------------------------------------------------------
+    # Overall name match rates.
+    # -----------------------------------------------------------------
+    source_fields = {
+        "PSAP_NAME": psap_name_n,
+        "ROUTE_PSAP_NAME": route_name_n
+    }
+
+    targets = {
+        "ROUTED_ID_BOUNDARY_AGENCY": routed_agency_n,
+        "CALLER_EXPECTED_AGENCY": caller_agency_n,
+        "CELL_EXPECTED_AGENCY": cell_agency_n
+    }
+
+    for field, source in source_fields.items():
+        for target_name, target in targets.items():
+            temp = pd.DataFrame({"S": source, "T": target})
+            temp = temp.loc[temp["S"].ne("") & temp["T"].ne("")]
+
+            vc = temp.value_counts()
+
+            counter = pair_counts[(field, target_name)]
+
+            for (s, t), count in vc.items():
+                counter[(s, t)] += int(count)
+
+    # -----------------------------------------------------------------
+    # Discriminating misroute cases.
+    #
+    # Store NAME + routed agency + expected agency combinations,
+    # not millions of individual rows.
+    # -----------------------------------------------------------------
+    for field, source in source_fields.items():
+
+        for context, expected_name, status in [
+            ("CALLER", caller_agency_n, caller_status),
+            ("CELL", cell_agency_n, cell_status),
+        ]:
+            mask = (
+                (status == "DIFFERENT") &
+                source.ne("").to_numpy() &
+                routed_agency_n.ne("").to_numpy() &
+                expected_name.ne("").to_numpy()
+            )
+
+            temp = pd.DataFrame({
+                "S": source[mask].to_numpy(),
+                "R": routed_agency_n[mask].to_numpy(),
+                "E": expected_name[mask].to_numpy()
+            })
+
+            vc = temp.value_counts()
+
+            for triple, count in vc.items():
+                role_counts[(field, context, "ALL")][triple] += int(count)
+
+            # Caller only: also break out by actual routed-boundary distance.
+            if context == "CALLER":
+                temp["BAND"] = caller_band[mask]
+
+                for band_name, band_df in temp.groupby("BAND"):
+                    vc_band = band_df[["S", "R", "E"]].value_counts()
+
+                    for triple, count in vc_band.items():
+                        role_counts[(field, context, band_name)][triple] += int(count)
+
+    # -----------------------------------------------------------------
+    # GMLC distance validation.
+    # -----------------------------------------------------------------
+    caller_cell_m = geod_distance(
+        df["LATITUDE"], df["LONGITUDE"],
+        df["CELL_LATITUDE"], df["CELL_LONGITUDE"]
+    )
+
+    if "DISTCELL2XY_M" in df.columns:
+        x = numeric(df["DISTCELL2XY_M"]).to_numpy(float)
+        ok = np.isfinite(x) & np.isfinite(caller_cell_m)
+
+        idx = np.flatnonzero(ok)
+        if len(idx):
+            if len(idx) > DIST_SAMPLE_PER_CHUNK:
+                rng = np.random.default_rng(chunk_no)
+                idx = rng.choice(idx, DIST_SAMPLE_PER_CHUNK, replace=False)
+
+            distance_samples["DISTCELL2XY_M"].append(
+                pd.DataFrame({
+                    "GMLC": x[idx],
+                    "OURS": caller_cell_m[idx]
+                })
+            )
+
+    if "DISTXY2PSAPXY_M" in df.columns:
+        x = numeric(df["DISTXY2PSAPXY_M"]).to_numpy(float)
+        ok = np.isfinite(x) & np.isfinite(caller_outside_m)
+
+        idx = np.flatnonzero(ok)
+        if len(idx):
+            if len(idx) > DIST_SAMPLE_PER_CHUNK:
+                rng = np.random.default_rng(10_000 + chunk_no)
+                idx = rng.choice(idx, DIST_SAMPLE_PER_CHUNK, replace=False)
+
+            distance_samples["DISTXY2PSAPXY_M"].append(
+                pd.DataFrame({
+                    "GMLC": x[idx],
+                    "OURS": caller_outside_m[idx]
+                })
+            )
+
+    # -----------------------------------------------------------------
+    # Keep only top 50 ≥19 km examples.
+    # -----------------------------------------------------------------
+    extreme = caller_diff & np.isfinite(caller_outside_m) & (caller_outside_m >= 19_000)
+
+    if extreme.any():
+        examples = pd.DataFrame({
+            "UNIQ911_CID": df["UNIQ911_CID"] if "UNIQ911_CID" in df else "",
+            "MARKET": df["MARKET"] if "MARKET" in df else "",
+            "PSAP_ID": df["PSAP_ID"],
+            "FCC_PSAP_ID": df["FCC_PSAP_ID"],
+            "PSAP_NAME": df["PSAP_NAME"],
+            "ROUTE_PSAP_NAME": df["ROUTE_PSAP_NAME"],
+            "ROUTED_BOUNDARY_AGENCY": routed_agency,
+            "CALLER_EXPECTED_NENA_ID": caller_expected,
+            "CALLER_EXPECTED_AGENCY": caller_agency,
+            "CALLER_TO_ROUTED_BOUNDARY_M": caller_outside_m,
+            "CALLER_LATITUDE": df["LATITUDE"],
+            "CALLER_LONGITUDE": df["LONGITUDE"],
+            "CELL_LATITUDE": df["CELL_LATITUDE"],
+            "CELL_LONGITUDE": df["CELL_LONGITUDE"],
+            "DISTCELL2XY_M": df["DISTCELL2XY_M"] if "DISTCELL2XY_M" in df else "",
+            "DISTXY2PSAPXY_M": df["DISTXY2PSAPXY_M"] if "DISTXY2PSAPXY_M" in df else "",
+        })
+
+        examples = examples.loc[extreme].nlargest(
+            min(20, int(extreme.sum())),
+            "CALLER_TO_ROUTED_BOUNDARY_M"
+        )
+
+        top_cases = pd.concat([top_cases, examples], ignore_index=True)
+        top_cases = top_cases.nlargest(
+            TOP_LONG_DISTANCE_CASES,
+            "CALLER_TO_ROUTED_BOUNDARY_M"
+        )
+
+    print(f"Chunk {chunk_no:03d} | rows processed {total_rows:,}")
+
+
+# =====================================================================
+# 9. TABLE 1 — PSAP_ID / FCC_PSAP_ID RESOLUTION
+# =====================================================================
+
+id_summary = pd.DataFrame([
+    {
+        "STATUS": status,
+        "ROWS": count,
+        "PCT_OF_GMLC": 100 * count / total_rows
+    }
+    for status, count in route_resolution.most_common()
+])
+
+id_summary.to_csv(OUT_ID, index=False)
+
+
+# =====================================================================
+# 10. TABLE 2 — HOW TIGHTLY EACH NAME FIELD IS TIED TO ID PAIRS
+# =====================================================================
+
+def name_id_summary(field, counter):
+    by_name = defaultdict(Counter)
+    by_pair = defaultdict(Counter)
+
+    for (name, pair), count in counter.items():
+        by_name[name][pair] += count
+        by_pair[pair][name] += count
+
+    rows = sum(counter.values())
+
+    unique_to_one_pair = sum(
+        1 for c in by_name.values() if len(c) == 1
+    )
+
+    modal_pair_rows = sum(
+        max(c.values()) for c in by_name.values()
+    )
+
+    modal_name_rows = sum(
+        max(c.values()) for c in by_pair.values()
+    )
+
+    ids_per_name = [len(c) for c in by_name.values()]
+    names_per_id = [len(c) for c in by_pair.values()]
+
+    return {
+        "FIELD": field,
+        "CONFIRMED_ROWS": rows,
+        "UNIQUE_NORMALIZED_NAMES": len(by_name),
+        "UNIQUE_ID_PAIRS": len(by_pair),
+
+        "NAMES_MAPPING_TO_EXACTLY_ONE_ID_PAIR_PCT":
+            100 * unique_to_one_pair / len(by_name) if by_name else np.nan,
+
+        "ROW_WEIGHTED_MODAL_ID_PURITY_PCT":
+            100 * modal_pair_rows / rows if rows else np.nan,
+
+        "MEDIAN_ID_PAIRS_PER_NAME":
+            np.median(ids_per_name) if ids_per_name else np.nan,
+
+        "MAX_ID_PAIRS_PER_NAME":
+            max(ids_per_name) if ids_per_name else np.nan,
+
+        "ROW_WEIGHTED_MODAL_NAME_PER_ID_PURITY_PCT":
+            100 * modal_name_rows / rows if rows else np.nan,
+
+        "MEDIAN_NAMES_PER_ID_PAIR":
+            np.median(names_per_id) if names_per_id else np.nan,
+    }
+
+name_id_table = pd.DataFrame([
+    name_id_summary(field, counter)
+    for field, counter in name_id_counts.items()
+])
+
+name_id_table.to_csv(OUT_NAME_ID, index=False)
+
+
+# =====================================================================
+# 11. TABLE 3 — OVERALL NAME MATCH RATES
+# =====================================================================
+
+match_rows = []
+
+for (field, target), counter in pair_counts.items():
+    counts = Counter()
+
+    for (a, b), n in counter.items():
+        counts[compare_norm(a, b)] += n
+
+    valid = sum(counts.values())
+    same_similar = counts["SAME"] + counts["SIMILAR"]
+
+    match_rows.append({
+        "GMLC_FIELD": field,
+        "COMPARED_TO": target,
+        "VALID_ROWS": valid,
+        "SAME_ROWS": counts["SAME"],
+        "SIMILAR_ROWS": counts["SIMILAR"],
+        "SAME_OR_SIMILAR_PCT":
+            100 * same_similar / valid if valid else np.nan,
+        "DIFFERENT_ROWS": counts["DIFFERENT"],
+        "DIFFERENT_PCT":
+            100 * counts["DIFFERENT"] / valid if valid else np.nan
+    })
+
+name_match_table = pd.DataFrame(match_rows)
+name_match_table.to_csv(OUT_MATCH, index=False)
+
+
+# =====================================================================
+# 12. TABLE 4 — ROUTED-LIKE vs EXPECTED-LIKE
+# =====================================================================
+
+def summarize_roles(counter):
+    result = Counter()
+    discriminating = 0
+    total = sum(counter.values())
+
+    for (source, routed, expected), count in counter.items():
+        # If routed and expected names themselves look the same,
+        # this row cannot tell us which role the GMLC field represents.
+        if is_match(compare_norm(routed, expected)):
+            result["NON_DISCRIMINATING"] += count
+            continue
+
+        discriminating += count
+        result[role(source, routed, expected)] += count
+
+    return total, discriminating, result
+
+role_rows = []
+
+for (field, context, band), counter in role_counts.items():
+    if band != "ALL":
+        continue
+
+    total, discrim, r = summarize_roles(counter)
+
+    role_rows.append({
+        "GMLC_FIELD": field,
+        "EXPECTED_SOURCE": context,
+        "MISROUTE_ROWS_WITH_NAMES": total,
+        "DISCRIMINATING_ROWS": discrim,
+
+        "ROUTED_LIKE_ROWS": r["ROUTED_LIKE"],
+        "ROUTED_LIKE_PCT":
+            100 * r["ROUTED_LIKE"] / discrim if discrim else np.nan,
+
+        "EXPECTED_LIKE_ROWS": r["EXPECTED_LIKE"],
+        "EXPECTED_LIKE_PCT":
+            100 * r["EXPECTED_LIKE"] / discrim if discrim else np.nan,
+
+        "MATCHES_BOTH_ROWS": r["MATCHES_BOTH"],
+        "MATCHES_NEITHER_ROWS": r["MATCHES_NEITHER"],
+        "UNRESOLVED_ROWS": r["UNRESOLVED"],
+        "NON_DISCRIMINATING_ROWS": r["NON_DISCRIMINATING"],
+    })
+
+name_role_table = pd.DataFrame(role_rows)
+name_role_table.to_csv(OUT_ROLE, index=False)
+
+
+# =====================================================================
+# 13. TABLE 5 — EXPECTED PSAP vs GMLC ID PSAP
+# =====================================================================
+
+expected_rows = []
+
+for source in ["CALLER", "CELL"]:
+    counts = expected_status_counts[source]
+    total = sum(counts.values())
+
+    for status in ["SAME", "DIFFERENT", "UNRESOLVED"]:
+        expected_rows.append({
+            "LOCATION_SOURCE": source,
+            "STATUS": status,
+            "ROWS": counts[status],
+            "PCT": 100 * counts[status] / total if total else np.nan
+        })
+
+expected_table = pd.DataFrame(expected_rows)
+expected_table.to_csv(OUT_EXPECTED, index=False)
+
+
+# =====================================================================
+# 14. TABLE 6 — CALLER DISTANCE BANDS
+# =====================================================================
+
+band_rows = []
+
+band_order = [
+    "OUTSIDE <1 km",
+    "OUTSIDE 1-10 km",
+    "OUTSIDE 10-19 km",
+    "OUTSIDE 19-50 km",
+    "OUTSIDE 50-100 km",
+    "OUTSIDE 100-500 km",
+    "OUTSIDE >=500 km"
+]
+
+for field in ["PSAP_NAME", "ROUTE_PSAP_NAME"]:
+    for band in band_order:
+        counter = role_counts.get((field, "CALLER", band), Counter())
+
+        if not counter:
+            continue
+
+        total, discrim, r = summarize_roles(counter)
+
+        band_rows.append({
+            "GMLC_FIELD": field,
+            "CALLER_DISTANCE_BAND": band,
+            "MISROUTE_ROWS_WITH_NAMES": total,
+            "DISCRIMINATING_ROWS": discrim,
+            "ROUTED_LIKE_PCT":
+                100 * r["ROUTED_LIKE"] / discrim if discrim else np.nan,
+            "EXPECTED_LIKE_PCT":
+                100 * r["EXPECTED_LIKE"] / discrim if discrim else np.nan,
+            "MATCHES_NEITHER_PCT":
+                100 * r["MATCHES_NEITHER"] / discrim if discrim else np.nan,
+        })
+
+band_table = pd.DataFrame(band_rows)
+band_table.to_csv(OUT_BANDS, index=False)
+
+
+# =====================================================================
+# 15. TABLE 7 — DISTANCE FIELD AUDIT
+# =====================================================================
+
+def summarize_distance(name, parts, interpretation):
+    if not parts:
+        return None
+
+    d = pd.concat(parts, ignore_index=True)
+    d["GMLC"] = numeric(d["GMLC"])
+    d["OURS"] = numeric(d["OURS"])
+    d = d.dropna()
+
+    # 1,000,000 appears to behave like a sentinel in some GMLC rows.
+    sentinel = np.isclose(d["GMLC"], 1_000_000, atol=0.5)
+    sentinel_pct = 100 * sentinel.mean() if len(d) else np.nan
+
+    clean = d.loc[~sentinel].copy()
+
+    if clean.empty:
+        return None
+
+    diff = (clean["GMLC"] - clean["OURS"]).abs()
+
+    return {
+        "GMLC_DISTANCE": name,
+        "INTERPRETATION": interpretation,
+        "SAMPLED_VALID_ROWS": len(clean),
+        "GMLC_1M_SENTINEL_PCT": sentinel_pct,
+        "PEARSON_R": clean["GMLC"].corr(clean["OURS"], method="pearson"),
+        "SPEARMAN_R": clean["GMLC"].corr(clean["OURS"], method="spearman"),
+        "MEDIAN_GMLC_M": clean["GMLC"].median(),
+        "MEDIAN_OURS_M": clean["OURS"].median(),
+        "MEDIAN_ABS_DIFF_M": diff.median(),
+        "P95_ABS_DIFF_M": diff.quantile(0.95)
+    }
+
+distance_rows = []
+
+x = summarize_distance(
+    "DISTCELL2XY_M",
+    distance_samples["DISTCELL2XY_M"],
+    "GMLC Cell-to-XY vs independently calculated Cell-to-Caller distance"
+)
+if x:
+    distance_rows.append(x)
+
+x = summarize_distance(
+    "DISTXY2PSAPXY_M",
+    distance_samples["DISTXY2PSAPXY_M"],
+    "GMLC XY-to-PSAPXY vs caller-to-routed-polygon-boundary distance"
+)
+if x:
+    distance_rows.append(x)
+
+distance_table = pd.DataFrame(distance_rows)
+distance_table.to_csv(OUT_DISTANCE, index=False)
+
+if not top_cases.empty:
+    top_cases.to_csv(OUT_TOP, index=False)
+
+
+# =====================================================================
+# 16. DISPLAY THE ANALYTICAL ANSWERS
+# =====================================================================
+
+print("\n==============================================================")
+print("1. CAN PSAP_ID + FCC_PSAP_ID BE RESOLVED TO THE BOUNDARY?")
+print("==============================================================")
+display(id_summary)
+
+print("\n==============================================================")
+print("2. WHICH NAME FIELD IS MORE TIGHTLY ATTACHED TO THE ID PAIR?")
+print("==============================================================")
+display(name_id_table)
+
+print("\n==============================================================")
+print("3. WHICH NAME MATCHES ROUTED-ID PSAP vs CALLER/CELL EXPECTED?")
+print("==============================================================")
+display(
+    name_match_table.sort_values(
+        ["GMLC_FIELD", "COMPARED_TO"]
+    )
+)
+
+print("\n==============================================================")
+print("4. ON REAL DISCRIMINATING MISROUTES: ROUTED-LIKE OR EXPECTED-LIKE?")
+print("==============================================================")
+display(name_role_table)
+
+print("\n==============================================================")
+print("5. FULL-GMLC EXPECTED PSAP vs PSAP_ID/FCC_PSAP_ID")
+print("==============================================================")
+display(expected_table)
+
+print("\n==============================================================")
+print("6. DOES THE NAME BEHAVIOR CHANGE WITH CALLER DISTANCE?")
+print("==============================================================")
+display(band_table)
+
+print("\n==============================================================")
+print("7. WHAT DO THE GMLC DISTANCE FIELDS APPEAR TO MEAN?")
+print("==============================================================")
+display(distance_table)
+
+if not top_cases.empty:
+    print("\n==============================================================")
+    print("8. TOP 50 >=19 km CASES — SMALL MANUAL QA TABLE")
+    print("==============================================================")
+    display(top_cases.head(50))
+
+print("\nSaved small summary tables:")
+for p in [
+    OUT_ID, OUT_NAME_ID, OUT_MATCH, OUT_ROLE,
+    OUT_EXPECTED, OUT_BANDS, OUT_DISTANCE, OUT_TOP
+]:
+    print(p)
