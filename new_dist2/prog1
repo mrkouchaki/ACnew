@@ -1,0 +1,35 @@
+One email with two separate updates, each covering the four requested items:
+
+Hi,
+
+Please find my updates for the two workstreams below.
+
+1. AI-Based Self-Healing
+
+Status: In progress. The core automated health-check and monitoring pipeline was established during August. AI interpretation, approval-based corrective actions, and dashboard refinement were initiated and continue to date.
+
+Top Wins:
+
+* Developed automated collection of live and historical database records, along with model artifacts and parameters from MLflow.
+* Implemented model tests and health checks covering performance, confidence, data quality, and drift, with results stored in PostgreSQL.
+* Connected results to Grafana for monitoring daily performance, prediction distributions, and per-class detection rates.
+* Initiated AI-based problem interpretation, action recommendations, and corrective-action execution following user approval.
+
+Top Concerns: Further validation is needed for AI recommendations, approval-based action execution, and post-action results. Dashboard metrics and visualizations are still being refined.
+
+Adjustments to Milestones: August progress covers the core health-check and monitoring foundation. AI interpretation, corrective actions, and dashboard refinement continue beyond August toward end-to-end self-healing validation.
+
+2. GMLC/IMS Network Analytics – PSAP Allocation and Misrouting
+
+Status: In progress. Developing network analytics to investigate PSAP misallocation and call misrouting, supported by interactive maps and feature analysis for initial machine learning development.
+
+Top Wins:
+
+* Developed analysis comparing call-location evidence, PSAP boundaries, and routed versus expected PSAPs to identify potential routing discrepancies.
+* Built and continued refining interactive maps to inspect call locations, boundary relationships, routing distances, and geographic hotspots.
+* Initiated feature analysis and correlation studies to identify potential misrouting predictors and prepare inputs for machine learning models.
+
+Top Concerns: Validation priorities include matching records across GMLC/IMS sources, handling missing or inconsistent location information, and distinguishing boundary uncertainty from clear misrouting. Feature selection must also prevent outcome-related information from leaking into model inputs.
+
+Adjustments to Milestones: Continue refining routing analysis and map outputs, then finalize feature selection and the modeling dataset to support initial model training and evaluation.
+
