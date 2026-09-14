@@ -1,0 +1,566 @@
+# =====================================================================
+# STRONG PSAP MISROUTE EVIDENCE COHORT v1
+# =====================================================================
+#
+# Strong pattern:
+#
+#   GMLC PSAP_ID / FCC_PSAP_ID / PSAP_NAME      -> PSAP A
+#   Caller Expected PSAP                        -> PSAP B
+#   Cell Expected PSAP                          -> PSAP B
+#   Caller Expected == Cell Expected
+#
+#   Caller OUTSIDE routed PSAP A
+#   Cell   OUTSIDE routed PSAP A
+#
+#   Caller <-> Cell reasonably close
+#
+#   ROUTE_PSAP_NAME -> EXPECTED-like (PSAP B)
+#   PSAP_NAME       -> ROUTED-like   (PSAP A)
+#
+# Names are supporting evidence only.
+# IDs remain the geographic/routing truth.
+# =====================================================================
+
+from pathlib import Path
+from difflib import SequenceMatcher
+import re
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+# =====================================================================
+# 0. CONFIG
+# =====================================================================
+
+DATA_DIR = Path(r"C:\temp\gmlc_v2")
+OUT_DIR = DATA_DIR / "outputs_psap_rca_v5"
+
+INPUT_CSV = OUT_DIR / "psap_three_location_crosscheck_v9.csv"
+OUTPUT_CSV = OUT_DIR / "strong_psap_misroute_evidence_v1.csv"
+
+# Geographic thresholds
+MIN_CALLER_OUTSIDE_M = 19_000
+MIN_CELL_OUTSIDE_M = 19_000
+
+# Caller and Cell should reasonably agree geographically.
+# Change to 5_000, 20_000, etc. if desired.
+MAX_CALLER_TO_CELL_M = 10_000
+
+# Optional call-duration filter
+MIN_CALL_DURATION_SEC = None
+MAX_CALL_DURATION_SEC = None
+
+# Name QA threshold
+NAME_SIMILARITY_THRESHOLD = 0.85
+
+# Recommended for strongest evidence.
+REQUIRE_ROUTE_NAME_EXPECTED_LIKE = True
+REQUIRE_PSAP_NAME_ROUTED_LIKE = True
+REQUIRE_CONFIRMED_ROUTED_IDS = True
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def txt(x):
+    if x is None or pd.isna(x):
+        return ""
+    x = str(x).strip()
+    return "" if x.upper() in {"", "NAN", "NONE", "<NA>"} else x
+
+def canon_id(x):
+    x = re.sub(r"\.0$", "", txt(x))
+    if not x:
+        return ""
+    if re.fullmatch(r"\d+", x):
+        return str(int(x))
+    return x.upper()
+
+def single_id(x):
+    vals = {
+        canon_id(v)
+        for v in txt(x).split(" | ")
+        if canon_id(v)
+    }
+    return next(iter(vals)) if len(vals) == 1 else ""
+
+def norm_name(x):
+    x = txt(x).upper()
+    x = re.sub(r"[^A-Z0-9 ]+", " ", x)
+    return re.sub(r"\s+", " ", x).strip()
+
+def similarity(a, b):
+    a, b = norm_name(a), norm_name(b)
+    if not a or not b:
+        return np.nan
+    if a == b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+def is_match(score):
+    return pd.notna(score) and score >= NAME_SIMILARITY_THRESHOLD
+
+def name_role(source, routed_name, expected_name):
+    sr = similarity(source, routed_name)
+    se = similarity(source, expected_name)
+
+    r = is_match(sr)
+    e = is_match(se)
+
+    if r and not e:
+        return "ROUTED_LIKE"
+    if e and not r:
+        return "EXPECTED_LIKE"
+    if r and e:
+        return "MATCHES_BOTH"
+    if pd.isna(sr) or pd.isna(se):
+        return "UNRESOLVED"
+    return "MATCHES_NEITHER"
+
+def pick_col(df, choices):
+    for c in choices:
+        if c in df.columns:
+            return c
+    return None
+
+def num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+# =====================================================================
+# 2. READ EXISTING v9 CROSSCHECK
+# =====================================================================
+
+df = pd.read_csv(INPUT_CSV, dtype="string", low_memory=False)
+
+# Find original GMLC name columns regardless of which v9 naming variant exists.
+route_name_col = pick_col(df, [
+    "ROUTE_PSAP_NAME",
+    "ROUTED_NAME_GMLC_ROUTE_PSAP_NAME",
+    "ROUTED_NAME_GMLC",
+])
+
+psap_name_col = pick_col(df, [
+    "PSAP_NAME",
+    "ROUTED_NAME_GMLC_PSAP_NAME",
+])
+
+if route_name_col is None:
+    raise RuntimeError("Could not find GMLC ROUTE_PSAP_NAME.")
+
+if psap_name_col is None:
+    raise RuntimeError("Could not find GMLC PSAP_NAME.")
+
+df["ROUTE_PSAP_NAME_GMLC"] = df[route_name_col].fillna("")
+df["PSAP_NAME_GMLC"] = df[psap_name_col].fillna("")
+
+
+# =====================================================================
+# 3. CANONICAL ROUTED / EXPECTED IDs
+# =====================================================================
+
+# Routed PSAP A
+df["_ROUTED_NENA"] = (
+    df["ROUTED_NENA_CANON"].map(canon_id)
+    if "ROUTED_NENA_CANON" in df
+    else df["ROUTED_NENA_ID_BOUNDARY"].map(canon_id)
+)
+
+df["_ROUTED_FCC"] = df["ROUTED_FCC_ID_BOUNDARY"].map(single_id)
+
+# Caller Expected PSAP B
+df["_CALLER_NENA"] = (
+    df["CALLER_EXPECTED_NENA_CANON"].map(canon_id)
+    if "CALLER_EXPECTED_NENA_CANON" in df
+    else df["CALLER_EXPECTED_NENA_ID_BOUNDARY"].map(canon_id)
+)
+
+df["_CALLER_FCC"] = df["CALLER_EXPECTED_FCC_ID_BOUNDARY"].map(single_id)
+
+# Cell Expected PSAP B
+df["_CELL_NENA"] = (
+    df["CELL_EXPECTED_NENA_CANON"].map(canon_id)
+    if "CELL_EXPECTED_NENA_CANON" in df
+    else df["CELL_EXPECTED_NENA_ID_BOUNDARY"].map(canon_id)
+)
+
+df["_CELL_FCC"] = df["CELL_EXPECTED_FCC_ID_BOUNDARY"].map(single_id)
+
+
+# =====================================================================
+# 4. CALLER + CELL MUST AGREE ON EXPECTED PSAP B
+# =====================================================================
+
+df["CALLER_CELL_EXPECTED_NENA_SAME"] = (
+    df["_CALLER_NENA"].ne("") &
+    df["_CELL_NENA"].ne("") &
+    df["_CALLER_NENA"].eq(df["_CELL_NENA"])
+)
+
+df["CALLER_CELL_EXPECTED_FCC_SAME"] = (
+    df["_CALLER_FCC"].ne("") &
+    df["_CELL_FCC"].ne("") &
+    df["_CALLER_FCC"].eq(df["_CELL_FCC"])
+)
+
+df["CALLER_CELL_EXPECTED_PSAP_SAME"] = (
+    df["CALLER_CELL_EXPECTED_NENA_SAME"] &
+    df["CALLER_CELL_EXPECTED_FCC_SAME"]
+)
+
+# One clean Expected PSAP B identity.
+df["EXPECTED_PSAP_NENA_ID"] = df["CALLER_EXPECTED_NENA_ID_BOUNDARY"]
+df["EXPECTED_PSAP_FCC_ID"] = df["CALLER_EXPECTED_FCC_ID_BOUNDARY"]
+df["EXPECTED_PSAP_AGENCY"] = df["CALLER_EXPECTED_AGENCY_BOUNDARY"]
+
+
+# =====================================================================
+# 5. NAME SEMANTICS
+# =====================================================================
+
+routed_agency = df["ROUTED_AGENCY_BOUNDARY"].fillna("")
+expected_agency = df["EXPECTED_PSAP_AGENCY"].fillna("")
+
+df["ROUTE_NAME_VS_ROUTED_SIMILARITY"] = [
+    similarity(a, b)
+    for a, b in zip(df["ROUTE_PSAP_NAME_GMLC"], routed_agency)
+]
+
+df["ROUTE_NAME_VS_EXPECTED_SIMILARITY"] = [
+    similarity(a, b)
+    for a, b in zip(df["ROUTE_PSAP_NAME_GMLC"], expected_agency)
+]
+
+df["ROUTE_PSAP_NAME_ROLE"] = [
+    name_role(source, routed, expected)
+    for source, routed, expected in zip(
+        df["ROUTE_PSAP_NAME_GMLC"],
+        routed_agency,
+        expected_agency
+    )
+]
+
+df["PSAP_NAME_VS_ROUTED_SIMILARITY"] = [
+    similarity(a, b)
+    for a, b in zip(df["PSAP_NAME_GMLC"], routed_agency)
+]
+
+df["PSAP_NAME_VS_EXPECTED_SIMILARITY"] = [
+    similarity(a, b)
+    for a, b in zip(df["PSAP_NAME_GMLC"], expected_agency)
+]
+
+df["PSAP_NAME_ROLE"] = [
+    name_role(source, routed, expected)
+    for source, routed, expected in zip(
+        df["PSAP_NAME_GMLC"],
+        routed_agency,
+        expected_agency
+    )
+]
+
+
+# =====================================================================
+# 6. DISTANCES
+# =====================================================================
+
+caller_out = num(df["CALLER_TO_ROUTED_BOUNDARY_M"])
+cell_out = num(df["CELL_TO_ROUTED_BOUNDARY_M"])
+
+# Prefer GMLC's proven Cell<->XY distance.
+if "DISTCELL2XY_M" in df.columns:
+    caller_cell = num(df["DISTCELL2XY_M"])
+else:
+    caller_cell = num(df["CALLER_TO_CELL_M"])
+
+df["CALLER_CELL_DISTANCE_M"] = caller_cell
+
+
+# =====================================================================
+# 7. STRONG-CANDIDATE FILTER
+# =====================================================================
+
+mask = pd.Series(True, index=df.index)
+
+# A and B must be different IDs.
+mask &= df["_ROUTED_NENA"].ne("")
+mask &= df["_CALLER_NENA"].ne("")
+mask &= df["_ROUTED_NENA"].ne(df["_CALLER_NENA"])
+
+# Caller and Cell independently point to same Expected PSAP B.
+mask &= df["CALLER_CELL_EXPECTED_PSAP_SAME"]
+
+# Existing geographic classifications.
+mask &= df["CALLER_EXPECTED_VS_ROUTED"].eq("DIFFERENT")
+mask &= df["CELL_EXPECTED_VS_ROUTED"].eq("DIFFERENT")
+
+mask &= df["CALLER_ROUTED_RELATION"].eq("OUTSIDE")
+mask &= df["CELL_ROUTED_RELATION"].eq("OUTSIDE")
+
+# Minimum outside distances.
+mask &= caller_out.notna() & (caller_out >= MIN_CALLER_OUTSIDE_M)
+mask &= cell_out.notna() & (cell_out >= MIN_CELL_OUTSIDE_M)
+
+# Caller and Cell themselves should be reasonably close.
+mask &= caller_cell.notna() & (caller_cell <= MAX_CALLER_TO_CELL_M)
+
+# Strong routed-ID resolution.
+if REQUIRE_CONFIRMED_ROUTED_IDS and "ROUTED_ID_STATUS" in df.columns:
+    mask &= df["ROUTED_ID_STATUS"].eq("CONFIRMED_PSAP_AND_FCC")
+
+# GMLC ROUTE_PSAP_NAME should look like Expected PSAP B.
+if REQUIRE_ROUTE_NAME_EXPECTED_LIKE:
+    mask &= df["ROUTE_PSAP_NAME_ROLE"].eq("EXPECTED_LIKE")
+
+# GMLC PSAP_NAME should look like final/routed PSAP A.
+if REQUIRE_PSAP_NAME_ROUTED_LIKE:
+    mask &= df["PSAP_NAME_ROLE"].eq("ROUTED_LIKE")
+
+# Optional call-duration filtering.
+if "CALL_DURATION_SEC" in df.columns:
+    duration = num(df["CALL_DURATION_SEC"])
+
+    if MIN_CALL_DURATION_SEC is not None:
+        mask &= duration >= MIN_CALL_DURATION_SEC
+
+    if MAX_CALL_DURATION_SEC is not None:
+        mask &= duration <= MAX_CALL_DURATION_SEC
+
+
+result = df.loc[mask].copy()
+
+
+# =====================================================================
+# 8. EVIDENCE / RANKING FIELDS
+# =====================================================================
+
+result["MIN_CALLER_CELL_OUTSIDE_M"] = pd.concat(
+    [
+        num(result["CALLER_TO_ROUTED_BOUNDARY_M"]),
+        num(result["CELL_TO_ROUTED_BOUNDARY_M"])
+    ],
+    axis=1
+).min(axis=1)
+
+result["MEAN_CALLER_CELL_OUTSIDE_M"] = pd.concat(
+    [
+        num(result["CALLER_TO_ROUTED_BOUNDARY_M"]),
+        num(result["CELL_TO_ROUTED_BOUNDARY_M"])
+    ],
+    axis=1
+).mean(axis=1)
+
+result["EVIDENCE_PATTERN"] = (
+    "FINAL_PSAP_A | "
+    "CALLER_CELL_EXPECT_PSAP_B | "
+    "BOTH_OUTSIDE_A | "
+    "CALLER_CELL_CLOSE | "
+    "ROUTE_NAME_EXPECTED_LIKE | "
+    "PSAP_NAME_ROUTED_LIKE"
+)
+
+# Strongest first:
+# 1. both caller/cell far outside
+# 2. caller/cell themselves close
+result = result.sort_values(
+    [
+        "MIN_CALLER_CELL_OUTSIDE_M",
+        "CALLER_CELL_DISTANCE_M"
+    ],
+    ascending=[False, True]
+)
+
+
+# =====================================================================
+# 9. CLEAN OUTPUT ORDER
+# =====================================================================
+
+primary = [
+    # -------------------------------------------------------------
+    # CALL / MARKET
+    # -------------------------------------------------------------
+    "SOURCE_GMLC_ROW_ID",
+    "UNIQ911_CID",
+    "CALL_BEGIN_TIME_UTC",
+    "MARKET",
+
+    # -------------------------------------------------------------
+    # HIGH-LEVEL EVIDENCE
+    # -------------------------------------------------------------
+    "EVIDENCE_PATTERN",
+    "MIN_CALLER_CELL_OUTSIDE_M",
+    "MEAN_CALLER_CELL_OUTSIDE_M",
+    "CALLER_CELL_DISTANCE_M",
+
+    # -------------------------------------------------------------
+    # FINAL / ROUTED PSAP A
+    # -------------------------------------------------------------
+    "ROUTED_PSAP_ID_GMLC",
+    "ROUTED_FCC_PSAP_ID_GMLC",
+    "PSAP_NAME_GMLC",
+
+    "ROUTED_NENA_ID_BOUNDARY",
+    "ROUTED_FCC_ID_BOUNDARY",
+    "ROUTED_AGENCY_BOUNDARY",
+    "ROUTED_ID_STATUS",
+
+    # -------------------------------------------------------------
+    # EXPECTED PSAP B
+    # -------------------------------------------------------------
+    "EXPECTED_PSAP_NENA_ID",
+    "EXPECTED_PSAP_FCC_ID",
+    "EXPECTED_PSAP_AGENCY",
+
+    "CALLER_CELL_EXPECTED_PSAP_SAME",
+
+    # -------------------------------------------------------------
+    # GMLC ROUTE NAME EVIDENCE
+    # -------------------------------------------------------------
+    "ROUTE_PSAP_NAME_GMLC",
+    "ROUTE_PSAP_NAME_ROLE",
+    "ROUTE_NAME_VS_EXPECTED_SIMILARITY",
+    "ROUTE_NAME_VS_ROUTED_SIMILARITY",
+
+    # -------------------------------------------------------------
+    # GMLC PSAP_NAME EVIDENCE
+    # -------------------------------------------------------------
+    "PSAP_NAME_ROLE",
+    "PSAP_NAME_VS_ROUTED_SIMILARITY",
+    "PSAP_NAME_VS_EXPECTED_SIMILARITY",
+
+    # -------------------------------------------------------------
+    # CALLER GEOGRAPHY
+    # -------------------------------------------------------------
+    "CALLER_EXPECTED_VS_ROUTED",
+    "CALLER_ROUTED_RELATION",
+    "CALLER_TO_ROUTED_BOUNDARY_M",
+    "CALLER_TO_EXPECTED_BOUNDARY_M",
+
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+
+    # -------------------------------------------------------------
+    # CELL GEOGRAPHY
+    # -------------------------------------------------------------
+    "CELL_EXPECTED_VS_ROUTED",
+    "CELL_ROUTED_RELATION",
+    "CELL_TO_ROUTED_BOUNDARY_M",
+    "CELL_TO_EXPECTED_BOUNDARY_M",
+
+    "CELL_LATITUDE_USED",
+    "CELL_LONGITUDE_USED",
+
+    # -------------------------------------------------------------
+    # EXPECTED PSAP DETAILS FOR QA
+    # -------------------------------------------------------------
+    "CALLER_EXPECTED_NENA_ID_BOUNDARY",
+    "CALLER_EXPECTED_FCC_ID_BOUNDARY",
+    "CALLER_EXPECTED_AGENCY_BOUNDARY",
+
+    "CELL_EXPECTED_NENA_ID_BOUNDARY",
+    "CELL_EXPECTED_FCC_ID_BOUNDARY",
+    "CELL_EXPECTED_AGENCY_BOUNDARY",
+]
+
+secondary = [
+    # -------------------------------------------------------------
+    # GMLC LOCATION / DISTANCE CONTEXT
+    # -------------------------------------------------------------
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+
+    "ESPOSREQ_EXPECTED_VS_ROUTED",
+    "ESPOSREQ_ROUTED_RELATION",
+    "ESPOSREQ_TO_ROUTED_BOUNDARY_M",
+
+    "ESPOSREQ_LATITUDE",
+    "ESPOSREQ_LONGITUDE",
+
+    "UNCERT_METERS",
+    "ESPOSREQ_LOC_HORIZONTAL_UNCERT",
+    "ESPOSREQ_LOC_CONFIDENCE",
+    "LOCATION_FIRST_HORIZONTAL_UNCERT",
+    "LOCATION_FIRST_CONFIDENCE",
+
+    # -------------------------------------------------------------
+    # NETWORK / CALL CONTEXT
+    # -------------------------------------------------------------
+    "SETUP_ECGI_DEC",
+    "ENODEB_ID",
+    "USID",
+    "CLUSTER",
+    "PHASE",
+
+    "CALL_DURATION_SEC",
+
+    "ROUTE_LOCATION_POS_SOURCE",
+    "POS_METHOD_USED",
+    "NW_METHOD_USED",
+
+    "ROUTE_ESZ",
+    "ROUTE_ESRK",
+    "ROUTE_ESINET",
+    "ROUTE_FALLBACK",
+    "DEFAULT_ROUTED_CALL",
+
+    "LBR_ATTEMPTED",
+    "LBR_SUCCESS",
+    "LBR_PSAP_DIFF",
+]
+
+primary = [c for c in primary if c in result.columns]
+secondary = [c for c in secondary if c in result.columns]
+
+remaining = [
+    c for c in result.columns
+    if c not in primary + secondary
+    and not c.startswith("_")
+]
+
+out = result[primary + secondary + remaining].copy()
+
+
+# =====================================================================
+# 10. FORMAT NUMERIC QA FIELDS
+# =====================================================================
+
+for c in out.columns:
+    if (
+        c.endswith("_M") or
+        c.endswith("_LATITUDE") or
+        c.endswith("_LONGITUDE") or
+        c.endswith("_SIMILARITY") or
+        c.endswith("_SEC")
+    ):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+
+# =====================================================================
+# 11. SAVE
+# =====================================================================
+
+out.to_csv(
+    OUTPUT_CSV,
+    index=False,
+    float_format="%.3f"
+)
+
+print("\n============================================================")
+print("STRONG MISROUTE EVIDENCE COHORT")
+print("============================================================")
+print("Input rows :", f"{len(df):,}")
+print("Output rows:", f"{len(out):,}")
+print("Saved      :", OUTPUT_CSV)
+
+print("\nCriteria:")
+print(f"Caller outside routed PSAP >= {MIN_CALLER_OUTSIDE_M:,.0f} m")
+print(f"Cell outside routed PSAP   >= {MIN_CELL_OUTSIDE_M:,.0f} m")
+print(f"Caller <-> Cell            <= {MAX_CALLER_TO_CELL_M:,.0f} m")
+print("Caller Expected = Cell Expected PSAP")
+print("Expected PSAP != Routed PSAP")
+print("ROUTE_PSAP_NAME = EXPECTED_LIKE")
+print("PSAP_NAME       = ROUTED_LIKE")
+
+display(out.head(100))
