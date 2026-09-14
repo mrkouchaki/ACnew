@@ -1,0 +1,997 @@
+
+
+
+# =====================================================================
+# PRESENTATION MAP - STRONG MISROUTE EVIDENCE
+# Uses the SAME rendering approach as the previous working map
+# =====================================================================
+
+from pathlib import Path
+from html import escape
+import re
+import pandas as pd
+import geopandas as gpd
+import folium
+
+from folium.plugins import MarkerCluster
+from shapely.geometry import Point, mapping
+from shapely.ops import nearest_points
+
+# =====================================================================
+# 0. SETTINGS
+# =====================================================================
+
+DATA_DIR = Path(r"C:\temp\gmlc_v2")
+OUTPUT_DIR = DATA_DIR / "outputs_psap_rca_v5"
+
+INPUT_CSV = OUTPUT_DIR / "strong_misroute_evidence_from_gmlc_v2.csv"
+BOUNDARY_PATH = DATA_DIR / "psap" / "Final_Join.tab"
+
+OUTPUT_HTML = (
+    OUTPUT_DIR
+    / "strong_misroute_evidence_from_gmlc_v2_map.html"
+)
+
+MAX_CALLS = 70
+
+# Strongest cases first.
+SORT_BY = "CALLER_TO_ROUTED_BOUNDARY_M"
+SORT_DESCENDING = True
+
+# Optional filters
+MIN_CALLER_M = None
+MAX_CALLER_M = None
+
+MIN_CELL_M = None
+MAX_CELL_M = None
+
+MAX_CALLER_CELL_M = None
+
+MIN_CALL_DURATION_SEC = None
+MAX_CALL_DURATION_SEC = None
+
+INCLUDE_MARKETS = None
+EXCLUDE_MARKETS = set()
+
+# ---------------------------------------------------------------------
+# Layers
+# ---------------------------------------------------------------------
+
+SHOW_ROUTED_BOUNDARIES = True
+SHOW_EXPECTED_BOUNDARIES = True
+
+SHOW_CALLER = True
+SHOW_CELL = True
+SHOW_ESPOSREQ = True
+
+SHOW_CALLER_TO_ROUTED = True
+SHOW_CELL_TO_ROUTED = True
+
+SHOW_CALLER_TO_EXPECTED = False
+SHOW_CELL_TO_EXPECTED = False
+
+SHOW_CALLER_TO_CELL = True
+
+AUTO_FIT_CALLER_POINTS = False
+
+MAP_CENTER = [39.5, -98.35]
+MAP_ZOOM = 4
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def canon(x):
+    if x is None or pd.isna(x):
+        return ""
+
+    x = re.sub(
+        r"\.0$",
+        "",
+        str(x).strip()
+    )
+
+    if not x or x.upper() in {"NAN", "NONE", "<NA>"}:
+        return ""
+
+    if x.isdigit():
+        return str(int(x))
+
+    return x.upper()
+
+
+def valid(lat, lon):
+    lat = pd.to_numeric(lat, errors="coerce")
+    lon = pd.to_numeric(lon, errors="coerce")
+
+    return (
+        pd.notna(lat)
+        and pd.notna(lon)
+        and -90 <= float(lat) <= 90
+        and -180 <= float(lon) <= 180
+        and not (
+            abs(float(lat)) < 1e-10
+            and abs(float(lon)) < 1e-10
+        )
+    )
+
+
+def fmt(x, d=1):
+    x = pd.to_numeric(x, errors="coerce")
+
+    return (
+        "N/A"
+        if pd.isna(x)
+        else f"{float(x):,.{d}f}"
+    )
+
+
+def safe(x):
+    if x is None or pd.isna(x):
+        return ""
+
+    return escape(str(x))
+
+
+def nearest_boundary_point(lat, lon, geom):
+    if geom is None or not valid(lat, lon):
+        return None
+
+    try:
+        p = Point(
+            float(lon),
+            float(lat)
+        )
+
+        _, q = nearest_points(
+            p,
+            geom.boundary
+        )
+
+        return [
+            float(q.y),
+            float(q.x)
+        ]
+
+    except Exception:
+        return None
+
+
+# =====================================================================
+# 2. READ NEW STRONG-EVIDENCE OUTPUT
+# =====================================================================
+
+df = pd.read_csv(
+    INPUT_CSV,
+    dtype="string",
+    low_memory=False
+)
+
+numeric_cols = [
+    "CALLER_TO_ROUTED_BOUNDARY_M",
+    "CELL_TO_ROUTED_BOUNDARY_M",
+    "CALLER_CELL_DISTANCE_M",
+    "CALL_DURATION_SEC",
+
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+
+    "CELL_LATITUDE_USED",
+    "CELL_LONGITUDE_USED",
+
+    "ESPOSREQ_LOC_LATITUDE",
+    "ESPOSREQ_LOC_LONGITUDE",
+
+    "DISTCELL2XY_M",
+    "UNCERT_METERS",
+]
+
+for c in numeric_cols:
+    if c in df.columns:
+        df[c] = pd.to_numeric(
+            df[c],
+            errors="coerce"
+        )
+
+map_df = df.copy()
+
+
+# =====================================================================
+# 3. OPTIONAL FILTERS
+# =====================================================================
+
+if MIN_CALLER_M is not None:
+    map_df = map_df.loc[
+        map_df["CALLER_TO_ROUTED_BOUNDARY_M"] >= MIN_CALLER_M
+    ]
+
+if MAX_CALLER_M is not None:
+    map_df = map_df.loc[
+        map_df["CALLER_TO_ROUTED_BOUNDARY_M"] <= MAX_CALLER_M
+    ]
+
+if MIN_CELL_M is not None:
+    map_df = map_df.loc[
+        map_df["CELL_TO_ROUTED_BOUNDARY_M"] >= MIN_CELL_M
+    ]
+
+if MAX_CELL_M is not None:
+    map_df = map_df.loc[
+        map_df["CELL_TO_ROUTED_BOUNDARY_M"] <= MAX_CELL_M
+    ]
+
+if MAX_CALLER_CELL_M is not None:
+    map_df = map_df.loc[
+        map_df["CALLER_CELL_DISTANCE_M"] <= MAX_CALLER_CELL_M
+    ]
+
+if MIN_CALL_DURATION_SEC is not None:
+    map_df = map_df.loc[
+        map_df["CALL_DURATION_SEC"] >= MIN_CALL_DURATION_SEC
+    ]
+
+if MAX_CALL_DURATION_SEC is not None:
+    map_df = map_df.loc[
+        map_df["CALL_DURATION_SEC"] <= MAX_CALL_DURATION_SEC
+    ]
+
+if INCLUDE_MARKETS is not None:
+    allowed = {
+        str(x).upper()
+        for x in INCLUDE_MARKETS
+    }
+
+    map_df = map_df.loc[
+        map_df["MARKET"]
+        .fillna("")
+        .str.upper()
+        .isin(allowed)
+    ]
+
+if EXCLUDE_MARKETS:
+    blocked = {
+        str(x).upper()
+        for x in EXCLUDE_MARKETS
+    }
+
+    map_df = map_df.loc[
+        ~map_df["MARKET"]
+        .fillna("")
+        .str.upper()
+        .isin(blocked)
+    ]
+
+if SORT_BY in map_df.columns:
+    map_df = map_df.sort_values(
+        SORT_BY,
+        ascending=not SORT_DESCENDING,
+        na_position="last"
+    )
+
+if MAX_CALLS is not None:
+    map_df = map_df.head(
+        int(MAX_CALLS)
+    ).copy()
+
+if map_df.empty:
+    raise RuntimeError(
+        "No rows remain after map filters."
+    )
+
+print("Input rows :", f"{len(df):,}")
+print("Map calls  :", f"{len(map_df):,}")
+
+
+# =====================================================================
+# 4. LOAD FULL BOUNDARY GEOMETRY
+# =====================================================================
+
+try:
+    b = gpd.read_file(
+        BOUNDARY_PATH,
+        engine="pyogrio"
+    )
+except Exception:
+    b = gpd.read_file(
+        BOUNDARY_PATH
+    )
+
+if b.crs is None:
+    raise RuntimeError(
+        "Boundary file has no CRS."
+    )
+
+if b.crs.to_epsg() != 4326:
+    b = b.to_crs(4326)
+
+lookup = {
+    str(c).strip().upper(): c
+    for c in b.columns
+}
+
+NENA_COL = lookup["NENA_ID"]
+
+AGENCY_COL = lookup.get(
+    "AGENCY",
+    lookup.get("AGENCY_NAME")
+)
+
+b["_NENA"] = b[NENA_COL].map(
+    canon
+)
+
+b["_NAME"] = (
+    b[AGENCY_COL]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+
+    if AGENCY_COL
+    else ""
+)
+
+b["geometry"] = b.geometry.apply(
+    lambda g:
+        g.buffer(0)
+        if g is not None
+        and not g.is_empty
+        and not g.is_valid
+        else g
+)
+
+b = b.loc[
+    b["_NENA"].ne("")
+    & b.geometry.notna()
+    & ~b.geometry.is_empty
+].copy()
+
+# FULL geometry, exactly like old working map.
+bg = (
+    b[
+        [
+            "_NENA",
+            "_NAME",
+            "geometry"
+        ]
+    ]
+    .dissolve(
+        by="_NENA",
+        as_index=False,
+        aggfunc={"_NAME": "first"}
+    )
+)
+
+geom_by_id = dict(
+    zip(
+        bg["_NENA"],
+        bg.geometry
+    )
+)
+
+name_by_id = dict(
+    zip(
+        bg["_NENA"],
+        bg["_NAME"]
+    )
+)
+
+
+# =====================================================================
+# 5. DEBUG ID COVERAGE
+# =====================================================================
+
+routed_ids = {
+    canon(x)
+    for x in map_df["ROUTED_NENA_ID_BOUNDARY"]
+    if canon(x)
+}
+
+expected_ids = {
+    canon(x)
+    for x in map_df["EXPECTED_PSAP_NENA_ID"]
+    if canon(x)
+}
+
+print(
+    "Unique Routed PSAP A:",
+    len(routed_ids)
+)
+
+print(
+    "Unique Expected PSAP B:",
+    len(expected_ids)
+)
+
+print(
+    "Routed polygons found:",
+    sum(x in geom_by_id for x in routed_ids),
+    "/",
+    len(routed_ids)
+)
+
+print(
+    "Expected polygons found:",
+    sum(x in geom_by_id for x in expected_ids),
+    "/",
+    len(expected_ids)
+)
+
+
+# =====================================================================
+# 6. CREATE MAP
+# =====================================================================
+#
+# Same structure as your old working version.
+# =====================================================================
+
+m = folium.Map(
+    location=MAP_CENTER,
+    zoom_start=MAP_ZOOM,
+    control_scale=True,
+    tiles="CartoDB positron",
+    prefer_canvas=True
+)
+
+# No OpenStreetMap.
+folium.TileLayer(
+    "CartoDB positron",
+    name="Light Map",
+    show=True
+).add_to(m)
+
+folium.TileLayer(
+    "CartoDB dark_matter",
+    name="Dark Map",
+    show=False
+).add_to(m)
+
+
+# =====================================================================
+# 7. LAYERS
+# =====================================================================
+
+routed_layer = folium.FeatureGroup(
+    "PSAP A - Final/Routed boundaries",
+    show=SHOW_ROUTED_BOUNDARIES
+)
+
+expected_layer = folium.FeatureGroup(
+    "PSAP B - Expected boundaries",
+    show=SHOW_EXPECTED_BOUNDARIES
+)
+
+caller_layer = folium.FeatureGroup(
+    "Caller locations",
+    show=SHOW_CALLER
+)
+
+cell_layer = folium.FeatureGroup(
+    "Cell locations",
+    show=SHOW_CELL
+)
+
+espos_layer = folium.FeatureGroup(
+    "ESPOSREQ locations",
+    show=SHOW_ESPOSREQ
+)
+
+caller_routed_lines = folium.FeatureGroup(
+    "Caller → PSAP A boundary",
+    show=SHOW_CALLER_TO_ROUTED
+)
+
+cell_routed_lines = folium.FeatureGroup(
+    "Cell → PSAP A boundary",
+    show=SHOW_CELL_TO_ROUTED
+)
+
+caller_expected_lines = folium.FeatureGroup(
+    "Caller → PSAP B boundary",
+    show=SHOW_CALLER_TO_EXPECTED
+)
+
+cell_expected_lines = folium.FeatureGroup(
+    "Cell → PSAP B boundary",
+    show=SHOW_CELL_TO_EXPECTED
+)
+
+caller_cell_lines = folium.FeatureGroup(
+    "Caller ↔ Cell",
+    show=SHOW_CALLER_TO_CELL
+)
+
+caller_cluster = MarkerCluster().add_to(
+    caller_layer
+)
+
+cell_cluster = MarkerCluster().add_to(
+    cell_layer
+)
+
+espos_cluster = MarkerCluster().add_to(
+    espos_layer
+)
+
+
+# =====================================================================
+# 8. DRAW FULL PSAP POLYGONS
+# =====================================================================
+
+def draw_psaps(ids, layer, color, label):
+
+    unique_ids = sorted({
+        canon(x)
+        for x in ids
+        if canon(x)
+    })
+
+    for nena in unique_ids:
+
+        geom = geom_by_id.get(
+            nena
+        )
+
+        if geom is None:
+            continue
+
+        folium.GeoJson(
+            mapping(geom),
+
+            style_function=lambda feature, c=color: {
+                "color": c,
+                "weight": 2,
+                "fillOpacity": 0.03,
+            },
+
+            tooltip=(
+                f"{label} | "
+                f"{safe(nena)} | "
+                f"{safe(name_by_id.get(nena,''))}"
+            )
+        ).add_to(
+            layer
+        )
+
+
+draw_psaps(
+    map_df["ROUTED_NENA_ID_BOUNDARY"],
+    routed_layer,
+    "red",
+    "PSAP A - Final/Routed"
+)
+
+draw_psaps(
+    map_df["EXPECTED_PSAP_NENA_ID"],
+    expected_layer,
+    "green",
+    "PSAP B - Expected"
+)
+
+
+# =====================================================================
+# 9. DRAW CALLS + LINES
+# =====================================================================
+
+for _, r in map_df.iterrows():
+
+    call_id = str(
+        r.get(
+            "UNIQ911_CID",
+            ""
+        )
+    )
+
+    routed_id = canon(
+        r.get(
+            "ROUTED_NENA_ID_BOUNDARY",
+            ""
+        )
+    )
+
+    expected_id = canon(
+        r.get(
+            "EXPECTED_PSAP_NENA_ID",
+            ""
+        )
+    )
+
+    routed_geom = geom_by_id.get(
+        routed_id
+    )
+
+    expected_geom = geom_by_id.get(
+        expected_id
+    )
+
+    clat = r.get(
+        "CALLER_LATITUDE"
+    )
+
+    clon = r.get(
+        "CALLER_LONGITUDE"
+    )
+
+    cellat = r.get(
+        "CELL_LATITUDE_USED"
+    )
+
+    cellon = r.get(
+        "CELL_LONGITUDE_USED"
+    )
+
+    elat = r.get(
+        "ESPOSREQ_LOC_LATITUDE"
+    )
+
+    elon = r.get(
+        "ESPOSREQ_LOC_LONGITUDE"
+    )
+
+
+    # -------------------------------------------------------------
+    # Popup
+    # -------------------------------------------------------------
+
+    popup = f"""
+    <b>CALL</b><br>
+    CID: {safe(call_id)}<br>
+    Market: {safe(r.get('MARKET',''))}<br>
+    Duration: {fmt(r.get('CALL_DURATION_SEC'))} sec<br>
+    USID: {safe(r.get('USID',''))}<br><br>
+
+    <b>PSAP A - FINAL / ROUTED</b><br>
+    PSAP_ID: {safe(r.get('PSAP_ID',''))}<br>
+    FCC_PSAP_ID: {safe(r.get('FCC_PSAP_ID',''))}<br>
+    PSAP_NAME: {safe(r.get('PSAP_NAME',''))}<br>
+    Boundary Agency:
+    {safe(r.get('ROUTED_AGENCY_BOUNDARY',''))}<br><br>
+
+    <b>PSAP B - EXPECTED</b><br>
+    NENA: {safe(r.get('EXPECTED_PSAP_NENA_ID',''))}<br>
+    FCC: {safe(r.get('EXPECTED_PSAP_FCC_ID',''))}<br>
+    Agency: {safe(r.get('EXPECTED_PSAP_AGENCY',''))}<br><br>
+
+    <b>ROUTE_PSAP_NAME</b><br>
+    {safe(r.get('ROUTE_PSAP_NAME',''))}<br>
+    Role:
+    {safe(r.get('ROUTE_PSAP_NAME_ROLE',''))}<br><br>
+
+    Caller → Routed:
+    {fmt(r.get('CALLER_TO_ROUTED_BOUNDARY_M'))} m<br>
+
+    Cell → Routed:
+    {fmt(r.get('CELL_TO_ROUTED_BOUNDARY_M'))} m<br>
+
+    Caller ↔ Cell:
+    {fmt(r.get('CALLER_CELL_DISTANCE_M'))} m
+    """
+
+
+    # -------------------------------------------------------------
+    # CALLER MARKER
+    # -------------------------------------------------------------
+
+    if valid(clat, clon):
+
+        folium.Marker(
+            [
+                float(clat),
+                float(clon)
+            ],
+
+            tooltip=(
+                f"CALLER | {call_id}"
+            ),
+
+            popup=folium.Popup(
+                popup,
+                max_width=520
+            ),
+
+            icon=folium.Icon(
+                color="blue",
+                icon="phone"
+            )
+        ).add_to(
+            caller_cluster
+        )
+
+
+    # -------------------------------------------------------------
+    # CELL MARKER
+    # -------------------------------------------------------------
+
+    if valid(cellat, cellon):
+
+        folium.Marker(
+            [
+                float(cellat),
+                float(cellon)
+            ],
+
+            tooltip=(
+                f"CELL | {call_id}"
+            ),
+
+            popup=(
+                f"Cell → Routed: "
+                f"{fmt(r.get('CELL_TO_ROUTED_BOUNDARY_M'))} m"
+            ),
+
+            icon=folium.Icon(
+                color="green",
+                icon="signal"
+            )
+        ).add_to(
+            cell_cluster
+        )
+
+
+    # -------------------------------------------------------------
+    # ESPOSREQ MARKER
+    # -------------------------------------------------------------
+
+    if valid(elat, elon):
+
+        folium.Marker(
+            [
+                float(elat),
+                float(elon)
+            ],
+
+            tooltip=(
+                f"ESPOSREQ | {call_id}"
+            ),
+
+            icon=folium.Icon(
+                color="orange",
+                icon="map-marker"
+            )
+        ).add_to(
+            espos_cluster
+        )
+
+
+    # -------------------------------------------------------------
+    # Caller -> Routed A
+    # -------------------------------------------------------------
+
+    q = nearest_boundary_point(
+        clat,
+        clon,
+        routed_geom
+    )
+
+    if (
+        SHOW_CALLER_TO_ROUTED
+        and q is not None
+    ):
+
+        folium.PolyLine(
+            [
+                [
+                    float(clat),
+                    float(clon)
+                ],
+                q
+            ],
+            color="red",
+            weight=2,
+            opacity=0.8,
+            tooltip=(
+                f"Caller → A: "
+                f"{fmt(r.get('CALLER_TO_ROUTED_BOUNDARY_M'))} m"
+            )
+        ).add_to(
+            caller_routed_lines
+        )
+
+
+    # -------------------------------------------------------------
+    # Cell -> Routed A
+    # -------------------------------------------------------------
+
+    q = nearest_boundary_point(
+        cellat,
+        cellon,
+        routed_geom
+    )
+
+    if (
+        SHOW_CELL_TO_ROUTED
+        and q is not None
+    ):
+
+        folium.PolyLine(
+            [
+                [
+                    float(cellat),
+                    float(cellon)
+                ],
+                q
+            ],
+            color="red",
+            weight=2,
+            opacity=0.55,
+            dash_array="6,5",
+            tooltip=(
+                f"Cell → A: "
+                f"{fmt(r.get('CELL_TO_ROUTED_BOUNDARY_M'))} m"
+            )
+        ).add_to(
+            cell_routed_lines
+        )
+
+
+    # -------------------------------------------------------------
+    # Caller -> Expected B
+    # -------------------------------------------------------------
+
+    if SHOW_CALLER_TO_EXPECTED:
+
+        q = nearest_boundary_point(
+            clat,
+            clon,
+            expected_geom
+        )
+
+        if q is not None:
+
+            folium.PolyLine(
+                [
+                    [
+                        float(clat),
+                        float(clon)
+                    ],
+                    q
+                ],
+                color="green",
+                weight=2,
+                dash_array="7,5"
+            ).add_to(
+                caller_expected_lines
+            )
+
+
+    # -------------------------------------------------------------
+    # Cell -> Expected B
+    # -------------------------------------------------------------
+
+    if SHOW_CELL_TO_EXPECTED:
+
+        q = nearest_boundary_point(
+            cellat,
+            cellon,
+            expected_geom
+        )
+
+        if q is not None:
+
+            folium.PolyLine(
+                [
+                    [
+                        float(cellat),
+                        float(cellon)
+                    ],
+                    q
+                ],
+                color="green",
+                weight=2,
+                dash_array="7,5"
+            ).add_to(
+                cell_expected_lines
+            )
+
+
+    # -------------------------------------------------------------
+    # Caller <-> Cell
+    # -------------------------------------------------------------
+
+    if (
+        SHOW_CALLER_TO_CELL
+        and valid(clat, clon)
+        and valid(cellat, cellon)
+    ):
+
+        folium.PolyLine(
+            [
+                [
+                    float(clat),
+                    float(clon)
+                ],
+                [
+                    float(cellat),
+                    float(cellon)
+                ]
+            ],
+            color="blue",
+            weight=2,
+            opacity=0.6,
+            dash_array="7,6",
+            tooltip=(
+                f"Caller ↔ Cell: "
+                f"{fmt(r.get('CALLER_CELL_DISTANCE_M'))} m"
+            )
+        ).add_to(
+            caller_cell_lines
+        )
+
+
+# =====================================================================
+# 10. ADD LAYERS
+# =====================================================================
+
+for layer in [
+    routed_layer,
+    expected_layer,
+
+    caller_routed_lines,
+    cell_routed_lines,
+
+    caller_expected_lines,
+    cell_expected_lines,
+
+    caller_cell_lines,
+
+    caller_layer,
+    cell_layer,
+    espos_layer,
+]:
+    layer.add_to(m)
+
+folium.LayerControl(
+    collapsed=False
+).add_to(m)
+
+
+# =====================================================================
+# 11. OPTIONAL AUTO FIT
+# =====================================================================
+
+if AUTO_FIT_CALLER_POINTS:
+
+    points = [
+        [
+            float(lat),
+            float(lon)
+        ]
+
+        for lat, lon
+        in zip(
+            map_df["CALLER_LATITUDE"],
+            map_df["CALLER_LONGITUDE"]
+        )
+
+        if valid(
+            lat,
+            lon
+        )
+    ]
+
+    if len(points) > 1:
+        m.fit_bounds(
+            points
+        )
+
+
+# =====================================================================
+# 12. SAVE
+# =====================================================================
+
+m.save(
+    OUTPUT_HTML
+)
+
+size_mb = (
+    OUTPUT_HTML.stat().st_size
+    / 1024
+    / 1024
+)
+
+print("\nSaved map :", OUTPUT_HTML)
+print("Mapped    :", len(map_df))
+print("HTML size :", f"{size_mb:.2f} MB")
+
+display(m)
+
