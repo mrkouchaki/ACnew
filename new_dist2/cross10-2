@@ -1,0 +1,911 @@
+# =====================================================================
+# STRONG MISROUTE EVIDENCE DIRECTLY FROM FULL GMLC v2
+# =====================================================================
+# SOURCE:
+#   C:\temp\gmlc_v2\e911_lte_master_gmlc.csv
+#
+# REFERENCE:
+#   Final_Join.tab
+#
+# OUTPUT:
+#   strong_misroute_evidence_from_gmlc_v2.csv
+# =====================================================================
+
+from pathlib import Path
+from collections import defaultdict
+from difflib import SequenceMatcher
+import re
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import shapely
+from shapely.geometry import Point
+from shapely.ops import nearest_points, transform as shp_transform
+from pyproj import CRS, Transformer, Geod
+from IPython.display import display
+
+# =====================================================================
+# 0. CONFIG
+# =====================================================================
+
+DATA_DIR = Path(r"C:\temp\gmlc_v2")
+OUT_DIR = DATA_DIR / "outputs_psap_rca_v5"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+GMLC_PATH = DATA_DIR / "e911_lte_master_gmlc.csv"
+BOUNDARY_PATH = DATA_DIR / "psap" / "Final_Join.tab"
+OUTPUT_CSV = OUT_DIR / "strong_misroute_evidence_from_gmlc_v2.csv"
+
+CHUNK_ROWS = 100_000
+
+MIN_CALLER_OUTSIDE_M = 19_000
+MIN_CELL_OUTSIDE_M = 19_000
+
+# Caller and Cell should describe approximately the same area.
+MAX_CALLER_CELL_M = 10_000
+
+MIN_CALL_DURATION_SEC = None
+MAX_CALL_DURATION_SEC = None
+
+INCLUDE_MARKETS = None       # example {"ARIZONA", "SACRAMENTO"}
+EXCLUDE_MARKETS = set()
+
+NAME_SIMILARITY = 0.85
+
+# Strongest cohort
+REQUIRE_ROUTE_NAME_EXPECTED_LIKE = True
+REQUIRE_PSAP_NAME_ROUTED_LIKE = True
+
+GEOD = Geod(ellps="WGS84")
+
+
+# =====================================================================
+# 1. HELPERS
+# =====================================================================
+
+def txt(x):
+    if x is None or pd.isna(x):
+        return ""
+    x = str(x).strip()
+    return "" if x.upper() in {"", "NAN", "NONE", "<NA>"} else x
+
+def raw_id(x):
+    return re.sub(r"\.0$", "", txt(x))
+
+def canon_id(x):
+    x = raw_id(x)
+    if not x:
+        return ""
+    if re.fullmatch(r"\d+", x):
+        return str(int(x))
+    return x.upper()
+
+def norm_name(x):
+    x = txt(x).upper()
+    x = re.sub(r"[^A-Z0-9 ]+", " ", x)
+    return re.sub(r"\s+", " ", x).strip()
+
+def sim(a, b):
+    a, b = norm_name(a), norm_name(b)
+    if not a or not b:
+        return np.nan
+    if a == b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+def name_role(source, routed_name, expected_name):
+    sr = sim(source, routed_name)
+    se = sim(source, expected_name)
+
+    routed_match = pd.notna(sr) and sr >= NAME_SIMILARITY
+    expected_match = pd.notna(se) and se >= NAME_SIMILARITY
+
+    if routed_match and not expected_match:
+        return "ROUTED_LIKE"
+    if expected_match and not routed_match:
+        return "EXPECTED_LIKE"
+    if routed_match and expected_match:
+        return "MATCHES_BOTH"
+    if pd.isna(sr) or pd.isna(se):
+        return "UNRESOLVED"
+    return "MATCHES_NEITHER"
+
+def repair_geom(g):
+    if g is None or g.is_empty:
+        return None
+    try:
+        if not g.is_valid:
+            g = g.buffer(0)
+        return None if g is None or g.is_empty or not g.is_valid else g
+    except Exception:
+        return None
+
+def first_nonempty(s):
+    for x in s:
+        x = txt(x)
+        if x:
+            return x
+    return ""
+
+def unique_join(s):
+    vals = []
+    for x in s:
+        x = txt(x)
+        if x and x not in vals:
+            vals.append(x)
+    return " | ".join(vals)
+
+def num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def valid_xy(lat, lon):
+    lat, lon = num(lat), num(lon)
+    return (
+        lat.notna() & lon.notna() &
+        lat.between(-90, 90) & lon.between(-180, 180) &
+        ~(lat.abs().lt(1e-10) & lon.abs().lt(1e-10))
+    )
+
+def geod_distance(lat1, lon1, lat2, lon2):
+    a, b = num(lat1).to_numpy(float), num(lon1).to_numpy(float)
+    c, d = num(lat2).to_numpy(float), num(lon2).to_numpy(float)
+
+    ok = (
+        np.isfinite(a) & np.isfinite(b) &
+        np.isfinite(c) & np.isfinite(d) &
+        (a >= -90) & (a <= 90) & (c >= -90) & (c <= 90) &
+        (b >= -180) & (b <= 180) & (d >= -180) & (d <= 180)
+    )
+
+    out = np.full(len(a), np.nan)
+    if ok.any():
+        _, _, dist = GEOD.inv(b[ok], a[ok], d[ok], c[ok])
+        out[ok] = np.abs(np.asarray(dist, float))
+    return out
+
+
+# =====================================================================
+# 2. LOAD PSAP BOUNDARIES
+# =====================================================================
+
+try:
+    b = gpd.read_file(BOUNDARY_PATH, engine="pyogrio")
+except Exception:
+    b = gpd.read_file(BOUNDARY_PATH)
+
+if b.crs is None:
+    raise RuntimeError("Boundary file has no CRS.")
+
+if b.crs.to_epsg() != 4326:
+    b = b.to_crs(4326)
+
+lookup = {str(c).strip().upper(): c for c in b.columns}
+
+NENA_COL = lookup["NENA_ID"]
+FCC_COL = lookup.get("FCC_ID", lookup.get("FCC_PSAP_ID"))
+AGENCY_COL = lookup.get("AGENCY", lookup.get("AGENCY_NAME"))
+
+if FCC_COL is None:
+    raise RuntimeError("FCC_ID not found in boundary file.")
+
+b["_NENA_RAW"] = b[NENA_COL].map(raw_id)
+b["_NENA"] = b[NENA_COL].map(canon_id)
+b["_FCC"] = b[FCC_COL].map(canon_id)
+b["_AGENCY"] = b[AGENCY_COL].fillna("").astype(str).str.strip() if AGENCY_COL else ""
+b["geometry"] = b.geometry.apply(repair_geom)
+
+b = b.loc[b["_NENA"].ne("") & b.geometry.notna()].copy()
+
+# One geometry per PSAP identity.
+psap_geo = b[["_NENA", "geometry"]].dissolve(by="_NENA", as_index=False)
+psap_geo["geometry"] = psap_geo.geometry.apply(repair_geom)
+psap_geo = psap_geo.loc[psap_geo.geometry.notna()].copy()
+
+rep = psap_geo.geometry.representative_point()
+psap_geo["_CENTER_LAT"] = rep.y
+psap_geo["_CENTER_LON"] = rep.x
+
+geom_by_nena = dict(zip(psap_geo["_NENA"], psap_geo.geometry))
+center_by_nena = dict(zip(
+    psap_geo["_NENA"],
+    zip(psap_geo["_CENTER_LAT"], psap_geo["_CENTER_LON"])
+))
+
+fcc_by_nena = defaultdict(set)
+for nena, fcc in b[["_NENA", "_FCC"]].drop_duplicates().itertuples(index=False, name=None):
+    if fcc:
+        fcc_by_nena[nena].add(fcc)
+
+meta = (
+    b.groupby("_NENA", as_index=False)
+    .agg(
+        NENA_ID_BOUNDARY=("_NENA_RAW", unique_join),
+        FCC_ID_BOUNDARY=("_FCC", unique_join),
+        AGENCY_BOUNDARY=("_AGENCY", first_nonempty),
+    )
+)
+
+meta["PSAP_CENTER_LAT"] = meta["_NENA"].map(
+    lambda x: center_by_nena.get(x, (np.nan, np.nan))[0]
+)
+meta["PSAP_CENTER_LON"] = meta["_NENA"].map(
+    lambda x: center_by_nena.get(x, (np.nan, np.nan))[1]
+)
+
+meta_by_nena = meta.set_index("_NENA").to_dict("index")
+
+print("Boundary PSAPs:", f"{len(geom_by_nena):,}")
+
+
+# =====================================================================
+# 3. LOCAL METRIC GEOMETRY FOR PRECISE BOUNDARY DISTANCE
+# =====================================================================
+
+metric_cache = {}
+
+def metric_model(nena):
+    nena = canon_id(nena)
+
+    if nena in metric_cache:
+        return metric_cache[nena]
+
+    geom = geom_by_nena.get(nena)
+    center = center_by_nena.get(nena)
+
+    if geom is None or center is None:
+        metric_cache[nena] = None
+        return None
+
+    lat0, lon0 = center
+
+    local_crs = CRS.from_proj4(
+        f"+proj=aeqd +lat_0={lat0} +lon_0={lon0} "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+
+    fwd = Transformer.from_crs("EPSG:4326", local_crs, always_xy=True)
+    inv = Transformer.from_crs(local_crs, "EPSG:4326", always_xy=True)
+    geom_m = repair_geom(shp_transform(fwd.transform, geom))
+
+    metric_cache[nena] = (geom, geom_m, fwd, inv)
+    return metric_cache[nena]
+
+
+def routed_boundary_distance(frame, lat_col, lon_col):
+    lat = num(frame[lat_col]).to_numpy(float)
+    lon = num(frame[lon_col]).to_numpy(float)
+    ids = frame["_ROUTED_NENA"].fillna("").astype(str).to_numpy()
+
+    dist = np.full(len(frame), np.nan)
+    relation = np.full(len(frame), "UNRESOLVED", dtype=object)
+
+    valid = (
+        np.isfinite(lat) & np.isfinite(lon) &
+        (lat >= -90) & (lat <= 90) &
+        (lon >= -180) & (lon <= 180) &
+        (ids != "")
+    )
+
+    for nena in pd.unique(ids[valid]):
+        model = metric_model(nena)
+        if model is None:
+            continue
+
+        geom_ll, geom_m, fwd, inv = model
+        idx = np.flatnonzero(valid & (ids == nena))
+
+        x, y = fwd.transform(lon[idx], lat[idx])
+        points_m = shapely.points(np.asarray(x), np.asarray(y))
+
+        lines = shapely.shortest_line(points_m, geom_m.boundary)
+        near = shapely.get_point(lines, 1)
+
+        nx = np.asarray(shapely.get_x(near), float)
+        ny = np.asarray(shapely.get_y(near), float)
+
+        nlon, nlat = inv.transform(nx, ny)
+
+        _, _, meters = GEOD.inv(
+            lon[idx], lat[idx],
+            np.asarray(nlon, float),
+            np.asarray(nlat, float)
+        )
+
+        meters = np.abs(np.asarray(meters, float))
+        dist[idx] = meters
+
+        points_ll = shapely.points(lon[idx], lat[idx])
+        inside = np.asarray(shapely.covers(geom_ll, points_ll), bool)
+
+        relation[idx] = np.where(
+            meters <= 0.05,
+            "BOUNDARY",
+            np.where(inside, "INSIDE", "OUTSIDE")
+        )
+
+    return dist, relation
+
+
+# =====================================================================
+# 4. EXPECTED PSAP FROM CALLER / CELL COORDINATE
+# =====================================================================
+
+def assign_expected(frame, lat_col, lon_col, prefix):
+    lat, lon = num(frame[lat_col]), num(frame[lon_col])
+    valid = valid_xy(lat, lon)
+
+    frame[f"{prefix}_EXPECTED_NENA_CANON"] = ""
+    frame[f"{prefix}_EXPECTED_NENA_ID"] = ""
+    frame[f"{prefix}_EXPECTED_FCC_ID"] = ""
+    frame[f"{prefix}_EXPECTED_AGENCY"] = ""
+    frame[f"{prefix}_EXPECTED_SPATIAL_STATUS"] = "INVALID_COORD"
+
+    pos = np.flatnonzero(valid.to_numpy())
+
+    if not len(pos):
+        return frame
+
+    pg = gpd.GeoDataFrame(
+        {"_ROW": pos},
+        geometry=gpd.points_from_xy(
+            lon.iloc[pos].to_numpy(float),
+            lat.iloc[pos].to_numpy(float)
+        ),
+        crs="EPSG:4326"
+    )
+
+    joined = gpd.sjoin(
+        pg,
+        psap_geo[["_NENA", "geometry"]],
+        how="left",
+        predicate="intersects"
+    )
+
+    for row_id, group in joined.groupby("_ROW"):
+        ids = sorted({
+            txt(x)
+            for x in group["_NENA"]
+            if txt(x)
+        })
+
+        row_id = int(row_id)
+
+        if len(ids) == 1:
+            nena = ids[0]
+            m = meta_by_nena.get(nena, {})
+
+            frame.at[row_id, f"{prefix}_EXPECTED_NENA_CANON"] = nena
+            frame.at[row_id, f"{prefix}_EXPECTED_NENA_ID"] = m.get("NENA_ID_BOUNDARY", "")
+            frame.at[row_id, f"{prefix}_EXPECTED_FCC_ID"] = m.get("FCC_ID_BOUNDARY", "")
+            frame.at[row_id, f"{prefix}_EXPECTED_AGENCY"] = m.get("AGENCY_BOUNDARY", "")
+            frame.at[row_id, f"{prefix}_EXPECTED_SPATIAL_STATUS"] = "UNIQUE_PSAP"
+
+        elif len(ids) > 1:
+            frame.at[row_id, f"{prefix}_EXPECTED_SPATIAL_STATUS"] = "MULTIPLE_PSAP"
+
+        else:
+            frame.at[row_id, f"{prefix}_EXPECTED_SPATIAL_STATUS"] = "NO_CONTAINING_PSAP"
+
+    return frame
+
+
+# =====================================================================
+# 5. GMLC COLUMNS
+# =====================================================================
+
+header = list(pd.read_csv(GMLC_PATH, nrows=0).columns)
+h = {str(c).strip().upper(): c for c in header}
+
+required = [
+    "PSAP_ID", "FCC_PSAP_ID", "PSAP_NAME", "ROUTE_PSAP_NAME",
+    "LATITUDE", "LONGITUDE", "CELL_LATITUDE", "CELL_LONGITUDE"
+]
+
+for c in required:
+    if c not in h:
+        raise RuntimeError(f"Missing required GMLC field: {c}")
+
+wanted = [
+    "UNIQ911_CID", "CALL_BEGIN_TIME_UTC", "CALL_DURATION_SEC",
+    "MARKET", "CLUSTER", "ENODEB_ID", "ENB_ID", "USID",
+    "PSAP_ID", "FCC_PSAP_ID", "PSAP_NAME", "ROUTE_PSAP_NAME",
+    "LATITUDE", "LONGITUDE", "CELL_LATITUDE", "CELL_LONGITUDE",
+    "ESPOSREQ_LOC_LATITUDE", "ESPOSREQ_LOC_LONGITUDE",
+    "DISTCELL2XY_M", "DISTCELL2PSAPXY_M", "DISTXY2PSAPXY_M",
+    "UNCERT_METERS",
+    "ESPOSREQ_LOC_HORIZONTAL_UNCERT", "ESPOSREQ_LOC_CONFIDENCE",
+    "LOCATION_FIRST_HORIZONTAL_UNCERT", "LOCATION_FIRST_CONFIDENCE",
+    "SETUP_ECGI_DEC", "PHASE",
+    "ROUTE_ESZ", "ROUTE_ESRK", "ROUTE_ESINET",
+    "ROUTE_FALLBACK", "DEFAULT_ROUTED_CALL",
+    "LBR_ATTEMPTED", "LBR_SUCCESS", "LBR_PSAP_DIFF",
+]
+
+usecols = [h[c] for c in wanted if c in h]
+
+
+# =====================================================================
+# 6. PROCESS FULL ORIGINAL GMLC
+# =====================================================================
+
+results = []
+processed = 0
+
+reader = pd.read_csv(
+    GMLC_PATH,
+    dtype="string",
+    usecols=usecols,
+    chunksize=CHUNK_ROWS,
+    low_memory=False,
+    encoding_errors="replace"
+)
+
+for chunk_no, df in enumerate(reader, start=1):
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    df = df.reset_index(drop=True)
+
+    df["SOURCE_GMLC_ROW_ID"] = np.arange(
+        processed + 1,
+        processed + len(df) + 1
+    )
+    processed += len(df)
+
+    # -------------------------------------------------------------
+    # Caller / Cell coordinates
+    # -------------------------------------------------------------
+    df["CALLER_LATITUDE"] = num(df["LATITUDE"])
+    df["CALLER_LONGITUDE"] = num(df["LONGITUDE"])
+    df["CELL_LATITUDE_USED"] = num(df["CELL_LATITUDE"])
+    df["CELL_LONGITUDE_USED"] = num(df["CELL_LONGITUDE"])
+
+    # -------------------------------------------------------------
+    # Caller <-> Cell distance.
+    # Prefer GMLC DISTCELL2XY_M, which full-GMLC audit validated.
+    # Recalculate only where unavailable.
+    # -------------------------------------------------------------
+    if "DISTCELL2XY_M" in df.columns:
+        df["CALLER_CELL_DISTANCE_M"] = num(df["DISTCELL2XY_M"])
+    else:
+        df["CALLER_CELL_DISTANCE_M"] = np.nan
+
+    missing_cc = df["CALLER_CELL_DISTANCE_M"].isna()
+
+    if missing_cc.any():
+        recalculated = geod_distance(
+            df["CALLER_LATITUDE"],
+            df["CALLER_LONGITUDE"],
+            df["CELL_LATITUDE_USED"],
+            df["CELL_LONGITUDE_USED"]
+        )
+        df.loc[missing_cc, "CALLER_CELL_DISTANCE_M"] = recalculated[missing_cc]
+
+    # -------------------------------------------------------------
+    # EARLY FILTER: Caller and Cell should agree geographically.
+    # This dramatically reduces geometry work.
+    # -------------------------------------------------------------
+    early = (
+        df["CALLER_CELL_DISTANCE_M"].notna() &
+        (df["CALLER_CELL_DISTANCE_M"] <= MAX_CALLER_CELL_M) &
+        valid_xy(df["CALLER_LATITUDE"], df["CALLER_LONGITUDE"]) &
+        valid_xy(df["CELL_LATITUDE_USED"], df["CELL_LONGITUDE_USED"])
+    )
+
+    if MIN_CALL_DURATION_SEC is not None and "CALL_DURATION_SEC" in df:
+        early &= num(df["CALL_DURATION_SEC"]) >= MIN_CALL_DURATION_SEC
+
+    if MAX_CALL_DURATION_SEC is not None and "CALL_DURATION_SEC" in df:
+        early &= num(df["CALL_DURATION_SEC"]) <= MAX_CALL_DURATION_SEC
+
+    if INCLUDE_MARKETS is not None and "MARKET" in df:
+        allowed = {str(x).upper() for x in INCLUDE_MARKETS}
+        early &= df["MARKET"].fillna("").str.upper().isin(allowed)
+
+    if EXCLUDE_MARKETS and "MARKET" in df:
+        blocked = {str(x).upper() for x in EXCLUDE_MARKETS}
+        early &= ~df["MARKET"].fillna("").str.upper().isin(blocked)
+
+    df = df.loc[early].copy().reset_index(drop=True)
+
+    if df.empty:
+        print(f"Chunk {chunk_no:03d} | processed {processed:,} | strong 0")
+        continue
+
+    # -------------------------------------------------------------
+    # ROUTED PSAP A from PSAP_ID + FCC_PSAP_ID
+    # -------------------------------------------------------------
+    df["_PSAP_CANON"] = df["PSAP_ID"].map(canon_id)
+    df["_FCC_CANON"] = df["FCC_PSAP_ID"].map(canon_id)
+
+    routed_nena, routed_status = [], []
+
+    for psap, fcc in zip(df["_PSAP_CANON"], df["_FCC_CANON"]):
+        if not psap or psap not in geom_by_nena:
+            routed_nena.append("")
+            routed_status.append("PSAP_NOT_RESOLVED")
+            continue
+
+        boundary_fccs = fcc_by_nena.get(psap, set())
+
+        if fcc and fcc in boundary_fccs:
+            routed_nena.append(psap)
+            routed_status.append("CONFIRMED_PSAP_AND_FCC")
+        elif fcc:
+            routed_nena.append("")
+            routed_status.append("PSAP_FCC_CONFLICT")
+        else:
+            routed_nena.append(psap)
+            routed_status.append("PSAP_MATCH_FCC_MISSING")
+
+    df["_ROUTED_NENA"] = routed_nena
+    df["ROUTED_ID_STATUS"] = routed_status
+
+    # Strong cohort requires confirmed IDs.
+    df = df.loc[
+        df["ROUTED_ID_STATUS"].eq("CONFIRMED_PSAP_AND_FCC")
+    ].copy().reset_index(drop=True)
+
+    if df.empty:
+        continue
+
+    df["ROUTED_NENA_ID_BOUNDARY"] = df["_ROUTED_NENA"].map(
+        lambda x: meta_by_nena.get(x, {}).get("NENA_ID_BOUNDARY", "")
+    )
+    df["ROUTED_FCC_ID_BOUNDARY"] = df["_ROUTED_NENA"].map(
+        lambda x: meta_by_nena.get(x, {}).get("FCC_ID_BOUNDARY", "")
+    )
+    df["ROUTED_AGENCY_BOUNDARY"] = df["_ROUTED_NENA"].map(
+        lambda x: meta_by_nena.get(x, {}).get("AGENCY_BOUNDARY", "")
+    )
+
+    # -------------------------------------------------------------
+    # Caller + Cell relation/distance to routed PSAP A
+    # -------------------------------------------------------------
+    caller_dist, caller_rel = routed_boundary_distance(
+        df, "CALLER_LATITUDE", "CALLER_LONGITUDE"
+    )
+    cell_dist, cell_rel = routed_boundary_distance(
+        df, "CELL_LATITUDE_USED", "CELL_LONGITUDE_USED"
+    )
+
+    df["CALLER_TO_ROUTED_BOUNDARY_M"] = caller_dist
+    df["CALLER_ROUTED_RELATION"] = caller_rel
+    df["CELL_TO_ROUTED_BOUNDARY_M"] = cell_dist
+    df["CELL_ROUTED_RELATION"] = cell_rel
+
+    # Both must be significantly OUTSIDE PSAP A.
+    strong_geo = (
+        df["CALLER_ROUTED_RELATION"].eq("OUTSIDE") &
+        df["CELL_ROUTED_RELATION"].eq("OUTSIDE") &
+        (df["CALLER_TO_ROUTED_BOUNDARY_M"] >= MIN_CALLER_OUTSIDE_M) &
+        (df["CELL_TO_ROUTED_BOUNDARY_M"] >= MIN_CELL_OUTSIDE_M)
+    )
+
+    df = df.loc[strong_geo].copy().reset_index(drop=True)
+
+    if df.empty:
+        print(f"Chunk {chunk_no:03d} | processed {processed:,} | strong 0")
+        continue
+
+    # -------------------------------------------------------------
+    # Independently derive Caller Expected and Cell Expected PSAP B.
+    # -------------------------------------------------------------
+    df = assign_expected(
+        df, "CALLER_LATITUDE", "CALLER_LONGITUDE", "CALLER"
+    )
+    df = assign_expected(
+        df, "CELL_LATITUDE_USED", "CELL_LONGITUDE_USED", "CELL"
+    )
+
+    # Caller and Cell must each have one unambiguous expected PSAP.
+    valid_expected = (
+        df["CALLER_EXPECTED_SPATIAL_STATUS"].eq("UNIQUE_PSAP") &
+        df["CELL_EXPECTED_SPATIAL_STATUS"].eq("UNIQUE_PSAP")
+    )
+
+    df = df.loc[valid_expected].copy().reset_index(drop=True)
+
+    if df.empty:
+        continue
+
+    # -------------------------------------------------------------
+    # Caller and Cell must independently identify SAME expected PSAP B.
+    # -------------------------------------------------------------
+    df["CALLER_CELL_EXPECTED_SAME"] = (
+        df["CALLER_EXPECTED_NENA_CANON"].ne("") &
+        df["CELL_EXPECTED_NENA_CANON"].ne("") &
+        df["CALLER_EXPECTED_NENA_CANON"].eq(
+            df["CELL_EXPECTED_NENA_CANON"]
+        )
+    )
+
+    df = df.loc[
+        df["CALLER_CELL_EXPECTED_SAME"]
+    ].copy().reset_index(drop=True)
+
+    # Expected B must differ from routed A.
+    df = df.loc[
+        df["CALLER_EXPECTED_NENA_CANON"].ne(df["_ROUTED_NENA"])
+    ].copy().reset_index(drop=True)
+
+    if df.empty:
+        continue
+
+    # Combined Expected PSAP B.
+    df["EXPECTED_PSAP_NENA_ID"] = df["CALLER_EXPECTED_NENA_ID"]
+    df["EXPECTED_PSAP_FCC_ID"] = df["CALLER_EXPECTED_FCC_ID"]
+    df["EXPECTED_PSAP_AGENCY"] = df["CALLER_EXPECTED_AGENCY"]
+
+    # ID comparison for report.
+    df["EXPECTED_NENA_VS_ROUTED"] = "DIFFERENT"
+
+    df["EXPECTED_FCC_VS_ROUTED"] = np.where(
+        df["EXPECTED_PSAP_FCC_ID"].map(canon_id).eq(
+            df["FCC_PSAP_ID"].map(canon_id)
+        ),
+        "SAME",
+        "DIFFERENT"
+    )
+
+    # -------------------------------------------------------------
+    # NAME EVIDENCE
+    # PSAP_NAME should look like routed A.
+    # ROUTE_PSAP_NAME should look like expected B.
+    # -------------------------------------------------------------
+    df["PSAP_NAME_VS_ROUTED_SIMILARITY"] = [
+        sim(a, b)
+        for a, b in zip(
+            df["PSAP_NAME"],
+            df["ROUTED_AGENCY_BOUNDARY"]
+        )
+    ]
+
+    df["PSAP_NAME_VS_EXPECTED_SIMILARITY"] = [
+        sim(a, b)
+        for a, b in zip(
+            df["PSAP_NAME"],
+            df["EXPECTED_PSAP_AGENCY"]
+        )
+    ]
+
+    df["PSAP_NAME_ROLE"] = [
+        name_role(s, r, e)
+        for s, r, e in zip(
+            df["PSAP_NAME"],
+            df["ROUTED_AGENCY_BOUNDARY"],
+            df["EXPECTED_PSAP_AGENCY"]
+        )
+    ]
+
+    df["ROUTE_NAME_VS_ROUTED_SIMILARITY"] = [
+        sim(a, b)
+        for a, b in zip(
+            df["ROUTE_PSAP_NAME"],
+            df["ROUTED_AGENCY_BOUNDARY"]
+        )
+    ]
+
+    df["ROUTE_NAME_VS_EXPECTED_SIMILARITY"] = [
+        sim(a, b)
+        for a, b in zip(
+            df["ROUTE_PSAP_NAME"],
+            df["EXPECTED_PSAP_AGENCY"]
+        )
+    ]
+
+    df["ROUTE_PSAP_NAME_ROLE"] = [
+        name_role(s, r, e)
+        for s, r, e in zip(
+            df["ROUTE_PSAP_NAME"],
+            df["ROUTED_AGENCY_BOUNDARY"],
+            df["EXPECTED_PSAP_AGENCY"]
+        )
+    ]
+
+    if REQUIRE_ROUTE_NAME_EXPECTED_LIKE:
+        df = df.loc[
+            df["ROUTE_PSAP_NAME_ROLE"].eq("EXPECTED_LIKE")
+        ].copy()
+
+    if REQUIRE_PSAP_NAME_ROUTED_LIKE:
+        df = df.loc[
+            df["PSAP_NAME_ROLE"].eq("ROUTED_LIKE")
+        ].copy()
+
+    if df.empty:
+        continue
+
+    # Useful strength metric only for sorting:
+    # both Caller and Cell must be at least this far outside.
+    df["_SORT_MIN_OUTSIDE_M"] = df[
+        ["CALLER_TO_ROUTED_BOUNDARY_M", "CELL_TO_ROUTED_BOUNDARY_M"]
+    ].min(axis=1)
+
+    results.append(df)
+
+    print(
+        f"Chunk {chunk_no:03d} | processed {processed:,} | "
+        f"strong {len(df):,}"
+    )
+
+
+# =====================================================================
+# 7. COMBINE + CLEAN OUTPUT
+# =====================================================================
+
+if not results:
+    raise RuntimeError(
+        "No calls met all strong-evidence criteria. "
+        "Try increasing MAX_CALLER_CELL_M or disabling one name-role requirement."
+    )
+
+result = pd.concat(results, ignore_index=True)
+
+result = result.sort_values(
+    ["_SORT_MIN_OUTSIDE_M", "CALLER_CELL_DISTANCE_M"],
+    ascending=[False, True]
+).reset_index(drop=True)
+
+# ---------------------------------------------------------------------
+# COLUMN ORDER
+# First columns are deliberately the most important.
+# ---------------------------------------------------------------------
+
+primary = [
+    # Call / network identity
+    "SOURCE_GMLC_ROW_ID",
+    "UNIQ911_CID",
+    "MARKET",
+    "CLUSTER",
+    "ENODEB_ID",
+    "ENB_ID",
+    "USID",
+
+    # =============================================================
+    # PSAP A = GMLC final/routed identity
+    # =============================================================
+    "PSAP_ID",
+    "FCC_PSAP_ID",
+    "PSAP_NAME",
+
+    "ROUTED_NENA_ID_BOUNDARY",
+    "ROUTED_FCC_ID_BOUNDARY",
+    "ROUTED_AGENCY_BOUNDARY",
+
+    # =============================================================
+    # PSAP B = independently expected from Caller + Cell
+    # =============================================================
+    "EXPECTED_PSAP_NENA_ID",
+    "EXPECTED_PSAP_FCC_ID",
+    "EXPECTED_PSAP_AGENCY",
+
+    "CALLER_CELL_EXPECTED_SAME",
+    "EXPECTED_NENA_VS_ROUTED",
+    "EXPECTED_FCC_VS_ROUTED",
+
+    # =============================================================
+    # GMLC ROUTE_PSAP_NAME evidence
+    # =============================================================
+    "ROUTE_PSAP_NAME",
+    "ROUTE_PSAP_NAME_ROLE",
+    "ROUTE_NAME_VS_EXPECTED_SIMILARITY",
+    "ROUTE_NAME_VS_ROUTED_SIMILARITY",
+
+    # =============================================================
+    # GMLC PSAP_NAME evidence
+    # =============================================================
+    "PSAP_NAME_ROLE",
+    "PSAP_NAME_VS_ROUTED_SIMILARITY",
+    "PSAP_NAME_VS_EXPECTED_SIMILARITY",
+
+    # =============================================================
+    # Geography / distance evidence
+    # =============================================================
+    "CALLER_ROUTED_RELATION",
+    "CALLER_TO_ROUTED_BOUNDARY_M",
+
+    "CELL_ROUTED_RELATION",
+    "CELL_TO_ROUTED_BOUNDARY_M",
+
+    "CALLER_CELL_DISTANCE_M",
+
+    # Coordinates
+    "CALLER_LATITUDE",
+    "CALLER_LONGITUDE",
+    "CELL_LATITUDE_USED",
+    "CELL_LONGITUDE_USED",
+]
+
+secondary = [
+    # Independent expected-source details
+    "CALLER_EXPECTED_NENA_ID",
+    "CALLER_EXPECTED_FCC_ID",
+    "CALLER_EXPECTED_AGENCY",
+
+    "CELL_EXPECTED_NENA_ID",
+    "CELL_EXPECTED_FCC_ID",
+    "CELL_EXPECTED_AGENCY",
+
+    # Original GMLC distances
+    "DISTCELL2XY_M",
+    "DISTCELL2PSAPXY_M",
+    "DISTXY2PSAPXY_M",
+
+    # Location quality
+    "UNCERT_METERS",
+    "ESPOSREQ_LOC_HORIZONTAL_UNCERT",
+    "ESPOSREQ_LOC_CONFIDENCE",
+    "LOCATION_FIRST_HORIZONTAL_UNCERT",
+    "LOCATION_FIRST_CONFIDENCE",
+
+    # ESPOSREQ coordinates
+    "ESPOSREQ_LOC_LATITUDE",
+    "ESPOSREQ_LOC_LONGITUDE",
+
+    # Call/context
+    "CALL_BEGIN_TIME_UTC",
+    "CALL_DURATION_SEC",
+    "SETUP_ECGI_DEC",
+    "PHASE",
+
+    # Routing context
+    "ROUTE_ESZ",
+    "ROUTE_ESRK",
+    "ROUTE_ESINET",
+    "ROUTE_FALLBACK",
+    "DEFAULT_ROUTED_CALL",
+    "LBR_ATTEMPTED",
+    "LBR_SUCCESS",
+    "LBR_PSAP_DIFF",
+]
+
+primary = [c for c in primary if c in result.columns]
+secondary = [c for c in secondary if c in result.columns]
+
+remaining = [
+    c for c in result.columns
+    if c not in primary + secondary
+    and not c.startswith("_")
+]
+
+out = result[primary + secondary + remaining].copy()
+
+# Preserve IDs as strings.
+for c in out.columns:
+    if (
+        c in {
+            "UNIQ911_CID", "PSAP_ID", "FCC_PSAP_ID",
+            "USID", "ENODEB_ID", "ENB_ID", "SETUP_ECGI_DEC"
+        }
+        or "NENA_ID" in c
+        or "FCC_ID" in c
+    ):
+        out[c] = out[c].astype("string")
+
+out.to_csv(
+    OUTPUT_CSV,
+    index=False,
+    float_format="%.3f"
+)
+
+
+# =====================================================================
+# 8. RESULT
+# =====================================================================
+
+print("\n============================================================")
+print("STRONG MISROUTE EVIDENCE — DIRECT FROM ORIGINAL GMLC")
+print("============================================================")
+print("Full GMLC rows processed :", f"{processed:,}")
+print("Strong evidence calls    :", f"{len(out):,}")
+print("Output                   :", OUTPUT_CSV)
+
+print("\nRequired evidence:")
+print(f"  Caller outside routed PSAP >= {MIN_CALLER_OUTSIDE_M:,.0f} m")
+print(f"  Cell outside routed PSAP   >= {MIN_CELL_OUTSIDE_M:,.0f} m")
+print(f"  Caller <-> Cell            <= {MAX_CALLER_CELL_M:,.0f} m")
+print("  Caller Expected = Cell Expected")
+print("  Expected PSAP != PSAP_ID/FCC_PSAP_ID PSAP")
+print("  ROUTE_PSAP_NAME = EXPECTED_LIKE")
+print("  PSAP_NAME       = ROUTED_LIKE")
+
+display(out.head(100))
